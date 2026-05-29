@@ -65,6 +65,40 @@ func TestSetTokenRoundtrip(t *testing.T) {
 	}
 }
 
+func TestSetClaudeAPIKeyRoundtrip(t *testing.T) {
+	m := newTestManager(t)
+	if _, err := m.SetToken(context.Background(), KindClaude, ModeAPIKey, "sk-ant-api-secret-XYZ"); err != nil {
+		t.Fatalf("set_token: %v", err)
+	}
+	st, _ := m.Status(context.Background(), KindClaude)
+	if !st.LoggedIn || st.Method != MethodAPIKey {
+		t.Errorf("post-set status = %+v", st)
+	}
+	secrets := m.Secrets(KindClaude)
+	if got := secrets["ANTHROPIC_API_KEY"]; got != "sk-ant-api-secret-XYZ" {
+		t.Errorf("env = %q want sk-ant-api-secret-XYZ", got)
+	}
+	if got := secrets["CLAUDE_CODE_OAUTH_TOKEN"]; got != "" {
+		t.Errorf("oauth env = %q want empty", got)
+	}
+}
+
+func TestClaudeSubscriptionDoesNotInjectOAuthToken(t *testing.T) {
+	m := newTestManager(t)
+	path, err := m.cfg.Vault.Seal(KindClaude, "short-lived-access-token")
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	if err := m.cfg.Store.PutCliToken(store.CliToken{
+		Kind: KindClaude, Method: MethodSubscription, CiphertextPath: path,
+	}); err != nil {
+		t.Fatalf("put cli token: %v", err)
+	}
+	if got := m.Secrets(KindClaude); len(got) != 0 {
+		t.Errorf("Secrets = %+v want no env injection", got)
+	}
+}
+
 func TestSetTokenCodexAPIKey(t *testing.T) {
 	m := newTestManager(t)
 	if _, err := m.SetToken(context.Background(), KindCodex, ModeAPIKey, "sk-openai-XYZ"); err != nil {
@@ -119,6 +153,29 @@ func TestStripANSI(t *testing.T) {
 	in := "\x1b[31mhello\x1b[0m world"
 	if got := stripANSI(in); got != "hello world" {
 		t.Errorf("stripANSI = %q want %q", got, "hello world")
+	}
+}
+
+func TestCleanTerminalLineDropsControlBytes(t *testing.T) {
+	in := "\x1b[?7lWelcome\x00 to\x1f Claude\x7f Code\n"
+	if got := cleanTerminalLine(in); got != "Welcome to Claude Code\n" {
+		t.Errorf("cleanTerminalLine = %q", got)
+	}
+}
+
+func TestIsClaudeFirstRunSetup(t *testing.T) {
+	cases := []string{
+		"Let's get started.\nChoose the text style that looks best with your terminal",
+		"Syntax theme: Monokai Extended (ctrl+t to disable)",
+		"WelcometoClaudeCodev2.1.156 Let'sgetstarted",
+	}
+	for _, tc := range cases {
+		if !isClaudeFirstRunSetup(tc) {
+			t.Errorf("expected setup prompt for %q", tc)
+		}
+	}
+	if isClaudeFirstRunSetup("Open https://claude.ai/oauth to continue") {
+		t.Error("oauth URL should not be treated as setup")
 	}
 }
 
@@ -217,5 +274,14 @@ func TestExtractTokenClaudeOAuth(t *testing.T) {
 	body := []byte(`{"oauth":{"access_token":"abc123"}}`)
 	if got := extractToken(KindClaude, body); got != "abc123" {
 		t.Errorf("extractToken = %q want abc123", got)
+	}
+}
+
+func TestLoginCommandArgs(t *testing.T) {
+	if got := loginCommandArgs(KindClaude, "/bin/claude"); got[0] != "/bin/claude" || got[1] != "auth" || got[2] != "login" {
+		t.Errorf("claude args = %#v", got)
+	}
+	if got := loginCommandArgs(KindCodex, "/bin/codex"); got[0] != "/bin/codex" || got[1] != "login" {
+		t.Errorf("codex args = %#v", got)
 	}
 }
