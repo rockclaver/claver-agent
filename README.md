@@ -41,8 +41,3 @@ curl -fsSL https://raw.githubusercontent.com/rockclaver/claver/main/agent/script
 The installer creates a `claver` system user, drops the binary at
 `/usr/local/bin/claver-agent`, installs the systemd unit, enables and starts
 the service, and prints the installed version on stdout.
-
-The requested version must already exist as a GitHub release. Push a tag such
-as `v0.1.0` to publish the `claver-agent-linux-amd64`,
-`claver-agent-linux-arm64`, and `claver-agent.service` assets consumed by the
-installer.
