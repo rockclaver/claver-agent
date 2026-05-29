@@ -52,7 +52,11 @@ trap 'rm -rf "$tmp"' EXIT
 
 url="${RELEASE_BASE}/v${VERSION}/claver-agent-linux-${arch}"
 echo "downloading $url" >&2
-curl -fsSL "$url" -o "$tmp/claver-agent"
+if ! curl -fsSL "$url" -o "$tmp/claver-agent"; then
+  echo "failed to download claver-agent ${VERSION} for linux-${arch}" >&2
+  echo "expected release asset: $url" >&2
+  exit 1
+fi
 chmod 0755 "$tmp/claver-agent"
 install -m 0755 "$tmp/claver-agent" "$BIN_DST"
 
@@ -61,7 +65,12 @@ install -m 0755 "$tmp/claver-agent" "$BIN_DST"
 if [[ -f "$(dirname "$0")/../systemd/claver-agent.service" ]]; then
   install -m 0644 "$(dirname "$0")/../systemd/claver-agent.service" "$UNIT_DST"
 else
-  curl -fsSL "${RELEASE_BASE}/v${VERSION}/claver-agent.service" -o "$UNIT_DST"
+  unit_url="${RELEASE_BASE}/v${VERSION}/claver-agent.service"
+  if ! curl -fsSL "$unit_url" -o "$UNIT_DST"; then
+    echo "failed to download claver-agent systemd unit" >&2
+    echo "expected release asset: $unit_url" >&2
+    exit 1
+  fi
   chmod 0644 "$UNIT_DST"
 fi
 
