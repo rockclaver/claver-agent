@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"github.com/rockclaver/claver/agent/internal/cliauth"
+	"github.com/rockclaver/claver/agent/internal/docker"
 	gh "github.com/rockclaver/claver/agent/internal/github"
 	"github.com/rockclaver/claver/agent/internal/previews"
 	"github.com/rockclaver/claver/agent/internal/projects"
@@ -87,6 +88,11 @@ func main() {
 		previewMgr = nil
 	}
 
+	dockerMgr, err := docker.New(docker.Config{Client: docker.NewSocketClient("")})
+	if err != nil {
+		log.Fatalf("claver-agent: init docker: %v", err)
+	}
+
 	srv := server.New(server.Config{
 		Addr:     *addr,
 		Projects: mgr,
@@ -96,6 +102,7 @@ func main() {
 		Previews: previewMgr,
 		Tooling:  toolingMgr,
 		Auth:     authMgr,
+		Docker:   dockerMgr,
 	})
 	ln, err := srv.Listen()
 	if err != nil {

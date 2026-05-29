@@ -13,6 +13,7 @@ import (
 	"nhooyr.io/websocket"
 
 	"github.com/rockclaver/claver/agent/internal/cliauth"
+	"github.com/rockclaver/claver/agent/internal/docker"
 	gh "github.com/rockclaver/claver/agent/internal/github"
 	"github.com/rockclaver/claver/agent/internal/projects"
 	"github.com/rockclaver/claver/agent/internal/review"
@@ -716,6 +717,116 @@ func TestDiff_StatusFileSummarize_OverWS(t *testing.T) {
 		t.Fatalf("summarize kind = %q payload %s", resp.Kind, resp.Payload)
 	}
 }
+
+// AC: docker.status surfaces the typed daemon status (availability + version
+// or machine-readable unavailable reason) over the WebSocket.
+func TestDockerStatus_Reachable(t *testing.T) {
+	mgr, err := docker.New(docker.Config{Client: fakeDockerClient{v: docker.VersionInfo{Version: "26.0.0", APIVersion: "1.45"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wsURL, stop := startTestServerWith(t, Config{Addr: "127.0.0.1:0", Docker: mgr})
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close(websocket.StatusNormalClosure, "")
+	req, _ := json.Marshal(Frame{ID: "1", Kind: "docker.status"})
+	if err := c.Write(ctx, websocket.MessageText, req); err != nil {
+		t.Fatal(err)
+	}
+	_, data, err := c.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp Frame
+	_ = json.Unmarshal(data, &resp)
+	if resp.Kind != "docker.status" {
+		t.Fatalf("kind = %q (payload %s)", resp.Kind, resp.Payload)
+	}
+	var dto DockerStatusDTO
+	if err := json.Unmarshal(resp.Payload, &dto); err != nil {
+		t.Fatal(err)
+	}
+	if !dto.Available || dto.Version != "26.0.0" || dto.APIVersion != "1.45" {
+		t.Errorf("unexpected dto: %+v", dto)
+	}
+}
+
+func TestDockerStatus_PermissionDenied(t *testing.T) {
+	mgr, err := docker.New(docker.Config{Client: fakeDockerClient{err: fakeErr{cause: docker.ErrPermissionDenied}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wsURL, stop := startTestServerWith(t, Config{Addr: "127.0.0.1:0", Docker: mgr})
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close(websocket.StatusNormalClosure, "")
+	req, _ := json.Marshal(Frame{ID: "1", Kind: "docker.status"})
+	_ = c.Write(ctx, websocket.MessageText, req)
+	_, data, err := c.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp Frame
+	_ = json.Unmarshal(data, &resp)
+	var dto DockerStatusDTO
+	_ = json.Unmarshal(resp.Payload, &dto)
+	if dto.Available {
+		t.Fatalf("expected unavailable, got %+v", dto)
+	}
+	if dto.UnavailableReason != docker.ReasonPermissionDenied {
+		t.Errorf("reason = %q", dto.UnavailableReason)
+	}
+}
+
+func TestDockerStatus_Unconfigured(t *testing.T) {
+	wsURL, stop := startTestServer(t)
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close(websocket.StatusNormalClosure, "")
+	req, _ := json.Marshal(Frame{ID: "1", Kind: "docker.status"})
+	_ = c.Write(ctx, websocket.MessageText, req)
+	_, data, err := c.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp Frame
+	_ = json.Unmarshal(data, &resp)
+	if !strings.HasPrefix(resp.Kind, "error.") {
+		t.Errorf("expected error frame, got %q", resp.Kind)
+	}
+}
+
+type fakeDockerClient struct {
+	v   docker.VersionInfo
+	err error
+}
+
+func (f fakeDockerClient) Version(context.Context) (docker.VersionInfo, error) {
+	return f.v, f.err
+}
+
+type fakeErr struct{ cause error }
+
+func (e fakeErr) Error() string { return "fake: " + e.cause.Error() }
+func (e fakeErr) Unwrap() error { return e.cause }
 
 func mustWriteFile(t *testing.T, path, body string) {
 	t.Helper()

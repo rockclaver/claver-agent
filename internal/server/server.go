@@ -18,6 +18,7 @@ import (
 	"nhooyr.io/websocket"
 
 	"github.com/rockclaver/claver/agent/internal/cliauth"
+	"github.com/rockclaver/claver/agent/internal/docker"
 	gh "github.com/rockclaver/claver/agent/internal/github"
 	"github.com/rockclaver/claver/agent/internal/previews"
 	"github.com/rockclaver/claver/agent/internal/projects"
@@ -62,6 +63,8 @@ type Config struct {
 	Tooling *tooling.Manager
 	// Auth, when non-nil, enables auth.* kinds (CLI login flows).
 	Auth *cliauth.Manager
+	// Docker, when non-nil, enables docker.* kinds.
+	Docker *docker.Manager
 }
 
 // Server is the agent's control-plane server.
@@ -292,6 +295,8 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *sync.
 		"auth.logout",
 		"auth.relay_callback":
 		s.dispatchAuth(ctx, c, writeMu, f)
+	case "docker.status":
+		s.dispatchDocker(ctx, c, writeMu, f)
 	case "github.repo_list",
 		"github.repo_import",
 		"github.commit",
@@ -1171,6 +1176,37 @@ func wildcardDNSHint(base string) string {
 		return ""
 	}
 	return "*." + base
+}
+
+// DockerStatusDTO mirrors docker.Status on the wire.
+type DockerStatusDTO struct {
+	Available          bool   `json:"available"`
+	Version            string `json:"version,omitempty"`
+	APIVersion         string `json:"api_version,omitempty"`
+	UnavailableReason  string `json:"unavailable_reason,omitempty"`
+	UnavailableMessage string `json:"unavailable_message,omitempty"`
+}
+
+func toDockerDTO(st docker.Status) DockerStatusDTO {
+	return DockerStatusDTO{
+		Available:          st.Available,
+		Version:            st.Version,
+		APIVersion:         st.APIVersion,
+		UnavailableReason:  st.UnavailableReason,
+		UnavailableMessage: st.UnavailableMessage,
+	}
+}
+
+func (s *Server) dispatchDocker(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, f Frame) {
+	if s.cfg.Docker == nil {
+		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "docker subsystem not configured")
+		return
+	}
+	switch f.Kind {
+	case "docker.status":
+		st := s.cfg.Docker.Status(ctx)
+		s.writeOK(ctx, c, writeMu, f.ID, "docker.status", toDockerDTO(st))
+	}
 }
 
 // ToolingStatusDTO mirrors tooling.Status on the wire.
