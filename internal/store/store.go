@@ -41,6 +41,44 @@ type SessionEvent struct {
 	CreatedAt time.Time
 }
 
+// AuditEntry is one row in the agent's append-only audit log.
+type AuditEntry struct {
+	ID        int64
+	Type      string
+	ProjectID string
+	SessionID string
+	Actor     string
+	Summary   string
+	Data      string
+	CreatedAt time.Time
+}
+
+// ConfirmationToken is a single-use, action-bound credential minted after a
+// biometric prompt on the mobile client. The agent verifies that a token has
+// not been consumed, has not expired, and that its bound action_hash matches
+// the action being attempted before performing any state-changing call that
+// requires confirmation (review.approve, push.*, commit.*).
+type ConfirmationToken struct {
+	Token      string
+	ActionHash string
+	ProjectID  string
+	CreatedAt  time.Time
+	ExpiresAt  time.Time
+	UsedAt     *time.Time
+}
+
+// DiffSummary caches an AI-generated description of one file's changes at a
+// specific revision (typically the working-tree blob hash). Cached so that
+// repeated `diff.summarize` calls for the same content do not re-invoke the
+// agent.
+type DiffSummary struct {
+	ProjectID string
+	Path      string
+	Revision  string
+	Summary   string
+	CreatedAt time.Time
+}
+
 // ErrNotFound is returned when a row does not exist.
 var ErrNotFound = errors.New("not found")
 
@@ -98,6 +136,39 @@ CREATE TABLE IF NOT EXISTS session_events (
 	created_at INTEGER NOT NULL,
 	PRIMARY KEY(session_id, seq),
 	FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS audit (
+	id         INTEGER PRIMARY KEY AUTOINCREMENT,
+	type       TEXT NOT NULL,
+	project_id TEXT NOT NULL DEFAULT '',
+	session_id TEXT NOT NULL DEFAULT '',
+	actor      TEXT NOT NULL DEFAULT '',
+	summary    TEXT NOT NULL DEFAULT '',
+	data       TEXT NOT NULL DEFAULT '',
+	created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS audit_created_idx ON audit(created_at DESC);
+CREATE INDEX IF NOT EXISTS audit_type_idx ON audit(type);
+CREATE INDEX IF NOT EXISTS audit_project_idx ON audit(project_id);
+
+CREATE TABLE IF NOT EXISTS confirmation_tokens (
+	token       TEXT PRIMARY KEY,
+	action_hash TEXT NOT NULL,
+	project_id  TEXT NOT NULL DEFAULT '',
+	created_at  INTEGER NOT NULL,
+	expires_at  INTEGER NOT NULL,
+	used_at     INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS diff_summaries (
+	project_id TEXT NOT NULL,
+	path       TEXT NOT NULL,
+	revision   TEXT NOT NULL,
+	summary    TEXT NOT NULL,
+	created_at INTEGER NOT NULL,
+	PRIMARY KEY(project_id, path, revision)
 );
 `)
 	return err
@@ -324,6 +395,142 @@ func (s *Store) SessionEventsAfter(sessionID string, afterSeq int64) ([]SessionE
 		out = append(out, ev)
 	}
 	return out, rows.Err()
+}
+
+// AppendAudit inserts an audit row, assigns its rowid, and returns it.
+func (s *Store) AppendAudit(e AuditEntry) (AuditEntry, error) {
+	if e.CreatedAt.IsZero() {
+		e.CreatedAt = time.Now()
+	}
+	res, err := s.db.Exec(
+		`INSERT INTO audit (type, project_id, session_id, actor, summary, data, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		e.Type, e.ProjectID, e.SessionID, e.Actor, e.Summary, e.Data, e.CreatedAt.Unix(),
+	)
+	if err != nil {
+		return AuditEntry{}, err
+	}
+	e.ID, _ = res.LastInsertId()
+	return e, nil
+}
+
+// ListAudit returns the most recent audit rows matching the filter. An empty
+// filter field means "any". Limit is clamped to [1, 500].
+func (s *Store) ListAudit(filterType, projectID string, limit int) ([]AuditEntry, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	rows, err := s.db.Query(
+		`SELECT id, type, project_id, session_id, actor, summary, data, created_at
+		 FROM audit
+		 WHERE (? = '' OR type = ?) AND (? = '' OR project_id = ?)
+		 ORDER BY created_at DESC, id DESC
+		 LIMIT ?`,
+		filterType, filterType, projectID, projectID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]AuditEntry, 0)
+	for rows.Next() {
+		var e AuditEntry
+		var ts int64
+		if err := rows.Scan(&e.ID, &e.Type, &e.ProjectID, &e.SessionID, &e.Actor, &e.Summary, &e.Data, &ts); err != nil {
+			return nil, err
+		}
+		e.CreatedAt = time.Unix(ts, 0)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// CreateConfirmationToken stores a freshly minted token. Returns an error if
+// the token already exists.
+func (s *Store) CreateConfirmationToken(tok ConfirmationToken) error {
+	if tok.CreatedAt.IsZero() {
+		tok.CreatedAt = time.Now()
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO confirmation_tokens (token, action_hash, project_id, created_at, expires_at, used_at)
+		 VALUES (?, ?, ?, ?, ?, NULL)`,
+		tok.Token, tok.ActionHash, tok.ProjectID, tok.CreatedAt.Unix(), tok.ExpiresAt.Unix(),
+	)
+	return err
+}
+
+// GetConfirmationToken loads a token by its opaque ID.
+func (s *Store) GetConfirmationToken(token string) (ConfirmationToken, error) {
+	row := s.db.QueryRow(
+		`SELECT token, action_hash, project_id, created_at, expires_at, used_at
+		 FROM confirmation_tokens WHERE token = ?`, token,
+	)
+	var t ConfirmationToken
+	var created, expires int64
+	var used sql.NullInt64
+	if err := row.Scan(&t.Token, &t.ActionHash, &t.ProjectID, &created, &expires, &used); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ConfirmationToken{}, fmt.Errorf("confirmation_token: %w", ErrNotFound)
+		}
+		return ConfirmationToken{}, err
+	}
+	t.CreatedAt = time.Unix(created, 0)
+	t.ExpiresAt = time.Unix(expires, 0)
+	if used.Valid {
+		u := time.Unix(used.Int64, 0)
+		t.UsedAt = &u
+	}
+	return t, nil
+}
+
+// MarkConfirmationTokenUsed atomically flips the used_at column from NULL to
+// `at`. Returns true if the update succeeded (token had not been used yet).
+func (s *Store) MarkConfirmationTokenUsed(token string, at time.Time) (bool, error) {
+	res, err := s.db.Exec(
+		`UPDATE confirmation_tokens SET used_at = ? WHERE token = ? AND used_at IS NULL`,
+		at.Unix(), token,
+	)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n == 1, nil
+}
+
+// GetDiffSummary loads a cached diff summary, if any.
+func (s *Store) GetDiffSummary(projectID, path, revision string) (DiffSummary, error) {
+	row := s.db.QueryRow(
+		`SELECT project_id, path, revision, summary, created_at
+		 FROM diff_summaries WHERE project_id = ? AND path = ? AND revision = ?`,
+		projectID, path, revision,
+	)
+	var d DiffSummary
+	var ts int64
+	if err := row.Scan(&d.ProjectID, &d.Path, &d.Revision, &d.Summary, &ts); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return DiffSummary{}, fmt.Errorf("diff_summary: %w", ErrNotFound)
+		}
+		return DiffSummary{}, err
+	}
+	d.CreatedAt = time.Unix(ts, 0)
+	return d, nil
+}
+
+// PutDiffSummary upserts a diff summary cache row.
+func (s *Store) PutDiffSummary(d DiffSummary) error {
+	if d.CreatedAt.IsZero() {
+		d.CreatedAt = time.Now()
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO diff_summaries (project_id, path, revision, summary, created_at)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(project_id, path, revision) DO UPDATE SET summary = excluded.summary`,
+		d.ProjectID, d.Path, d.Revision, d.Summary, d.CreatedAt.Unix(),
+	)
+	return err
 }
 
 func nullableUnix(t *time.Time) any {

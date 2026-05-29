@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"github.com/rockclaver/claver/agent/internal/projects"
+	"github.com/rockclaver/claver/agent/internal/review"
 	"github.com/rockclaver/claver/agent/internal/server"
 	"github.com/rockclaver/claver/agent/internal/sessions"
 	"github.com/rockclaver/claver/agent/internal/store"
@@ -42,8 +43,14 @@ func main() {
 		log.Fatalf("claver-agent: init workspaces: %v", err)
 	}
 	sessionMgr := sessions.New(st, mgr, sessions.TmuxRuntime{})
+	reviewMgr := review.New(mgr, st, review.HeuristicSummarizer{})
 
-	srv := server.New(server.Config{Addr: *addr, Projects: mgr, Sessions: sessionMgr})
+	srv := server.New(server.Config{
+		Addr:     *addr,
+		Projects: mgr,
+		Sessions: sessionMgr,
+		Review:   reviewMgr,
+	})
 	ln, err := srv.Listen()
 	if err != nil {
 		log.Fatalf("claver-agent: %v", err)

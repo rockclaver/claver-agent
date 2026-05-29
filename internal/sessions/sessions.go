@@ -173,6 +173,16 @@ func (m *Manager) Rehydrate(ctx context.Context) error {
 	return nil
 }
 
+// PublishExisting fans an event that has already been persisted (by another
+// subsystem such as review) out to live subscribers without re-appending it.
+func (m *Manager) PublishExisting(ev store.SessionEvent) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for ch := range m.subs[ev.SessionID] {
+		ch <- ev
+	}
+}
+
 func (m *Manager) Publish(ev store.SessionEvent) (store.SessionEvent, error) {
 	ev, err := m.Store.AppendSessionEvent(ev)
 	if err != nil {

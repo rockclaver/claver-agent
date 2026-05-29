@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"nhooyr.io/websocket"
 
 	"github.com/rockclaver/claver/agent/internal/projects"
+	"github.com/rockclaver/claver/agent/internal/review"
 	"github.com/rockclaver/claver/agent/internal/sessions"
 	"github.com/rockclaver/claver/agent/internal/store"
 	"github.com/rockclaver/claver/agent/internal/version"
@@ -331,5 +333,175 @@ func TestSessionStartRejectsArbitraryAgentOverWS(t *testing.T) {
 	_ = json.Unmarshal(data, &resp)
 	if resp.Kind != "error.bad_agent" {
 		t.Fatalf("got %q want error.bad_agent", resp.Kind)
+	}
+}
+
+// AC: end-to-end approval flow. confirm + review.approve + audit.list over WS.
+func TestReview_ApproveFlow_OverWS(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	pm, err := projects.New(filepath.Join(dir, "p"), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pm.IDGen = func() string { return "p1" }
+	if _, err := pm.CreateEmpty("demo"); err != nil {
+		t.Fatal(err)
+	}
+	rm := review.New(pm, st, review.HeuristicSummarizer{})
+	sm := sessions.New(st, pm, fakeSessionRuntime{})
+	sm.IDGen = func() string { return "s1" }
+	if _, err := sm.Start(context.Background(), "p1", "codex"); err != nil {
+		t.Fatal(err)
+	}
+
+	wsURL, stop := startTestServerWith(t, Config{Addr: "127.0.0.1:0", Projects: pm, Sessions: sm, Review: rm})
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close(websocket.StatusNormalClosure, "")
+
+	// 1. Approve without a token must fail with token_invalid.
+	payload, _ := json.Marshal(map[string]any{
+		"project_id": "p1", "session_id": "s1",
+		"files": []string{"x.txt"}, "comment": "",
+	})
+	req, _ := json.Marshal(Frame{ID: "1", Kind: "review.approve", Payload: payload})
+	_ = c.Write(ctx, websocket.MessageText, req)
+	_, data, _ := c.Read(ctx)
+	var resp Frame
+	_ = json.Unmarshal(data, &resp)
+	if resp.Kind != "error.token_invalid" {
+		t.Fatalf("missing token: kind = %q want error.token_invalid", resp.Kind)
+	}
+
+	// 2. Mint a token via auth.confirm.
+	payload, _ = json.Marshal(map[string]any{
+		"action": "review.approve", "project_id": "p1",
+		"files": []string{"x.txt"}, "comment": "",
+	})
+	req, _ = json.Marshal(Frame{ID: "2", Kind: "auth.confirm", Payload: payload})
+	_ = c.Write(ctx, websocket.MessageText, req)
+	_, data, _ = c.Read(ctx)
+	_ = json.Unmarshal(data, &resp)
+	if resp.Kind != "auth.confirm" {
+		t.Fatalf("auth.confirm kind = %q", resp.Kind)
+	}
+	var mint struct {
+		Token string `json:"confirmation_token"`
+	}
+	_ = json.Unmarshal(resp.Payload, &mint)
+	if mint.Token == "" {
+		t.Fatal("empty token")
+	}
+
+	// 3. Approve with token: succeeds.
+	payload, _ = json.Marshal(map[string]any{
+		"project_id": "p1", "session_id": "s1",
+		"files": []string{"x.txt"}, "comment": "",
+		"confirmation_token": mint.Token,
+	})
+	req, _ = json.Marshal(Frame{ID: "3", Kind: "review.approve", Payload: payload})
+	_ = c.Write(ctx, websocket.MessageText, req)
+	_, data, _ = c.Read(ctx)
+	_ = json.Unmarshal(data, &resp)
+	if resp.Kind != "review.approve" {
+		t.Fatalf("approve kind = %q payload %s", resp.Kind, resp.Payload)
+	}
+
+	// 4. Replay rejected as token_used.
+	req, _ = json.Marshal(Frame{ID: "4", Kind: "review.approve", Payload: payload})
+	_ = c.Write(ctx, websocket.MessageText, req)
+	_, data, _ = c.Read(ctx)
+	_ = json.Unmarshal(data, &resp)
+	if resp.Kind != "error.token_used" {
+		t.Fatalf("replay kind = %q want error.token_used", resp.Kind)
+	}
+
+	// 5. audit.list must contain the approval.
+	payload, _ = json.Marshal(map[string]any{"type": "review.approve"})
+	req, _ = json.Marshal(Frame{ID: "5", Kind: "audit.list", Payload: payload})
+	_ = c.Write(ctx, websocket.MessageText, req)
+	_, data, _ = c.Read(ctx)
+	_ = json.Unmarshal(data, &resp)
+	var list struct {
+		Entries []AuditDTO `json:"entries"`
+	}
+	_ = json.Unmarshal(resp.Payload, &list)
+	if len(list.Entries) == 0 || list.Entries[0].Type != "review.approve" {
+		t.Fatalf("audit list missing approval: %+v", list)
+	}
+}
+
+// AC: diff.status / diff.file / diff.summarize wire through over WS.
+func TestDiff_StatusFileSummarize_OverWS(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	pm, err := projects.New(filepath.Join(dir, "p"), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pm.IDGen = func() string { return "p1" }
+	if _, err := pm.CreateEmpty("demo"); err != nil {
+		t.Fatal(err)
+	}
+	ws := pm.WorkspaceDir("p1")
+	mustWriteFile(t, ws+"/added.txt", "fresh\n")
+	rm := review.New(pm, st, review.HeuristicSummarizer{})
+	wsURL, stop := startTestServerWith(t, Config{Addr: "127.0.0.1:0", Projects: pm, Review: rm})
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close(websocket.StatusNormalClosure, "")
+
+	payload, _ := json.Marshal(map[string]any{"project_id": "p1"})
+	req, _ := json.Marshal(Frame{ID: "1", Kind: "diff.status", Payload: payload})
+	_ = c.Write(ctx, websocket.MessageText, req)
+	_, data, _ := c.Read(ctx)
+	var resp Frame
+	_ = json.Unmarshal(data, &resp)
+	if resp.Kind != "diff.status" {
+		t.Fatalf("status kind = %q", resp.Kind)
+	}
+	var list struct {
+		Files []ChangedFileDTO `json:"files"`
+	}
+	_ = json.Unmarshal(resp.Payload, &list)
+	if len(list.Files) == 0 || list.Files[0].Path != "added.txt" {
+		t.Fatalf("diff.status missing added.txt: %+v", list)
+	}
+
+	payload, _ = json.Marshal(map[string]any{"project_id": "p1", "path": "added.txt"})
+	req, _ = json.Marshal(Frame{ID: "2", Kind: "diff.summarize", Payload: payload})
+	_ = c.Write(ctx, websocket.MessageText, req)
+	_, data, _ = c.Read(ctx)
+	_ = json.Unmarshal(data, &resp)
+	if resp.Kind != "diff.summarize" {
+		t.Fatalf("summarize kind = %q payload %s", resp.Kind, resp.Payload)
+	}
+}
+
+func mustWriteFile(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }

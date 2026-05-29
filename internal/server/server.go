@@ -18,6 +18,7 @@ import (
 	"nhooyr.io/websocket"
 
 	"github.com/rockclaver/claver/agent/internal/projects"
+	"github.com/rockclaver/claver/agent/internal/review"
 	"github.com/rockclaver/claver/agent/internal/sessions"
 	"github.com/rockclaver/claver/agent/internal/store"
 	"github.com/rockclaver/claver/agent/internal/version"
@@ -46,6 +47,9 @@ type Config struct {
 	Projects *projects.Manager
 	// Sessions, when non-nil, enables the session.* kinds.
 	Sessions *sessions.Manager
+	// Review, when non-nil, enables the diff.*, review.*, auth.confirm,
+	// and audit.list kinds.
+	Review *review.Manager
 }
 
 // Server is the agent's control-plane server.
@@ -165,6 +169,15 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *sync.
 		"session.subscribe",
 		"session.download":
 		s.dispatchSession(ctx, c, writeMu, f)
+	case "diff.status",
+		"diff.file",
+		"diff.summarize",
+		"review.approve",
+		"review.reject",
+		"review.revise",
+		"auth.confirm",
+		"audit.list":
+		s.dispatchReview(ctx, c, writeMu, f)
 	default:
 		s.writeError(ctx, c, writeMu, f.ID, "unknown_kind", f.Kind)
 	}
@@ -437,6 +450,204 @@ func (s *Server) dispatchSession(ctx context.Context, c *websocket.Conn, writeMu
 				}
 			}
 		}()
+	}
+}
+
+// ChangedFileDTO is the wire shape of one row in diff.status.
+type ChangedFileDTO struct {
+	Path     string `json:"path"`
+	OldPath  string `json:"old_path,omitempty"`
+	Group    string `json:"group"`
+	Binary   bool   `json:"binary"`
+	Revision string `json:"revision"`
+}
+
+// AuditDTO is the wire shape of one audit row.
+type AuditDTO struct {
+	ID        int64  `json:"id"`
+	Type      string `json:"type"`
+	ProjectID string `json:"project_id"`
+	SessionID string `json:"session_id,omitempty"`
+	Actor     string `json:"actor"`
+	Summary   string `json:"summary"`
+	Data      string `json:"data,omitempty"`
+	CreatedAt int64  `json:"created_at"`
+}
+
+func (s *Server) dispatchReview(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, f Frame) {
+	if s.cfg.Review == nil {
+		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "review subsystem not configured")
+		return
+	}
+	mgr := s.cfg.Review
+	switch f.Kind {
+	case "diff.status":
+		var in struct {
+			ProjectID string `json:"project_id"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ProjectID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "project_id required")
+			return
+		}
+		files, err := mgr.Status(in.ProjectID)
+		if err != nil {
+			s.writeReviewErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		out := make([]ChangedFileDTO, 0, len(files))
+		for _, fl := range files {
+			out = append(out, ChangedFileDTO{
+				Path: fl.Path, OldPath: fl.OldPath, Group: string(fl.Group),
+				Binary: fl.Binary, Revision: fl.Revision,
+			})
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "diff.status", map[string]any{"files": out})
+	case "diff.file":
+		var in struct {
+			ProjectID string `json:"project_id"`
+			Path      string `json:"path"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ProjectID == "" || in.Path == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "project_id and path required")
+			return
+		}
+		fp, err := mgr.File(in.ProjectID, in.Path)
+		if err != nil {
+			s.writeReviewErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "diff.file", fp)
+	case "diff.summarize":
+		var in struct {
+			ProjectID string `json:"project_id"`
+			Path      string `json:"path"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ProjectID == "" || in.Path == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "project_id and path required")
+			return
+		}
+		row, err := mgr.Summarize(in.ProjectID, in.Path)
+		if err != nil {
+			s.writeReviewErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "diff.summarize", map[string]any{
+			"path":       row.Path,
+			"revision":   row.Revision,
+			"summary":    row.Summary,
+			"created_at": row.CreatedAt.Unix(),
+		})
+	case "auth.confirm":
+		var in struct {
+			Action    string   `json:"action"`
+			ProjectID string   `json:"project_id"`
+			Files     []string `json:"files"`
+			Comment   string   `json:"comment"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Action == "" || in.ProjectID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "action and project_id required")
+			return
+		}
+		tok, err := mgr.MintConfirmationToken(in.Action, in.ProjectID, in.Files, in.Comment)
+		if err != nil {
+			s.writeReviewErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "auth.confirm", map[string]any{
+			"confirmation_token": tok.Token,
+			"action_hash":        tok.ActionHash,
+			"expires_at":         tok.ExpiresAt.Unix(),
+		})
+	case "review.approve":
+		s.dispatchReviewDecision(ctx, c, writeMu, f, mgr, "review.approve", true)
+	case "review.reject":
+		s.dispatchReviewDecision(ctx, c, writeMu, f, mgr, "review.reject", false)
+	case "review.revise":
+		s.dispatchReviewDecision(ctx, c, writeMu, f, mgr, "review.revise", false)
+	case "audit.list":
+		var in struct {
+			Type      string `json:"type"`
+			ProjectID string `json:"project_id"`
+			Limit     int    `json:"limit"`
+		}
+		_ = json.Unmarshal(f.Payload, &in)
+		entries, err := mgr.ListAudit(in.Type, in.ProjectID, in.Limit)
+		if err != nil {
+			s.writeReviewErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		out := make([]AuditDTO, 0, len(entries))
+		for _, e := range entries {
+			out = append(out, AuditDTO{
+				ID: e.ID, Type: e.Type, ProjectID: e.ProjectID, SessionID: e.SessionID,
+				Actor: e.Actor, Summary: e.Summary, Data: e.Data, CreatedAt: e.CreatedAt.Unix(),
+			})
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "audit.list", map[string]any{"entries": out})
+	}
+}
+
+func (s *Server) dispatchReviewDecision(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, f Frame, mgr *review.Manager, action string, requireToken bool) {
+	var in struct {
+		ProjectID         string   `json:"project_id"`
+		SessionID         string   `json:"session_id"`
+		Files             []string `json:"files"`
+		Comment           string   `json:"comment"`
+		ConfirmationToken string   `json:"confirmation_token"`
+	}
+	if err := json.Unmarshal(f.Payload, &in); err != nil || in.ProjectID == "" || len(in.Files) == 0 {
+		s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "project_id and files required")
+		return
+	}
+	if requireToken {
+		if err := mgr.ConsumeToken(in.ConfirmationToken, action, in.ProjectID, in.Files, in.Comment); err != nil {
+			s.writeReviewErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+	}
+	var (
+		ev    store.SessionEvent
+		audit store.AuditEntry
+		err   error
+	)
+	switch action {
+	case "review.approve":
+		ev, audit, err = mgr.Approve(in.ProjectID, in.SessionID, in.Files, in.Comment)
+	case "review.reject":
+		ev, audit, err = mgr.Reject(in.ProjectID, in.SessionID, in.Files, in.Comment)
+	case "review.revise":
+		ev, audit, err = mgr.Revise(in.ProjectID, in.SessionID, in.Files, in.Comment)
+	}
+	if err != nil {
+		s.writeReviewErr(ctx, c, writeMu, f.ID, err)
+		return
+	}
+	// Surface the new session event to live subscribers so the UI sees the
+	// review decision immediately.
+	if s.cfg.Sessions != nil && in.SessionID != "" && ev.Seq > 0 {
+		s.cfg.Sessions.PublishExisting(ev)
+	}
+	s.writeOK(ctx, c, writeMu, f.ID, action, map[string]any{
+		"audit_id":   audit.ID,
+		"session_id": in.SessionID,
+		"seq":        ev.Seq,
+	})
+}
+
+func (s *Server) writeReviewErr(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, id string, err error) {
+	switch {
+	case errors.Is(err, review.ErrTokenInvalid):
+		s.writeError(ctx, c, writeMu, id, "token_invalid", err.Error())
+	case errors.Is(err, review.ErrTokenUsed):
+		s.writeError(ctx, c, writeMu, id, "token_used", err.Error())
+	case errors.Is(err, review.ErrTokenExpired):
+		s.writeError(ctx, c, writeMu, id, "token_expired", err.Error())
+	case errors.Is(err, review.ErrTokenMismatch):
+		s.writeError(ctx, c, writeMu, id, "token_mismatch", err.Error())
+	case errors.Is(err, review.ErrNotFound), errors.Is(err, projects.ErrNotFound), errors.Is(err, store.ErrNotFound):
+		s.writeError(ctx, c, writeMu, id, "not_found", err.Error())
+	default:
+		s.writeError(ctx, c, writeMu, id, "internal", err.Error())
 	}
 }
 
