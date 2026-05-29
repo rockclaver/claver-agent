@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"github.com/rockclaver/claver/agent/internal/cliauth"
 	gh "github.com/rockclaver/claver/agent/internal/github"
 	"github.com/rockclaver/claver/agent/internal/previews"
 	"github.com/rockclaver/claver/agent/internal/projects"
@@ -16,6 +17,7 @@ import (
 	"github.com/rockclaver/claver/agent/internal/server"
 	"github.com/rockclaver/claver/agent/internal/sessions"
 	"github.com/rockclaver/claver/agent/internal/store"
+	"github.com/rockclaver/claver/agent/internal/tooling"
 	"github.com/rockclaver/claver/agent/internal/version"
 )
 
@@ -47,10 +49,32 @@ func main() {
 	if err != nil {
 		log.Fatalf("claver-agent: init workspaces: %v", err)
 	}
-	sessionMgr := sessions.New(st, mgr, sessions.TmuxRuntime{})
+	toolingMgr, err := tooling.New(tooling.Config{
+		BinDir:    filepath.Join(*dataDir, "bin"),
+		NpmPrefix: filepath.Join(*dataDir, "npm-prefix"),
+	})
+	if err != nil {
+		log.Fatalf("claver-agent: init tooling: %v", err)
+	}
 	reviewMgr := review.New(mgr, st, review.HeuristicSummarizer{})
 	vault := gh.NewTokenVault(filepath.Join(*dataDir, "github-token.key"), filepath.Join(*dataDir, "github-tokens"))
 	githubMgr := gh.New(st, mgr, reviewMgr, vault, *githubClientID)
+
+	// cliauth reuses the same vault for CLI credentials. SQLite keeps the
+	// two namespaces separate (cli_tokens vs github_tokens).
+	authMgr, err := cliauth.New(cliauth.Config{
+		BinDir:  toolingMgr.BinDir(),
+		HomeDir: homeDirOr(*dataDir),
+		Vault:   vault,
+		Store:   st,
+	})
+	if err != nil {
+		log.Fatalf("claver-agent: init cliauth: %v", err)
+	}
+	sessionMgr := sessions.New(st, mgr, sessions.TmuxRuntime{
+		ExtraPath: toolingMgr.BinDir(),
+		Secrets:   authMgr.Secrets,
+	})
 
 	previewMgr, err := previews.New(previews.Config{
 		FragmentsDir: *caddyFragmentsDir,
@@ -71,6 +95,8 @@ func main() {
 		Review:   reviewMgr,
 		GitHub:   githubMgr,
 		Previews: previewMgr,
+		Tooling:  toolingMgr,
+		Auth:     authMgr,
 	})
 	ln, err := srv.Listen()
 	if err != nil {
@@ -100,4 +126,14 @@ func defaultDataDir() string {
 		return filepath.Join(home, "claver")
 	}
 	return "./claver-data"
+}
+
+// homeDirOr falls back to the parent of dataDir if $HOME isn't set, so the
+// CLIs' credential files land somewhere stable. On the systemd-managed agent
+// $HOME=/var/lib/claver, dataDir=/var/lib/claver/claver, parent matches.
+func homeDirOr(dataDir string) string {
+	if h, err := os.UserHomeDir(); err == nil && h != "" {
+		return h
+	}
+	return filepath.Dir(dataDir)
 }

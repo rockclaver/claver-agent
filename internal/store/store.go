@@ -114,6 +114,18 @@ type GitHubToken struct {
 	UpdatedAt      time.Time
 }
 
+// CliToken stores the encrypted credential material for one CLI (claude or
+// codex). Method records how the credential was obtained so callers can
+// reconstruct the right env vars / on-disk file when launching sessions.
+type CliToken struct {
+	Kind           string // "claude" | "codex"
+	Method         string // "subscription" | "token" | "api_key" | "auth_json"
+	Account        string // best-effort identifier (email, login) — may be empty
+	CiphertextPath string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
 // ErrNotFound is returned when a row does not exist.
 var ErrNotFound = errors.New("not found")
 
@@ -235,6 +247,15 @@ CREATE INDEX IF NOT EXISTS previews_status_idx  ON previews(status);
 CREATE TABLE IF NOT EXISTS agent_settings (
 	key   TEXT PRIMARY KEY,
 	value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS cli_tokens (
+	kind            TEXT PRIMARY KEY,
+	method          TEXT NOT NULL,
+	account         TEXT NOT NULL DEFAULT '',
+	ciphertext_path TEXT NOT NULL,
+	created_at      INTEGER NOT NULL,
+	updated_at      INTEGER NOT NULL
 );
 `)
 	return err
@@ -666,6 +687,51 @@ func (s *Store) ListGitHubTokens() ([]GitHubToken, error) {
 // DeleteGitHubToken removes one token pointer.
 func (s *Store) DeleteGitHubToken(accountLogin string) error {
 	_, err := s.db.Exec(`DELETE FROM github_tokens WHERE account_login = ?`, accountLogin)
+	return err
+}
+
+// PutCliToken upserts the encrypted credential pointer for a CLI.
+func (s *Store) PutCliToken(t CliToken) error {
+	now := time.Now()
+	if t.CreatedAt.IsZero() {
+		t.CreatedAt = now
+	}
+	t.UpdatedAt = now
+	_, err := s.db.Exec(
+		`INSERT INTO cli_tokens (kind, method, account, ciphertext_path, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(kind) DO UPDATE SET
+		   method = excluded.method,
+		   account = excluded.account,
+		   ciphertext_path = excluded.ciphertext_path,
+		   updated_at = excluded.updated_at`,
+		t.Kind, t.Method, t.Account, t.CiphertextPath, t.CreatedAt.Unix(), t.UpdatedAt.Unix(),
+	)
+	return err
+}
+
+// GetCliToken loads the credential pointer for one CLI kind.
+func (s *Store) GetCliToken(kind string) (CliToken, error) {
+	row := s.db.QueryRow(
+		`SELECT kind, method, account, ciphertext_path, created_at, updated_at
+		 FROM cli_tokens WHERE kind = ?`, kind,
+	)
+	var t CliToken
+	var created, updated int64
+	if err := row.Scan(&t.Kind, &t.Method, &t.Account, &t.CiphertextPath, &created, &updated); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return CliToken{}, fmt.Errorf("cli_token: %w", ErrNotFound)
+		}
+		return CliToken{}, err
+	}
+	t.CreatedAt = time.Unix(created, 0)
+	t.UpdatedAt = time.Unix(updated, 0)
+	return t, nil
+}
+
+// DeleteCliToken removes one CLI credential pointer.
+func (s *Store) DeleteCliToken(kind string) error {
+	_, err := s.db.Exec(`DELETE FROM cli_tokens WHERE kind = ?`, kind)
 	return err
 }
 

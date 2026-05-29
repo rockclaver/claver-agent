@@ -291,9 +291,17 @@ func parseUsage(s string) (int, int, bool) {
 	return in, out, true
 }
 
-type TmuxRuntime struct{}
+// TmuxRuntime exec's tmux to host agent CLIs. ExtraPath, when set, is
+// prepended to $PATH for the launched pane so per-user-installed CLIs
+// (e.g. claude/codex under /var/lib/claver/bin) resolve. Secrets, when set,
+// returns env-var assignments to inject into the new pane via `tmux -e` so
+// the CLI inherits subscription credentials.
+type TmuxRuntime struct {
+	ExtraPath string
+	Secrets   func(agent string) map[string]string
+}
 
-func (TmuxRuntime) Start(ctx context.Context, spec RuntimeSpec) error {
+func (r TmuxRuntime) Start(ctx context.Context, spec RuntimeSpec) error {
 	if spec.Agent != "claude" && spec.Agent != "codex" {
 		return ErrBadAgent
 	}
@@ -301,14 +309,43 @@ func (TmuxRuntime) Start(ctx context.Context, spec RuntimeSpec) error {
 		return err
 	}
 	name := tmuxName(spec.SessionID)
-	if out, err := exec.CommandContext(ctx, "tmux", "new-session", "-d", "-s", name, "-n", spec.SessionID, "-c", spec.WorkDir, spec.Agent).CombinedOutput(); err != nil {
+	args := []string{"new-session", "-d", "-s", name, "-n", spec.SessionID, "-c", spec.WorkDir}
+	if r.Secrets != nil {
+		for k, v := range r.Secrets(spec.Agent) {
+			args = append(args, "-e", k+"="+v)
+		}
+	}
+	args = append(args, spec.Agent)
+	cmd := exec.CommandContext(ctx, "tmux", args...)
+	cmd.Env = r.envWithPath()
+	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("tmux new-session: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	_ = exec.CommandContext(ctx, "tmux", "select-pane", "-t", name+":0.0", "-T", spec.SessionID).Run()
-	return TmuxRuntime{}.Attach(ctx, spec)
+	return r.Attach(ctx, spec)
 }
 
-func (TmuxRuntime) Attach(ctx context.Context, spec RuntimeSpec) error {
+func (r TmuxRuntime) envWithPath() []string {
+	env := os.Environ()
+	if r.ExtraPath == "" {
+		return env
+	}
+	cur := os.Getenv("PATH")
+	newPath := r.ExtraPath
+	if cur != "" {
+		newPath = r.ExtraPath + ":" + cur
+	}
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "PATH=") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return append(out, "PATH="+newPath)
+}
+
+func (r TmuxRuntime) Attach(ctx context.Context, spec RuntimeSpec) error {
 	target := tmuxName(spec.SessionID) + ":0.0"
 	fifo := filepath.Join(os.TempDir(), "claver-"+spec.SessionID+".pipe")
 	_ = os.Remove(fifo)

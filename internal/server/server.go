@@ -17,12 +17,14 @@ import (
 
 	"nhooyr.io/websocket"
 
+	"github.com/rockclaver/claver/agent/internal/cliauth"
 	gh "github.com/rockclaver/claver/agent/internal/github"
 	"github.com/rockclaver/claver/agent/internal/previews"
 	"github.com/rockclaver/claver/agent/internal/projects"
 	"github.com/rockclaver/claver/agent/internal/review"
 	"github.com/rockclaver/claver/agent/internal/sessions"
 	"github.com/rockclaver/claver/agent/internal/store"
+	"github.com/rockclaver/claver/agent/internal/tooling"
 	"github.com/rockclaver/claver/agent/internal/version"
 )
 
@@ -56,6 +58,10 @@ type Config struct {
 	GitHub *gh.Manager
 	// Previews, when non-nil, enables preview.* kinds.
 	Previews *previews.Manager
+	// Tooling, when non-nil, enables tooling.* kinds.
+	Tooling *tooling.Manager
+	// Auth, when non-nil, enables auth.* kinds (CLI login flows).
+	Auth *cliauth.Manager
 }
 
 // Server is the agent's control-plane server.
@@ -274,6 +280,17 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *sync.
 		"preview.get",
 		"preview.active":
 		s.dispatchPreview(ctx, c, writeMu, f)
+	case "tooling.check",
+		"tooling.install":
+		s.dispatchTooling(ctx, c, writeMu, f)
+	case "auth.status",
+		"auth.login_start",
+		"auth.input",
+		"auth.login_cancel",
+		"auth.set_token",
+		"auth.logout",
+		"auth.relay_callback":
+		s.dispatchAuth(ctx, c, writeMu, f)
 	case "github.device_start",
 		"github.device_poll",
 		"github.repo_list",
@@ -1158,6 +1175,266 @@ func wildcardDNSHint(base string) string {
 		return ""
 	}
 	return "*." + base
+}
+
+// ToolingStatusDTO mirrors tooling.Status on the wire.
+type ToolingStatusDTO struct {
+	Kind      string `json:"kind"`
+	Installed bool   `json:"installed"`
+	Path      string `json:"path,omitempty"`
+	Version   string `json:"version,omitempty"`
+}
+
+func toToolingDTO(st tooling.Status) ToolingStatusDTO {
+	return ToolingStatusDTO{
+		Kind: string(st.Kind), Installed: st.Installed,
+		Path: st.Path, Version: st.Version,
+	}
+}
+
+func (s *Server) dispatchTooling(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, f Frame) {
+	if s.cfg.Tooling == nil {
+		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "tooling subsystem not configured")
+		return
+	}
+	mgr := s.cfg.Tooling
+	switch f.Kind {
+	case "tooling.check":
+		var in struct {
+			Kind string `json:"kind"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Kind == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "kind required")
+			return
+		}
+		st, err := mgr.Check(ctx, tooling.Kind(in.Kind))
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "tooling.check", toToolingDTO(st))
+	case "tooling.install":
+		var in struct {
+			Kind string `json:"kind"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Kind == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "kind required")
+			return
+		}
+		kind := tooling.Kind(in.Kind)
+		// Ack the install request immediately so the client can start
+		// rendering the log view; progress lines correlate via the
+		// install_id we hand back.
+		installID := f.ID
+		s.writeOK(ctx, c, writeMu, f.ID, "tooling.install", map[string]any{
+			"install_id": installID,
+			"kind":       in.Kind,
+			"state":      "started",
+		})
+		go func() {
+			onLine := func(l tooling.Line) {
+				s.writeOK(ctx, c, writeMu, "", "tooling.progress", map[string]any{
+					"install_id": installID,
+					"kind":       in.Kind,
+					"stream":     string(l.Stream),
+					"line":       l.Text,
+				})
+			}
+			st, err := mgr.Install(ctx, kind, onLine)
+			if err != nil {
+				if errors.Is(err, tooling.ErrAlreadyRunning) {
+					s.writeOK(ctx, c, writeMu, "", "tooling.done", map[string]any{
+						"install_id": installID,
+						"kind":       in.Kind,
+						"ok":         false,
+						"error":      "already_running",
+					})
+					return
+				}
+				s.writeOK(ctx, c, writeMu, "", "tooling.done", map[string]any{
+					"install_id": installID,
+					"kind":       in.Kind,
+					"ok":         false,
+					"error":      err.Error(),
+					"status":     toToolingDTO(st),
+				})
+				return
+			}
+			s.writeOK(ctx, c, writeMu, "", "tooling.done", map[string]any{
+				"install_id": installID,
+				"kind":       in.Kind,
+				"ok":         true,
+				"status":     toToolingDTO(st),
+			})
+		}()
+	}
+}
+
+// CliAuthStatusDTO mirrors cliauth.Status.
+type CliAuthStatusDTO struct {
+	Kind     string `json:"kind"`
+	LoggedIn bool   `json:"logged_in"`
+	Method   string `json:"method"`
+	Account  string `json:"account,omitempty"`
+	Version  string `json:"version,omitempty"`
+}
+
+func toAuthDTO(st cliauth.Status) CliAuthStatusDTO {
+	return CliAuthStatusDTO{
+		Kind: st.Kind, LoggedIn: st.LoggedIn,
+		Method: st.Method, Account: st.Account, Version: st.Version,
+	}
+}
+
+func (s *Server) dispatchAuth(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, f Frame) {
+	if s.cfg.Auth == nil {
+		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "auth subsystem not configured")
+		return
+	}
+	mgr := s.cfg.Auth
+	switch f.Kind {
+	case "auth.status":
+		var in struct {
+			Kind string `json:"kind"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Kind == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "kind required")
+			return
+		}
+		st, err := mgr.Status(ctx, in.Kind)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "auth.status", toAuthDTO(st))
+	case "auth.login_start":
+		var in struct {
+			Kind string `json:"kind"`
+			Mode string `json:"mode"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Kind == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "kind required")
+			return
+		}
+		if in.Mode == "" {
+			in.Mode = cliauth.ModeInteractive
+		}
+		login, err := mgr.StartLogin(ctx, in.Kind, in.Mode)
+		if err != nil {
+			code := "internal"
+			if errors.Is(err, cliauth.ErrAlreadyRunning) {
+				code = "cli_pending"
+			} else if errors.Is(err, cliauth.ErrBadKind) || errors.Is(err, cliauth.ErrBadMode) {
+				code = "bad_payload"
+			}
+			s.writeError(ctx, c, writeMu, f.ID, code, err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "auth.login_start", map[string]any{
+			"login_id": login.ID, "kind": login.Kind, "mode": in.Mode,
+		})
+		go func() {
+			for ev := range login.Events {
+				switch ev.Type {
+				case cliauth.EvtProgress:
+					s.writeOK(ctx, c, writeMu, "", "auth.progress", map[string]any{
+						"login_id": login.ID, "kind": login.Kind,
+						"stream": ev.Stream, "line": ev.Line,
+					})
+				case cliauth.EvtURL:
+					s.writeOK(ctx, c, writeMu, "", "auth.url", map[string]any{
+						"login_id": login.ID, "kind": login.Kind,
+						"url": ev.URL, "user_code": ev.UserCode,
+					})
+				case cliauth.EvtCallbackTarget:
+					s.writeOK(ctx, c, writeMu, "", "auth.callback_target", map[string]any{
+						"login_id": login.ID, "kind": login.Kind,
+						"host": ev.CallbackHost, "port": ev.CallbackPort, "path": ev.CallbackPath,
+					})
+				case cliauth.EvtPromptPaste:
+					s.writeOK(ctx, c, writeMu, "", "auth.prompt_paste", map[string]any{
+						"login_id": login.ID, "kind": login.Kind,
+					})
+				case cliauth.EvtDone:
+					s.writeOK(ctx, c, writeMu, "", "auth.done", map[string]any{
+						"login_id": login.ID, "kind": login.Kind,
+						"ok": ev.OK, "error": ev.Error, "status": toAuthDTO(ev.Status),
+					})
+				}
+			}
+		}()
+	case "auth.input":
+		var in struct {
+			LoginID string `json:"login_id"`
+			Text    string `json:"text"`
+			Enter   bool   `json:"enter"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.LoginID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "login_id required")
+			return
+		}
+		if err := mgr.Send(ctx, in.LoginID, in.Text, in.Enter); err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "auth.input", map[string]any{"login_id": in.LoginID})
+	case "auth.login_cancel":
+		var in struct {
+			LoginID string `json:"login_id"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.LoginID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "login_id required")
+			return
+		}
+		if err := mgr.Cancel(in.LoginID); err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "auth.login_cancel", map[string]any{"login_id": in.LoginID, "cancelled": true})
+	case "auth.set_token":
+		var in struct {
+			Kind  string `json:"kind"`
+			Mode  string `json:"mode"`
+			Value string `json:"value"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Kind == "" || in.Value == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "kind and value required")
+			return
+		}
+		st, err := mgr.SetToken(ctx, in.Kind, in.Mode, in.Value)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "auth.set_token", toAuthDTO(st))
+	case "auth.relay_callback":
+		var in struct {
+			LoginID string `json:"login_id"`
+			Query   string `json:"query"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.LoginID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "login_id required")
+			return
+		}
+		if err := mgr.Relay(ctx, in.LoginID, in.Query); err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "auth.relay_callback", map[string]any{"login_id": in.LoginID, "ok": true})
+	case "auth.logout":
+		var in struct {
+			Kind string `json:"kind"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Kind == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "kind required")
+			return
+		}
+		if err := mgr.Logout(ctx, in.Kind); err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "auth.logout", map[string]any{"kind": in.Kind, "ok": true})
+	}
 }
 
 func (s *Server) writeOK(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, id, kind string, payload any) {
