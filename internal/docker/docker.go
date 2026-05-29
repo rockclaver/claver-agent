@@ -572,7 +572,10 @@ func (c *SocketClient) Images(ctx context.Context) ([]ImageSummary, error) {
 		Labels      map[string]string `json:"Labels"`
 		Containers  int               `json:"Containers"`
 	}
-	if err := c.getJSON(ctx, "/images/json", &raw); err != nil {
+	// Pass all=1 so intermediate/child images (e.g. layers left from local
+	// multi-stage builds) are included in the inventory rather than silently
+	// omitted by the default top-level filter.
+	if err := c.getJSON(ctx, "/images/json?all=1", &raw); err != nil {
 		return nil, err
 	}
 	out := make([]ImageSummary, 0, len(raw))
