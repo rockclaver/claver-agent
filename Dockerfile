@@ -1,7 +1,7 @@
 # Phase 9 AC6: dockerized agent image used by the CI E2E smoke harness.
 # Builds the agent and ships a minimal runtime image with git + tmux on PATH
 # (both are required by the projects and sessions subsystems).
-FROM golang:1.23-alpine AS build
+FROM golang:1.25-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
