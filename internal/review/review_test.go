@@ -387,6 +387,62 @@ func TestAuditLog_RecordsAndFilters(t *testing.T) {
 	}
 }
 
+// Regression for PR #16 review comment 3323616294: review decisions must
+// refuse to append events to a session that belongs to a different project,
+// otherwise the event leaks to that project's session.subscribe subscribers.
+func TestReviewDecisions_RejectCrossProjectSession(t *testing.T) {
+	mgr, pm, st, _ := fixture(t)
+	// A second project + a session attached to it.
+	pm.IDGen = func() string { return "other" }
+	if _, err := pm.CreateEmpty("other"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateSession(store.Session{ID: "s-other", ProjectID: "other", Agent: "claude", StartedAt: time.Unix(1, 0)}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := mgr.Approve("proj", "s-other", []string{"a.txt"}, "")
+	if !errors.Is(err, ErrSessionMismatch) {
+		t.Errorf("approve cross-project session: got %v want ErrSessionMismatch", err)
+	}
+	_, _, err = mgr.Reject("proj", "s-other", []string{"a.txt"}, "")
+	if !errors.Is(err, ErrSessionMismatch) {
+		t.Errorf("reject cross-project session: got %v want ErrSessionMismatch", err)
+	}
+	_, _, err = mgr.Revise("proj", "s-other", []string{"a.txt"}, "")
+	if !errors.Is(err, ErrSessionMismatch) {
+		t.Errorf("revise cross-project session: got %v want ErrSessionMismatch", err)
+	}
+	// No leak: the foreign session must have no review events appended.
+	events, err := st.SessionEventsAfter("s-other", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ev := range events {
+		if ev.Type == "review" {
+			t.Fatalf("review event leaked into unrelated session: %+v", ev)
+		}
+	}
+}
+
+// Regression for PR #16 review comment 3323616297: untracked files whose
+// names begin with `-` must not be parsed as git flags by `git diff
+// --no-index`. The fix passes `--` before the two paths.
+func TestFile_AddedDashPrefixedNameRendersDiff(t *testing.T) {
+	mgr, _, _, ws := fixture(t)
+	mustWrite(t, ws, "--help", "content\n")
+	fp, err := mgr.File("proj", "--help")
+	if err != nil {
+		t.Fatalf("File for dash-prefixed name: %v", err)
+	}
+	if fp.Binary {
+		t.Errorf("dash-prefixed file mis-detected as binary: %+v", fp)
+	}
+	if !strings.Contains(fp.Patch, "content") {
+		t.Errorf("patch missing file content (likely got git usage text instead): %q", fp.Patch)
+	}
+}
+
 // Sanity: the manager refuses unknown projects.
 func TestStatus_UnknownProjectReturnsNotFound(t *testing.T) {
 	mgr, _, _, _ := fixture(t)

@@ -25,11 +25,12 @@ import (
 // Errors returned by the review module. Callers translate them to wire-level
 // error kinds.
 var (
-	ErrTokenInvalid  = errors.New("confirmation_token is invalid")
-	ErrTokenExpired  = errors.New("confirmation_token is expired")
-	ErrTokenUsed     = errors.New("confirmation_token has already been used")
-	ErrTokenMismatch = errors.New("confirmation_token does not match this action")
-	ErrNotFound      = projects.ErrNotFound
+	ErrTokenInvalid     = errors.New("confirmation_token is invalid")
+	ErrTokenExpired     = errors.New("confirmation_token is expired")
+	ErrTokenUsed        = errors.New("confirmation_token has already been used")
+	ErrTokenMismatch    = errors.New("confirmation_token does not match this action")
+	ErrSessionMismatch  = errors.New("session_id does not belong to project_id")
+	ErrNotFound         = projects.ErrNotFound
 )
 
 // Status group buckets exposed on the wire. Matching `git status` porcelain
@@ -164,7 +165,12 @@ func (m *Manager) File(projectID, path string) (FilePatch, error) {
 	// we render them with `--no-index /dev/null path`.
 	var patchOut string
 	if target.Group == GroupAdded && target.OldPath == "" {
-		patchOut, _ = gitRun(dir, "diff", "--no-index", "--unified=3", "/dev/null", target.Path)
+		// `--` separates options from paths so that filenames starting with
+		// a dash (e.g. "--help") are not parsed as git flags.
+		patchOut, err = gitRun(dir, "diff", "--no-index", "--unified=3", "--", "/dev/null", target.Path)
+		if err != nil {
+			return FilePatch{}, fmt.Errorf("diff %q: %w", target.Path, err)
+		}
 	} else if target.OldPath != "" {
 		patchOut, err = gitRun(dir, "diff", "-M", "--unified=3", "HEAD", "--", target.OldPath, target.Path)
 		if err != nil {
@@ -305,6 +311,16 @@ func (m *Manager) recordDecision(d Decision, auditType, projectID, sessionID str
 	body, _ := jsonMarshal(ev)
 	var sessEv store.SessionEvent
 	if sessionID != "" {
+		// Reject if the session belongs to a different project, otherwise a
+		// client could append a review event into an unrelated session and
+		// leak it to that project's `session.subscribe` subscribers.
+		sess, err := m.Store.GetSession(sessionID)
+		if err != nil {
+			return store.SessionEvent{}, store.AuditEntry{}, err
+		}
+		if sess.ProjectID != projectID {
+			return store.SessionEvent{}, store.AuditEntry{}, ErrSessionMismatch
+		}
 		s, err := m.Store.AppendSessionEvent(store.SessionEvent{
 			SessionID: sessionID,
 			Type:      "review",
@@ -426,7 +442,9 @@ func groupOrder(g FileGroup) int {
 func isBinaryFile(dir, path string) bool {
 	// `git check-attr` would require a .gitattributes; use `git diff
 	// --numstat` against /dev/null which prints "-\t-\t" for binary content.
-	out, err := gitRun(dir, "diff", "--numstat", "--no-index", "/dev/null", path)
+	// `--` separates options from paths so dash-prefixed filenames are not
+	// parsed as flags.
+	out, err := gitRun(dir, "diff", "--numstat", "--no-index", "--", "/dev/null", path)
 	if err == nil && strings.HasPrefix(strings.TrimSpace(out), "-\t-\t") {
 		return true
 	}

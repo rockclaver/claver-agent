@@ -644,6 +644,8 @@ func (s *Server) writeReviewErr(ctx context.Context, c *websocket.Conn, writeMu 
 		s.writeError(ctx, c, writeMu, id, "token_expired", err.Error())
 	case errors.Is(err, review.ErrTokenMismatch):
 		s.writeError(ctx, c, writeMu, id, "token_mismatch", err.Error())
+	case errors.Is(err, review.ErrSessionMismatch):
+		s.writeError(ctx, c, writeMu, id, "session_mismatch", err.Error())
 	case errors.Is(err, review.ErrNotFound), errors.Is(err, projects.ErrNotFound), errors.Is(err, store.ErrNotFound):
 		s.writeError(ctx, c, writeMu, id, "not_found", err.Error())
 	default:
