@@ -3,11 +3,13 @@ package github
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -52,6 +54,32 @@ type Repo struct {
 	CloneURL      string `json:"clone_url"`
 	Private       bool   `json:"private"`
 	DefaultBranch string `json:"default_branch"`
+	Owner         Owner  `json:"owner"`
+}
+
+type Owner struct {
+	Login string `json:"login"`
+	Type  string `json:"type"`
+}
+
+type OwnerOption struct {
+	Login string `json:"login"`
+	Type  string `json:"type"`
+}
+
+type RepoListOptions struct {
+	Page       int
+	PerPage    int
+	Query      string
+	Visibility string
+	Owner      string
+	OwnerType  string
+}
+
+type RepoListResult struct {
+	Repos   []Repo        `json:"repos"`
+	Owners  []OwnerOption `json:"owners"`
+	HasNext bool          `json:"has_next"`
 }
 
 type PullRequest struct {
@@ -79,21 +107,32 @@ func New(st *store.Store, pm *projects.Manager, rm *review.Manager, vault *Token
 	}
 }
 
-func (m *Manager) ListRepos(ctx context.Context, account string, page, perPage int) ([]Repo, bool, error) {
+func (m *Manager) ListRepos(ctx context.Context, account string, opts RepoListOptions) (RepoListResult, error) {
 	token, err := m.token(ctx, account)
 	if err != nil {
-		return nil, false, err
+		return RepoListResult{}, err
 	}
+	ownerOptions, userLogin, orgs, err := m.repoOwners(ctx, token)
+	if err != nil {
+		return RepoListResult{}, err
+	}
+	page := opts.Page
 	if page <= 0 {
 		page = 1
 	}
+	perPage := opts.PerPage
 	if perPage <= 0 || perPage > 100 {
 		perPage = 50
 	}
-	u := fmt.Sprintf("%s/user/repos?affiliation=owner,collaborator,organization_member&sort=updated&page=%d&per_page=%d", m.APIBase, page, perPage)
-	var repos []Repo
-	next, err := m.get(ctx, u, token, &repos)
-	return repos, next, err
+	filter := normalizedRepoFilter(opts, userLogin, orgs)
+	if filter.empty() {
+		u := repoListURL(m.APIBase, page, perPage)
+		var repos []Repo
+		next, err := m.get(ctx, u, token, &repos)
+		return RepoListResult{Repos: repos, Owners: ownerOptions, HasNext: next}, err
+	}
+	repos, next, err := m.filteredRepos(ctx, token, page, perPage, filter)
+	return RepoListResult{Repos: repos, Owners: ownerOptions, HasNext: next}, err
 }
 
 func (m *Manager) ImportRepo(ctx context.Context, account, fullName string) (store.Project, error) {
@@ -357,6 +396,157 @@ func (m *Manager) get(ctx context.Context, endpoint, token string, out any) (boo
 	return next, err
 }
 
+type repoUser struct {
+	Login string `json:"login"`
+}
+
+type repoFilter struct {
+	query      string
+	visibility string
+	owner      string
+	ownerType  string
+	userLogin  string
+	orgs       map[string]struct{}
+}
+
+func (m *Manager) repoOwners(ctx context.Context, token string) ([]OwnerOption, string, map[string]struct{}, error) {
+	var user repoUser
+	if err := m.getNoPage(ctx, m.APIBase+"/user", token, &user); err != nil {
+		return nil, "", nil, err
+	}
+	var orgs []OwnerOption
+	for page := 1; ; page++ {
+		var pageOrgs []OwnerOption
+		next, err := m.get(ctx, fmt.Sprintf("%s/user/orgs?per_page=100&page=%d", m.APIBase, page), token, &pageOrgs)
+		if err != nil {
+			return nil, "", nil, err
+		}
+		orgs = append(orgs, pageOrgs...)
+		if !next {
+			break
+		}
+	}
+	out := make([]OwnerOption, 0, 1+len(orgs))
+	if user.Login != "" {
+		out = append(out, OwnerOption{Login: user.Login, Type: "User"})
+	}
+	orgSet := map[string]struct{}{}
+	for _, org := range orgs {
+		if org.Login == "" {
+			continue
+		}
+		org.Type = "Organization"
+		out = append(out, org)
+		orgSet[strings.ToLower(org.Login)] = struct{}{}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Type == out[j].Type {
+			return strings.ToLower(out[i].Login) < strings.ToLower(out[j].Login)
+		}
+		return out[i].Type == "User"
+	})
+	return out, user.Login, orgSet, nil
+}
+
+func normalizedRepoFilter(opts RepoListOptions, userLogin string, orgs map[string]struct{}) repoFilter {
+	visibility := strings.ToLower(strings.TrimSpace(opts.Visibility))
+	if visibility != "private" && visibility != "public" {
+		visibility = "all"
+	}
+	ownerType := strings.ToLower(strings.TrimSpace(opts.OwnerType))
+	if ownerType != "personal" && ownerType != "organization" {
+		ownerType = "all"
+	}
+	return repoFilter{
+		query:      strings.ToLower(strings.TrimSpace(opts.Query)),
+		visibility: visibility,
+		owner:      strings.ToLower(strings.TrimSpace(opts.Owner)),
+		ownerType:  ownerType,
+		userLogin:  strings.ToLower(strings.TrimSpace(userLogin)),
+		orgs:       orgs,
+	}
+}
+
+func (f repoFilter) empty() bool {
+	return f.query == "" && f.visibility == "all" && f.owner == "" && f.ownerType == "all"
+}
+
+func (m *Manager) filteredRepos(ctx context.Context, token string, page, perPage int, filter repoFilter) ([]Repo, bool, error) {
+	wantStart := (page - 1) * perPage
+	wantEnd := wantStart + perPage
+	matched := make([]Repo, 0, wantEnd+1)
+	apiPage := 1
+	for {
+		var repos []Repo
+		next, err := m.get(ctx, repoListURL(m.APIBase, apiPage, 100), token, &repos)
+		if err != nil {
+			return nil, false, err
+		}
+		for _, repo := range repos {
+			if filter.match(repo) {
+				matched = append(matched, repo)
+				if len(matched) > wantEnd {
+					return matched[wantStart:wantEnd], true, nil
+				}
+			}
+		}
+		if !next {
+			break
+		}
+		apiPage++
+	}
+	if wantStart >= len(matched) {
+		return []Repo{}, false, nil
+	}
+	end := wantEnd
+	if end > len(matched) {
+		end = len(matched)
+	}
+	return matched[wantStart:end], end < len(matched), nil
+}
+
+func (f repoFilter) match(repo Repo) bool {
+	if f.visibility == "private" && !repo.Private {
+		return false
+	}
+	if f.visibility == "public" && repo.Private {
+		return false
+	}
+	ownerLogin := strings.ToLower(repo.Owner.Login)
+	ownerType := strings.ToLower(repo.Owner.Type)
+	if f.owner != "" && ownerLogin != f.owner {
+		return false
+	}
+	switch f.ownerType {
+	case "personal":
+		if ownerLogin != f.userLogin {
+			return false
+		}
+	case "organization":
+		if ownerType != "organization" {
+			if _, ok := f.orgs[ownerLogin]; !ok {
+				return false
+			}
+		}
+	}
+	if f.query != "" {
+		haystack := strings.ToLower(repo.Name + " " + repo.FullName)
+		if !strings.Contains(haystack, f.query) {
+			return false
+		}
+	}
+	return true
+}
+
+func repoListURL(apiBase string, page, perPage int) string {
+	q := url.Values{}
+	q.Set("affiliation", "owner,collaborator,organization_member")
+	q.Set("sort", "updated")
+	q.Set("page", fmt.Sprint(page))
+	q.Set("per_page", fmt.Sprint(perPage))
+	return apiBase + "/user/repos?" + q.Encode()
+}
+
 func (m *Manager) do(req *http.Request, out any) error {
 	return m.doWithResponse(req, out, nil)
 }
@@ -405,10 +595,11 @@ func hasUpstream(dir string) bool {
 }
 
 func githubGitEnv(token string) []string {
+	credential := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token))
 	return []string{
 		"GIT_CONFIG_COUNT=1",
 		"GIT_CONFIG_KEY_0=http.https://github.com/.extraHeader",
-		"GIT_CONFIG_VALUE_0=Authorization: Bearer " + token,
+		"GIT_CONFIG_VALUE_0=Authorization: Basic " + credential,
 	}
 }
 

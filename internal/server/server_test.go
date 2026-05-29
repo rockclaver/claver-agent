@@ -138,8 +138,12 @@ if [ "$1" = "--version" ]; then
   echo "gh version 2.0.0"
   exit 0
 fi
+if [ "$1" = "auth" ] && [ "$2" = "token" ]; then
+  echo "gho_test"
+  exit 0
+fi
 if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
-  echo '{"hosts":{"github.com":[{"active":true,"user":"octo"}]}}'
+  echo "Logged in to github.com account octo (/tmp/hosts.yml)"
   exit 0
 fi
 exit 1

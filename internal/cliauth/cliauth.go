@@ -11,7 +11,6 @@
 package cliauth
 
 import (
-	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -261,17 +260,22 @@ func (m *Manager) githubStatus(ctx context.Context) (Status, error) {
 	}
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	raw, err := exec.CommandContext(cctx, bin, "auth", "status", "--active", "--hostname", "github.com", "--json", "hosts").CombinedOutput()
-	if err != nil {
-		return out, nil
-	}
-	account := activeGitHubAccount(raw)
-	if account == "" {
+	if raw, err := exec.CommandContext(cctx, bin, "auth", "token", "--hostname", "github.com").CombinedOutput(); err != nil || strings.TrimSpace(string(raw)) == "" {
 		return out, nil
 	}
 	out.LoggedIn = true
 	out.Method = MethodSubscription
-	out.Account = account
+
+	cctx, cancel = context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	raw, err := exec.CommandContext(cctx, bin, "auth", "status", "--hostname", "github.com").CombinedOutput()
+	if err != nil {
+		return out, nil
+	}
+	account := activeGitHubAccount(raw)
+	if account != "" {
+		out.Account = account
+	}
 	return out, nil
 }
 
@@ -280,7 +284,7 @@ func activeGitHubAccount(raw []byte) string {
 		Hosts map[string]json.RawMessage `json:"hosts"`
 	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
-		return ""
+		return parseGitHubStatusAccount(string(raw))
 	}
 	host := doc.Hosts["github.com"]
 	if len(host) == 0 {
@@ -291,6 +295,19 @@ func activeGitHubAccount(raw []byte) string {
 		return ""
 	}
 	return findGitHubAccount(decoded)
+}
+
+func parseGitHubStatusAccount(raw string) string {
+	patterns := []*regexp.Regexp{
+		regexp.MustCompile(`(?i)logged in (?:to .* )?account ([A-Za-z0-9-]+)`),
+		regexp.MustCompile(`(?i)logged in as ([A-Za-z0-9-]+)`),
+	}
+	for _, pattern := range patterns {
+		if m := pattern.FindStringSubmatch(raw); len(m) > 1 {
+			return m[1]
+		}
+	}
+	return ""
 }
 
 func findGitHubAccount(v any) string {
@@ -571,6 +588,10 @@ func (m *Manager) driveLogin(ctx context.Context, login *Login, bin string) {
 	urlSeen := false
 	pasteSeen := false
 	claudeSetupAdvanced := false
+	githubGitPromptAdvanced := false
+	githubBrowserPromptAdvanced := false
+	githubLoginSucceeded := false
+	githubAccount := ""
 	lines := make(chan string, 256)
 	go func() {
 		defer close(lines)
@@ -579,11 +600,11 @@ func (m *Manager) driveLogin(ctx context.Context, login *Login, bin string) {
 			return
 		}
 		defer f.Close()
-		br := bufio.NewReader(f)
+		buf := make([]byte, 4096)
 		for {
-			raw, err := br.ReadString('\n')
-			if raw != "" {
-				lines <- raw
+			n, err := f.Read(buf)
+			if n > 0 {
+				lines <- string(buf[:n])
 			}
 			if err != nil {
 				return
@@ -615,6 +636,15 @@ func (m *Manager) driveLogin(ctx context.Context, login *Login, bin string) {
 			if !ok {
 				// Pipe closed (tmux session ended). Check credential file.
 				if login.Kind == KindGitHub {
+					if githubLoginSucceeded {
+						login.emitDone(true, "", Status{
+							Kind:     KindGitHub,
+							LoggedIn: true,
+							Method:   MethodSubscription,
+							Account:  githubAccount,
+						})
+						return
+					}
 					if st, err := m.Status(ctx, login.Kind); err == nil && st.LoggedIn {
 						login.emitDone(true, "", st)
 						return
@@ -633,12 +663,40 @@ func (m *Manager) driveLogin(ctx context.Context, login *Login, bin string) {
 			}
 			scrubbed := scrubSecrets(clean)
 			login.emit(Event{Type: EvtProgress, Stream: "stdout", Line: scrubbed})
+			if login.Kind == KindGitHub && isGitHubLoginSuccess(clean) {
+				githubLoginSucceeded = true
+				if acct := parseGitHubLoginSuccessAccount(clean); acct != "" {
+					githubAccount = acct
+				}
+			}
 			if login.Kind == KindClaude && !claudeSetupAdvanced && isClaudeFirstRunSetup(clean) {
 				claudeSetupAdvanced = true
 				if err := sendEnter(ctx, login.sessionName); err != nil {
 					login.emit(Event{Type: EvtProgress, Stream: "system", Line: "Could not advance Claude setup: " + err.Error()})
 				} else {
 					login.emit(Event{Type: EvtProgress, Stream: "system", Line: "Selected the default Claude Code theme to continue sign-in."})
+				}
+			}
+			if login.Kind == KindGitHub && !githubGitPromptAdvanced && isGitHubGitCredentialPrompt(clean) {
+				githubGitPromptAdvanced = true
+				if err := sendEnter(ctx, login.sessionName); err != nil {
+					login.emit(Event{Type: EvtProgress, Stream: "system", Line: "Could not advance GitHub setup: " + err.Error()})
+				} else {
+					login.emit(Event{Type: EvtProgress, Stream: "system", Line: "Selected GitHub HTTPS credentials for git operations."})
+				}
+			}
+			if login.Kind == KindGitHub && !urlSeen {
+				if m := codeRE.FindStringSubmatch(clean); len(m) > 1 {
+					urlSeen = true
+					login.emit(Event{Type: EvtURL, URL: "https://github.com/login/device", UserCode: m[1]})
+				}
+			}
+			if login.Kind == KindGitHub && !githubBrowserPromptAdvanced && isGitHubBrowserPrompt(clean) {
+				githubBrowserPromptAdvanced = true
+				if err := sendEnter(ctx, login.sessionName); err != nil {
+					login.emit(Event{Type: EvtProgress, Stream: "system", Line: "Could not advance GitHub browser prompt: " + err.Error()})
+				} else {
+					login.emit(Event{Type: EvtProgress, Stream: "system", Line: "Advanced GitHub CLI to wait for browser authorization."})
 				}
 			}
 			if !urlSeen {
@@ -683,6 +741,15 @@ func (m *Manager) driveLogin(ctx context.Context, login *Login, bin string) {
 			}
 			if !tmuxSessionAlive(login.sessionName) {
 				if login.Kind == KindGitHub {
+					if githubLoginSucceeded {
+						login.emitDone(true, "", Status{
+							Kind:     KindGitHub,
+							LoggedIn: true,
+							Method:   MethodSubscription,
+							Account:  githubAccount,
+						})
+						return
+					}
 					if st, err := m.Status(ctx, login.Kind); err == nil && st.LoggedIn {
 						login.emitDone(true, "", st)
 						return
@@ -980,6 +1047,26 @@ func isClaudeFirstRunSetup(s string) bool {
 	return strings.Contains(compact, "choosethetextstyle") ||
 		strings.Contains(compact, "syntaxtheme:") ||
 		(strings.Contains(compact, "welcometoclaudecode") && strings.Contains(compact, "let'sgetstarted"))
+}
+
+func isGitHubGitCredentialPrompt(s string) bool {
+	compact := strings.ToLower(strings.ReplaceAll(s, " ", ""))
+	return strings.Contains(compact, "authenticategitwithyourgithubcredentials")
+}
+
+func isGitHubBrowserPrompt(s string) bool {
+	compact := strings.ToLower(strings.ReplaceAll(s, " ", ""))
+	return strings.Contains(compact, "pressentertoopen") && strings.Contains(compact, "github.com")
+}
+
+func isGitHubLoginSuccess(s string) bool {
+	compact := strings.ToLower(s)
+	return strings.Contains(compact, "authentication complete") ||
+		strings.Contains(compact, "logged in as")
+}
+
+func parseGitHubLoginSuccessAccount(s string) string {
+	return parseGitHubStatusAccount(s)
 }
 
 func scrubSecrets(s string) string {

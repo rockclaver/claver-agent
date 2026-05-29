@@ -88,8 +88,19 @@ func TestToken_MissingGitHubCLIAuthReturnsSentinel(t *testing.T) {
 	m.RunCommand = func(context.Context, string, ...string) ([]byte, error) {
 		return []byte("not logged in"), errors.New("exit 1")
 	}
-	if _, _, err := m.ListRepos(context.Background(), "", 1, 10); !errors.Is(err, ErrTokenMissing) {
+	if _, err := m.ListRepos(context.Background(), "", RepoListOptions{Page: 1, PerPage: 10}); !errors.Is(err, ErrTokenMissing) {
 		t.Fatalf("missing gh auth got %v", err)
+	}
+}
+
+func TestGitHubGitEnvUsesBasicTokenHeader(t *testing.T) {
+	env := githubGitEnv("gho_secret")
+	got := strings.Join(env, "\n")
+	if !strings.Contains(got, "GIT_CONFIG_VALUE_0=Authorization: Basic ") {
+		t.Fatalf("missing basic auth header: %q", got)
+	}
+	if strings.Contains(got, "gho_secret") || strings.Contains(got, "Bearer") {
+		t.Fatalf("git env leaked raw token or used bearer header: %q", got)
 	}
 }
 
@@ -101,10 +112,14 @@ func TestRepoBrowse_PaginatesUserAndOrgRepos_AndImportClones(t *testing.T) {
 	seed := t.TempDir()
 	src := filepath.Join(seed, "src")
 	mustGit(t, seed, "init", "--bare", src)
-	repoJSON := `{"id":1,"name":"src","full_name":"octo/src","clone_url":"file://` + src + `","private":false,"default_branch":"main"}`
+	repoJSON := `{"id":1,"name":"src","full_name":"octo/src","clone_url":"file://` + src + `","private":false,"default_branch":"main","owner":{"login":"octo","type":"Organization"}}`
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
+		case r.URL.Path == "/user":
+			_, _ = w.Write([]byte(`{"login":"rockclaver"}`))
+		case r.URL.Path == "/user/orgs":
+			_, _ = w.Write([]byte(`[{"login":"octo","type":"Organization"}]`))
 		case r.URL.Path == "/user/repos":
 			if r.URL.Query().Get("affiliation") != "owner,collaborator,organization_member" {
 				t.Fatalf("affiliation query missing org repos: %s", r.URL.RawQuery)
@@ -121,12 +136,15 @@ func TestRepoBrowse_PaginatesUserAndOrgRepos_AndImportClones(t *testing.T) {
 	m.APIBase = ts.URL
 	storeToken(t, m, "octo", "token")
 
-	repos, next, err := m.ListRepos(context.Background(), "octo", 1, 25)
+	result, err := m.ListRepos(context.Background(), "octo", RepoListOptions{Page: 1, PerPage: 25})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !next || len(repos) != 1 || repos[0].FullName != "octo/src" {
-		t.Fatalf("repos=%+v next=%v", repos, next)
+	if !result.HasNext || len(result.Repos) != 1 || result.Repos[0].FullName != "octo/src" {
+		t.Fatalf("result=%+v", result)
+	}
+	if len(result.Owners) != 2 || result.Owners[1].Login != "octo" {
+		t.Fatalf("owners=%+v", result.Owners)
 	}
 	p, err := m.ImportRepo(context.Background(), "octo", "octo/src")
 	if err != nil {
@@ -134,6 +152,49 @@ func TestRepoBrowse_PaginatesUserAndOrgRepos_AndImportClones(t *testing.T) {
 	}
 	if p.Name != "octo/src" || p.RemoteURL == "" {
 		t.Fatalf("import did not create project: %+v", p)
+	}
+}
+
+func TestRepoBrowse_FiltersBySearchVisibilityAndOwner(t *testing.T) {
+	m, _, _, _, _ := fixture(t)
+	repos := []string{
+		`{"id":1,"name":"budget","full_name":"rockclaver/budget","clone_url":"https://github.com/rockclaver/budget.git","private":true,"default_branch":"main","owner":{"login":"rockclaver","type":"User"}}`,
+		`{"id":2,"name":"budget-api","full_name":"octo/budget-api","clone_url":"https://github.com/octo/budget-api.git","private":true,"default_branch":"main","owner":{"login":"octo","type":"Organization"}}`,
+		`{"id":3,"name":"public-site","full_name":"octo/public-site","clone_url":"https://github.com/octo/public-site.git","private":false,"default_branch":"main","owner":{"login":"octo","type":"Organization"}}`,
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/user":
+			_, _ = w.Write([]byte(`{"login":"rockclaver"}`))
+		case "/user/orgs":
+			_, _ = w.Write([]byte(`[{"login":"octo"}]`))
+		case "/user/repos":
+			_, _ = w.Write([]byte(`[` + strings.Join(repos, ",") + `]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+	m.APIBase = ts.URL
+	storeToken(t, m, "octo", "token")
+
+	result, err := m.ListRepos(context.Background(), "octo", RepoListOptions{
+		Page:       1,
+		PerPage:    10,
+		Query:      "budget",
+		Visibility: "private",
+		Owner:      "octo",
+		OwnerType:  "organization",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Repos) != 1 || result.Repos[0].FullName != "octo/budget-api" {
+		t.Fatalf("filtered repos=%+v", result.Repos)
+	}
+	if len(result.Owners) != 2 || result.Owners[0].Login != "rockclaver" || result.Owners[1].Login != "octo" {
+		t.Fatalf("owners=%+v", result.Owners)
 	}
 }
 

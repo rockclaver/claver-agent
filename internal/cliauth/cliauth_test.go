@@ -129,8 +129,12 @@ if [ "$1" = "--version" ]; then
   echo "gh version 2.0.0"
   exit 0
 fi
+if [ "$1" = "auth" ] && [ "$2" = "token" ]; then
+  echo "gho_test"
+  exit 0
+fi
 if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
-  echo '{"hosts":{"github.com":[{"active":true,"user":"octo"}]}}'
+  echo "Logged in to github.com account octo (/tmp/hosts.yml)"
   exit 0
 fi
 exit 1
@@ -205,6 +209,27 @@ func TestIsClaudeFirstRunSetup(t *testing.T) {
 	}
 	if isClaudeFirstRunSetup("Open https://claude.ai/oauth to continue") {
 		t.Error("oauth URL should not be treated as setup")
+	}
+}
+
+func TestGitHubPrompts(t *testing.T) {
+	if !isGitHubGitCredentialPrompt("? Authenticate Git with your GitHub credentials? (Y/n)") {
+		t.Fatal("expected GitHub git credential prompt")
+	}
+	if !isGitHubBrowserPrompt("Press Enter to open github.com in your browser...") {
+		t.Fatal("expected GitHub browser prompt")
+	}
+	if isGitHubBrowserPrompt("Open https://github.com/login/device") {
+		t.Fatal("plain URL should not be treated as browser prompt")
+	}
+	if !isGitHubLoginSuccess("✓ Logged in as rockclaver") {
+		t.Fatal("expected GitHub login success")
+	}
+	if got := parseGitHubLoginSuccessAccount("✓ Logged in as rockclaver"); got != "rockclaver" {
+		t.Fatalf("account = %q", got)
+	}
+	if got := parseGitHubStatusAccount("Logged in to github.com account rockclaver (/var/lib/claver/.config/gh/hosts.yml)"); got != "rockclaver" {
+		t.Fatalf("status account = %q", got)
 	}
 }
 

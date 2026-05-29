@@ -784,17 +784,28 @@ func (s *Server) dispatchGitHub(ctx context.Context, c *websocket.Conn, writeMu 
 	switch f.Kind {
 	case "github.repo_list":
 		var in struct {
-			Account string `json:"account"`
-			Page    int    `json:"page"`
-			PerPage int    `json:"per_page"`
+			Account    string `json:"account"`
+			Page       int    `json:"page"`
+			PerPage    int    `json:"per_page"`
+			Query      string `json:"query"`
+			Visibility string `json:"visibility"`
+			Owner      string `json:"owner"`
+			OwnerType  string `json:"owner_type"`
 		}
 		_ = json.Unmarshal(f.Payload, &in)
-		repos, hasNext, err := mgr.ListRepos(ctx, in.Account, in.Page, in.PerPage)
+		result, err := mgr.ListRepos(ctx, in.Account, gh.RepoListOptions{
+			Page:       in.Page,
+			PerPage:    in.PerPage,
+			Query:      in.Query,
+			Visibility: in.Visibility,
+			Owner:      in.Owner,
+			OwnerType:  in.OwnerType,
+		})
 		if err != nil {
 			s.writeGitHubErr(ctx, c, writeMu, f.ID, err)
 			return
 		}
-		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, map[string]any{"repos": repos, "has_next": hasNext})
+		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, result)
 	case "github.repo_import":
 		var in struct {
 			Account  string `json:"account"`
