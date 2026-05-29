@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 	"syscall"
 	"time"
@@ -143,14 +144,22 @@ func NewSocketClient(socketPath string) *SocketClient {
 // Version calls GET /version on the Docker socket and maps every connection
 // failure mode into one of the package-typed errors.
 func (c *SocketClient) Version(ctx context.Context) (VersionInfo, error) {
+	// A missing socket is ambiguous: dockerd removes /var/run/docker.sock
+	// when it stops, so ENOENT does not prove Docker is uninstalled. Only
+	// claim "not installed" when neither the socket nor a `docker` binary
+	// on PATH is present; otherwise prefer the daemon-down classification.
 	if fi, err := os.Stat(c.socketPath); err != nil {
-		if os.IsNotExist(err) {
-			return VersionInfo{}, fmt.Errorf("%w: %s missing", ErrNotInstalled, c.socketPath)
-		}
-		if errors.Is(err, os.ErrPermission) {
+		switch {
+		case errors.Is(err, os.ErrPermission):
 			return VersionInfo{}, fmt.Errorf("%w: stat %s: %v", ErrPermissionDenied, c.socketPath, err)
+		case os.IsNotExist(err):
+			if _, lookErr := exec.LookPath("docker"); lookErr != nil {
+				return VersionInfo{}, fmt.Errorf("%w: %s missing and docker binary not found", ErrNotInstalled, c.socketPath)
+			}
+			return VersionInfo{}, fmt.Errorf("%w: %s missing (daemon likely stopped)", ErrDaemonDown, c.socketPath)
+		default:
+			return VersionInfo{}, err
 		}
-		return VersionInfo{}, err
 	} else if fi.IsDir() {
 		return VersionInfo{}, fmt.Errorf("%w: %s is a directory", ErrNotInstalled, c.socketPath)
 	}
@@ -190,6 +199,9 @@ func translateDialError(err error) error {
 		return fmt.Errorf("%w: %v", ErrPermissionDenied, err)
 	}
 	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ENOENT) {
+		// A bare ENOENT at dial time also means a missing socket; treat
+		// it as daemon-down to avoid mislabelling a stopped daemon as
+		// uninstalled (see the os.Stat branch above for the reasoning).
 		return fmt.Errorf("%w: %v", ErrDaemonDown, err)
 	}
 	// Fall back to substring sniffing for wrapped net errors that don't
@@ -198,9 +210,8 @@ func translateDialError(err error) error {
 	switch {
 	case strings.Contains(msg, "permission denied"):
 		return fmt.Errorf("%w: %v", ErrPermissionDenied, err)
-	case strings.Contains(msg, "no such file"):
-		return fmt.Errorf("%w: %v", ErrNotInstalled, err)
-	case strings.Contains(msg, "connection refused"):
+	case strings.Contains(msg, "no such file"),
+		strings.Contains(msg, "connection refused"):
 		return fmt.Errorf("%w: %v", ErrDaemonDown, err)
 	}
 	return err
