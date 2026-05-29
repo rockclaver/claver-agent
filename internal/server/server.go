@@ -137,6 +137,13 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 	var writeMu sync.Mutex
+	// Per-connection request-id dedupe: when the mobile transport replays a
+	// frame after a tunnel drop (same id), short-circuit so we don't execute
+	// the side-effect twice. The response of the first execution is dropped
+	// by the dead WebSocket; clients re-issue with the same id so this branch
+	// fires on the retry. We ack the replay as session.replay; the client
+	// transport treats any frame matching the pending id as a completion.
+	seen := newIDSet(512)
 	for {
 		_, data, err := c.Read(ctx)
 		if err != nil {
@@ -147,8 +154,43 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			s.writeError(ctx, c, &writeMu, "", "bad_frame", err.Error())
 			continue
 		}
+		if f.ID != "" && seen.add(f.ID) {
+			s.writeOK(ctx, c, &writeMu, f.ID, f.Kind, map[string]any{"replay": true})
+			continue
+		}
 		s.dispatch(ctx, c, &writeMu, f)
 	}
+}
+
+// idSet is a tiny FIFO-evicting set used for request-id dedupe over a single
+// WebSocket. Capacity is small (a few hundred) — enough to cover the in-flight
+// + recent-history window for a single client.
+type idSet struct {
+	mu    sync.Mutex
+	seen  map[string]struct{}
+	order []string
+	cap   int
+}
+
+func newIDSet(cap int) *idSet {
+	return &idSet{seen: make(map[string]struct{}, cap), order: make([]string, 0, cap), cap: cap}
+}
+
+// add returns true iff id was already present.
+func (s *idSet) add(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.seen[id]; ok {
+		return true
+	}
+	if len(s.order) >= s.cap {
+		evict := s.order[0]
+		s.order = s.order[1:]
+		delete(s.seen, evict)
+	}
+	s.seen[id] = struct{}{}
+	s.order = append(s.order, id)
+	return false
 }
 
 func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, f Frame) {

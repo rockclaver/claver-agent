@@ -275,6 +275,106 @@ func TestRehydrate_AttachesStreamingToActiveTmuxPane(t *testing.T) {
 	}
 }
 
+// Phase 9 AC2: "Killing the agent during a streaming session and restarting
+// it loses no committed event beyond the in-flight tmux buffer."
+//
+// We model agent restart by spinning up a Manager, publishing events, then
+// throwing the Manager away and creating a brand-new Manager pointing at the
+// same Store + Projects. After Rehydrate(), a subscriber from afterSeq=0
+// receives every committed event plus continues to see new live events.
+func TestRehydrate_AcrossAgentRestart_LosesNoCommittedEvent(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "x.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	pm, err := projects.New(filepath.Join(dir, "p"), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pm.IDGen = func() string { return "p1" }
+	if _, err := pm.CreateEmpty("demo"); err != nil {
+		t.Fatal(err)
+	}
+
+	rt1 := &fakeRuntime{}
+	m1 := New(st, pm, rt1)
+	m1.IDGen = func() string { return "s1" }
+	m1.Now = func() time.Time { return time.Unix(100, 0) }
+	if _, err := m1.Start(context.Background(), "p1", "codex"); err != nil {
+		t.Fatal(err)
+	}
+	// Publish committed events that should survive the crash.
+	for _, line := range []string{"committed-1\n", "committed-2\n", "committed-3\n"} {
+		if _, err := m1.Publish(store.SessionEvent{SessionID: "s1", Type: "stdout", Data: line}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// "Crash" m1: drop the reference, build a fresh manager from the same store.
+	rt2 := &fakeRuntime{captureText: "tmux-buffer-still-running\n"}
+	m2 := New(st, pm, rt2)
+	m2.IDGen = func() string { return "s1" }
+	m2.Now = func() time.Time { return time.Unix(200, 0) }
+	if err := m2.Rehydrate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Subscribe from seq=0 and verify every committed event is replayed before
+	// any new live events.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, done, err := m2.Subscribe(ctx, "s1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer done()
+
+	got := make([]string, 0, 8)
+	deadline := time.After(2 * time.Second)
+collect:
+	for {
+		select {
+		case ev, ok := <-ch:
+			if !ok {
+				break collect
+			}
+			if ev.Type == "stdout" {
+				got = append(got, strings.TrimSpace(ev.Data))
+			}
+			if len(got) >= 6 {
+				break collect
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for replay; got %v", got)
+		}
+	}
+
+	for _, want := range []string{"committed-1", "committed-2", "committed-3"} {
+		if !contains(got, want) {
+			t.Fatalf("committed event %q lost after restart; got %v", want, got)
+		}
+	}
+	// tmux buffer snapshot also makes it into the stream.
+	if !contains(got, "tmux-buffer-still-running") {
+		t.Fatalf("rehydrated tmux buffer missing from stream: %v", got)
+	}
+	// Reattach should have been called once on restart.
+	if len(rt2.attached) != 1 || rt2.attached[0].SessionID != "s1" {
+		t.Fatalf("reattach mismatch: %+v", rt2.attached)
+	}
+}
+
+func contains(xs []string, s string) bool {
+	for _, x := range xs {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
 // AC: "Session list shows started/ended timestamps and per-session token usage
 // (parsed from the agent's own usage output)."
 func TestUsageOutput_UpdatesSessionList(t *testing.T) {
