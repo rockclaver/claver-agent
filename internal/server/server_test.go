@@ -1073,7 +1073,7 @@ func TestDockerContainerLogsSubscribeTerminalState(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { c.Close(websocket.StatusNormalClosure, "") })
-	payload, _ := json.Marshal(map[string]any{"id": "abc"})
+	payload, _ := json.Marshal(map[string]any{"id": "abc", "subscription_id": "sub-1"})
 	req, _ := json.Marshal(Frame{ID: "sub", Kind: "docker.container.logs_subscribe", Payload: payload})
 	if err := c.Write(ctx, websocket.MessageText, req); err != nil {
 		t.Fatal(err)
@@ -1106,6 +1106,77 @@ func TestDockerContainerLogsSubscribeTerminalState(t *testing.T) {
 	}
 }
 
+func TestDockerContainerLogsUnsubscribeCancelsStream(t *testing.T) {
+	// Review #3327184090: cancelling a log stream must stop the agent-side
+	// Docker follow goroutine without waiting for the WebSocket to close.
+	started := make(chan struct{})
+	cancelled := make(chan struct{})
+	mgr, err := docker.New(docker.Config{Client: fakeDockerClient{
+		blockStream:     true,
+		streamStarted:   started,
+		streamCancelled: cancelled,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wsURL, stop := startTestServerWith(t, Config{Addr: "127.0.0.1:0", Docker: mgr})
+	t.Cleanup(stop)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+	c, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close(websocket.StatusNormalClosure, "") })
+	subPayload, _ := json.Marshal(map[string]any{"id": "abc", "subscription_id": "sub-1"})
+	req, _ := json.Marshal(Frame{ID: "sub", Kind: "docker.container.logs_subscribe", Payload: subPayload})
+	if err := c.Write(ctx, websocket.MessageText, req); err != nil {
+		t.Fatal(err)
+	}
+	_, data, err := c.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ack Frame
+	if err := json.Unmarshal(data, &ack); err != nil {
+		t.Fatal(err)
+	}
+	if ack.Kind != "docker.container.logs_subscribe" {
+		t.Fatalf("ack kind = %q", ack.Kind)
+	}
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("stream did not start")
+	}
+	unsubPayload, _ := json.Marshal(map[string]any{"subscription_id": "sub-1"})
+	unsub, _ := json.Marshal(Frame{ID: "unsub", Kind: "docker.container.logs_unsubscribe", Payload: unsubPayload})
+	if err := c.Write(ctx, websocket.MessageText, unsub); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		_, data, err := c.Read(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var f Frame
+		if err := json.Unmarshal(data, &f); err != nil {
+			t.Fatal(err)
+		}
+		if f.ID == "unsub" {
+			if f.Kind != "docker.container.logs_unsubscribe" {
+				t.Fatalf("unsubscribe kind = %q", f.Kind)
+			}
+			break
+		}
+	}
+	select {
+	case <-cancelled:
+	case <-ctx.Done():
+		t.Fatal("stream was not cancelled")
+	}
+}
+
 func dockerRoundTrip(t *testing.T, mgr *docker.Manager, kind string, payload []byte) Frame {
 	t.Helper()
 	wsURL, stop := startTestServerWith(t, Config{Addr: "127.0.0.1:0", Docker: mgr})
@@ -1131,18 +1202,21 @@ func dockerRoundTrip(t *testing.T, mgr *docker.Manager, kind string, payload []b
 }
 
 type fakeDockerClient struct {
-	v           docker.VersionInfo
-	err         error
-	containers  []docker.ContainerSummary
-	detail      docker.ContainerDetail
-	images      []docker.ImageSummary
-	imageDetail docker.ImageDetail
-	volumes     []docker.VolumeSummary
-	networks    []docker.NetworkSummary
-	daemon      docker.DaemonInfo
-	logs        []docker.LogEntry
-	streamLogs  []docker.LogEntry
-	streamErr   error
+	v               docker.VersionInfo
+	err             error
+	containers      []docker.ContainerSummary
+	detail          docker.ContainerDetail
+	images          []docker.ImageSummary
+	imageDetail     docker.ImageDetail
+	volumes         []docker.VolumeSummary
+	networks        []docker.NetworkSummary
+	daemon          docker.DaemonInfo
+	logs            []docker.LogEntry
+	streamLogs      []docker.LogEntry
+	streamErr       error
+	blockStream     bool
+	streamStarted   chan struct{}
+	streamCancelled chan struct{}
 }
 
 func (f fakeDockerClient) Version(context.Context) (docker.VersionInfo, error) {
@@ -1182,6 +1256,16 @@ func (f fakeDockerClient) ContainerLogs(context.Context, string, int) ([]docker.
 }
 
 func (f fakeDockerClient) ContainerLogStream(ctx context.Context, id string, since time.Time, emit func(docker.LogEntry)) error {
+	if f.blockStream {
+		if f.streamStarted != nil {
+			close(f.streamStarted)
+		}
+		<-ctx.Done()
+		if f.streamCancelled != nil {
+			close(f.streamCancelled)
+		}
+		return ctx.Err()
+	}
 	for _, entry := range f.streamLogs {
 		emit(entry)
 	}

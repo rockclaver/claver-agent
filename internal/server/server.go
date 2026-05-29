@@ -76,6 +76,15 @@ type Server struct {
 	// (after the previous one dropped) still short-circuits instead of
 	// re-executing the side-effect. Entries expire after replayWindow.
 	seen *idSet
+
+	dockerLogMu      sync.Mutex
+	dockerLogNextGen int64
+	dockerLogCancels map[string]dockerLogCancel
+}
+
+type dockerLogCancel struct {
+	gen    int64
+	cancel context.CancelFunc
 }
 
 // replayWindow bounds how long a request id remains in the dedupe cache.
@@ -89,9 +98,10 @@ func New(cfg Config) *Server {
 		cfg.Now = time.Now
 	}
 	return &Server{
-		cfg:     cfg,
-		startAt: cfg.Now(),
-		seen:    newIDSet(1024, replayWindow, cfg.Now),
+		cfg:              cfg,
+		startAt:          cfg.Now(),
+		seen:             newIDSet(1024, replayWindow, cfg.Now),
+		dockerLogCancels: make(map[string]dockerLogCancel),
 	}
 }
 
@@ -300,6 +310,7 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *sync.
 		"docker.container.get",
 		"docker.container.logs",
 		"docker.container.logs_subscribe",
+		"docker.container.logs_unsubscribe",
 		"docker.image.list",
 		"docker.image.get",
 		"docker.volume.list",
@@ -1253,11 +1264,12 @@ func (s *Server) dispatchDocker(ctx context.Context, c *websocket.Conn, writeMu 
 		s.writeOK(ctx, c, writeMu, f.ID, "docker.container.logs", map[string]any{"logs": logs})
 	case "docker.container.logs_subscribe":
 		var in struct {
-			ID        string `json:"id"`
-			SinceTime string `json:"since_time"`
+			ID             string `json:"id"`
+			SubscriptionID string `json:"subscription_id"`
+			SinceTime      string `json:"since_time"`
 		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" || in.SubscriptionID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id and subscription_id required")
 			return
 		}
 		var since time.Time
@@ -1269,24 +1281,71 @@ func (s *Server) dispatchDocker(ctx context.Context, c *websocket.Conn, writeMu 
 			}
 			since = parsed
 		}
-		s.writeOK(ctx, c, writeMu, f.ID, "docker.container.logs_subscribe", map[string]any{"container_id": in.ID})
+		streamCtx, cancel := context.WithCancel(ctx)
+		s.dockerLogMu.Lock()
+		if previous := s.dockerLogCancels[in.SubscriptionID]; previous.cancel != nil {
+			previous.cancel()
+		}
+		s.dockerLogNextGen++
+		gen := s.dockerLogNextGen
+		s.dockerLogCancels[in.SubscriptionID] = dockerLogCancel{gen: gen, cancel: cancel}
+		s.dockerLogMu.Unlock()
+		s.writeOK(ctx, c, writeMu, f.ID, "docker.container.logs_subscribe", map[string]any{
+			"container_id":    in.ID,
+			"subscription_id": in.SubscriptionID,
+		})
 		go func() {
-			err := s.cfg.Docker.SubscribeLogs(ctx, in.ID, since, func(entry docker.LogEntry) {
-				s.writeOK(ctx, c, writeMu, "", "docker.container.log_event", entry)
+			defer func() {
+				s.dockerLogMu.Lock()
+				if current := s.dockerLogCancels[in.SubscriptionID]; current.gen == gen {
+					delete(s.dockerLogCancels, in.SubscriptionID)
+				}
+				s.dockerLogMu.Unlock()
+				cancel()
+			}()
+			err := s.cfg.Docker.SubscribeLogs(streamCtx, in.ID, since, func(entry docker.LogEntry) {
+				s.writeOK(ctx, c, writeMu, "", "docker.container.log_event", map[string]any{
+					"subscription_id": in.SubscriptionID,
+					"container_id":    entry.ContainerID,
+					"stream":          entry.Stream,
+					"timestamp":       entry.Timestamp,
+					"line":            entry.Line,
+				})
 			})
 			if err != nil {
 				s.writeOK(ctx, c, writeMu, "", "docker.container.log_done", map[string]any{
-					"container_id": in.ID,
-					"ok":           false,
-					"error":        err.Error(),
+					"subscription_id": in.SubscriptionID,
+					"container_id":    in.ID,
+					"ok":              false,
+					"error":           err.Error(),
 				})
 				return
 			}
 			s.writeOK(ctx, c, writeMu, "", "docker.container.log_done", map[string]any{
-				"container_id": in.ID,
-				"ok":           true,
+				"subscription_id": in.SubscriptionID,
+				"container_id":    in.ID,
+				"ok":              true,
 			})
 		}()
+	case "docker.container.logs_unsubscribe":
+		var in struct {
+			SubscriptionID string `json:"subscription_id"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.SubscriptionID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "subscription_id required")
+			return
+		}
+		s.dockerLogMu.Lock()
+		cancelEntry := s.dockerLogCancels[in.SubscriptionID]
+		if cancelEntry.cancel != nil {
+			cancelEntry.cancel()
+			delete(s.dockerLogCancels, in.SubscriptionID)
+		}
+		s.dockerLogMu.Unlock()
+		s.writeOK(ctx, c, writeMu, f.ID, "docker.container.logs_unsubscribe", map[string]any{
+			"subscription_id": in.SubscriptionID,
+			"cancelled":       cancelEntry.cancel != nil,
+		})
 	case "docker.image.list":
 		images, err := s.cfg.Docker.Images(ctx)
 		if err != nil {
