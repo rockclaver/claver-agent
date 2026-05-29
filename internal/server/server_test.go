@@ -23,10 +23,11 @@ func (fakeSessionRuntime) Start(_ context.Context, spec sessions.RuntimeSpec) er
 	_, _ = spec.Output.Write([]byte("ready\n"))
 	return nil
 }
-func (fakeSessionRuntime) SendPrompt(context.Context, string, string) error { return nil }
-func (fakeSessionRuntime) Interrupt(context.Context, string) error          { return nil }
-func (fakeSessionRuntime) Stop(context.Context, string) error               { return nil }
-func (fakeSessionRuntime) Capture(context.Context, string) (string, error)  { return "", nil }
+func (fakeSessionRuntime) Attach(context.Context, sessions.RuntimeSpec) error { return nil }
+func (fakeSessionRuntime) SendPrompt(context.Context, string, string) error   { return nil }
+func (fakeSessionRuntime) Interrupt(context.Context, string) error            { return nil }
+func (fakeSessionRuntime) Stop(context.Context, string) error                 { return nil }
+func (fakeSessionRuntime) Capture(context.Context, string) (string, error)    { return "", nil }
 
 // startTestServer brings up a server on a real loopback port and returns the
 // ws URL plus a cancel function.

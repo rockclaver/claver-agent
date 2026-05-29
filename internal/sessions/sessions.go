@@ -30,6 +30,7 @@ var (
 
 type Runtime interface {
 	Start(ctx context.Context, spec RuntimeSpec) error
+	Attach(ctx context.Context, spec RuntimeSpec) error
 	SendPrompt(ctx context.Context, sessionID, prompt string) error
 	Interrupt(ctx context.Context, sessionID string) error
 	Stop(ctx context.Context, sessionID string) error
@@ -157,10 +158,17 @@ func (m *Manager) Rehydrate(ctx context.Context) error {
 	}
 	for _, sess := range active {
 		data, err := m.Runtime.Capture(ctx, sess.ID)
-		if err != nil || data == "" {
+		if err == nil && data != "" {
+			_, _ = m.Publish(store.SessionEvent{SessionID: sess.ID, Type: "stdout", Data: data})
+		}
+		if err := m.Runtime.Attach(ctx, RuntimeSpec{
+			SessionID: sess.ID,
+			Agent:     sess.Agent,
+			WorkDir:   m.Projects.WorkspaceDir(sess.ProjectID),
+			Output:    &eventWriter{manager: m, sessionID: sess.ID, eventType: "stdout"},
+		}); err != nil {
 			continue
 		}
-		_, _ = m.Publish(store.SessionEvent{SessionID: sess.ID, Type: "stdout", Data: data})
 	}
 	return nil
 }
@@ -185,37 +193,63 @@ func (m *Manager) Subscribe(ctx context.Context, sessionID string, afterSeq int6
 	if _, err := m.Store.GetSession(sessionID); err != nil {
 		return nil, nil, err
 	}
-	ch := make(chan store.SessionEvent, 64)
+	subCtx, cancelSub := context.WithCancel(ctx)
+	live := make(chan store.SessionEvent, 64)
+	out := make(chan store.SessionEvent, 64)
 	m.mu.Lock()
 	if m.subs[sessionID] == nil {
 		m.subs[sessionID] = make(map[chan store.SessionEvent]struct{})
 	}
-	m.subs[sessionID][ch] = struct{}{}
+	m.subs[sessionID][live] = struct{}{}
 	replay, err := m.Store.SessionEventsAfter(sessionID, afterSeq)
 	if err != nil {
-		delete(m.subs[sessionID], ch)
+		delete(m.subs[sessionID], live)
 		m.mu.Unlock()
-		close(ch)
+		close(live)
+		close(out)
+		cancelSub()
 		return nil, nil, err
 	}
-	for _, ev := range replay {
-		select {
-		case ch <- ev:
-		case <-ctx.Done():
-			delete(m.subs[sessionID], ch)
-			m.mu.Unlock()
-			close(ch)
-			return nil, nil, ctx.Err()
-		}
-	}
 	m.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(out)
+		defer close(done)
+		for _, ev := range replay {
+			select {
+			case out <- ev:
+			case <-subCtx.Done():
+				return
+			}
+		}
+		for {
+			select {
+			case ev, ok := <-live:
+				if !ok {
+					return
+				}
+				select {
+				case out <- ev:
+				case <-subCtx.Done():
+					return
+				}
+			case <-subCtx.Done():
+				return
+			}
+		}
+	}()
 	cancel := func() {
+		cancelSub()
 		m.mu.Lock()
-		delete(m.subs[sessionID], ch)
+		if _, ok := m.subs[sessionID][live]; ok {
+			delete(m.subs[sessionID], live)
+			close(live)
+		}
 		m.mu.Unlock()
-		close(ch)
+		<-done
 	}
-	return ch, cancel, nil
+	return out, cancel, nil
 }
 
 type eventWriter struct {
@@ -261,6 +295,11 @@ func (TmuxRuntime) Start(ctx context.Context, spec RuntimeSpec) error {
 		return fmt.Errorf("tmux new-session: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	_ = exec.CommandContext(ctx, "tmux", "select-pane", "-t", name+":0.0", "-T", spec.SessionID).Run()
+	return TmuxRuntime{}.Attach(ctx, spec)
+}
+
+func (TmuxRuntime) Attach(ctx context.Context, spec RuntimeSpec) error {
+	target := tmuxName(spec.SessionID) + ":0.0"
 	fifo := filepath.Join(os.TempDir(), "claver-"+spec.SessionID+".pipe")
 	_ = os.Remove(fifo)
 	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
@@ -276,7 +315,7 @@ func (TmuxRuntime) Start(ctx context.Context, spec RuntimeSpec) error {
 		scanPipe(f, spec.Output)
 	}()
 	pipeCmd := "cat > " + shellQuote(fifo)
-	if out, err := exec.CommandContext(ctx, "tmux", "pipe-pane", "-t", name+":0.0", "-o", pipeCmd).CombinedOutput(); err != nil {
+	if out, err := exec.CommandContext(ctx, "tmux", "pipe-pane", "-t", target, "-o", pipeCmd).CombinedOutput(); err != nil {
 		return fmt.Errorf("tmux pipe-pane: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil

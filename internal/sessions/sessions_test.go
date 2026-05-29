@@ -14,6 +14,7 @@ import (
 
 type fakeRuntime struct {
 	started     []RuntimeSpec
+	attached    []RuntimeSpec
 	prompts     []string
 	interrupts  int
 	stops       int
@@ -23,6 +24,11 @@ type fakeRuntime struct {
 func (f *fakeRuntime) Start(_ context.Context, spec RuntimeSpec) error {
 	f.started = append(f.started, spec)
 	_, _ = io.WriteString(spec.Output, "ready\n")
+	return nil
+}
+func (f *fakeRuntime) Attach(_ context.Context, spec RuntimeSpec) error {
+	f.attached = append(f.attached, spec)
+	_, _ = io.WriteString(spec.Output, "attached\n")
 	return nil
 }
 func (f *fakeRuntime) SendPrompt(_ context.Context, sessionID, prompt string) error {
@@ -117,6 +123,81 @@ func TestStreamHub_NoEventLossWithSlowClient(t *testing.T) {
 	}
 }
 
+// Review comment #3323370015: replaying more events than the subscriber buffer
+// must not block Subscribe before the caller can start reading.
+func TestSubscribe_ReplaysMoreThanBufferWithoutDeadlock(t *testing.T) {
+	m, _ := newTestManager(t)
+	if _, err := m.Start(context.Background(), "p1", "claude"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 80; i++ {
+		if _, err := m.Publish(store.SessionEvent{SessionID: "s1", Type: "stdout", Data: "x"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	type result struct {
+		ch      <-chan store.SessionEvent
+		cleanup func()
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		ch, cleanup, err := m.Subscribe(ctx, "s1", 0)
+		done <- result{ch: ch, cleanup: cleanup, err: err}
+	}()
+
+	var got result
+	select {
+	case got = <-done:
+	case <-ctx.Done():
+		t.Fatal("Subscribe deadlocked on replay backlog")
+	}
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+	defer got.cleanup()
+
+	count := 0
+	for count < 82 {
+		select {
+		case <-got.ch:
+			count++
+		case <-ctx.Done():
+			t.Fatalf("timed out after %d replay events", count)
+		}
+	}
+}
+
+func TestSubscribe_CleanupDoesNotRequireParentContextCancel(t *testing.T) {
+	m, _ := newTestManager(t)
+	if _, err := m.Start(context.Background(), "p1", "claude"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 80; i++ {
+		if _, err := m.Publish(store.SessionEvent{SessionID: "s1", Type: "stdout", Data: "x"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, cleanup, err := m.Subscribe(context.Background(), "s1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		cleanup()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup waited for parent context cancellation")
+	}
+}
+
 // AC: "Prompts sent from mobile reach the agent in the pane and produce
 // streamed output within the NFR latency budget."
 func TestPrompt_ReachesRuntimePaneAndCanStreamOutput(t *testing.T) {
@@ -167,6 +248,30 @@ func TestRehydrate_CapturesActiveTmuxPane(t *testing.T) {
 	}
 	if !strings.Contains(log, "still running") {
 		t.Fatalf("rehydrated log missing: %q", log)
+	}
+}
+
+// Review comment #3323370019: restart rehydration must reinstall streaming for
+// existing tmux panes, not only capture a one-time snapshot.
+func TestRehydrate_AttachesStreamingToActiveTmuxPane(t *testing.T) {
+	m, rt := newTestManager(t)
+	if _, err := m.Start(context.Background(), "p1", "claude"); err != nil {
+		t.Fatal(err)
+	}
+	rt.captureText = "still running\n"
+
+	if err := m.Rehydrate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(rt.attached) != 1 || rt.attached[0].SessionID != "s1" || rt.attached[0].Agent != "claude" {
+		t.Fatalf("reattach mismatch: %+v", rt.attached)
+	}
+	log, err := m.Log("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(log, "still running") || !strings.Contains(log, "attached") {
+		t.Fatalf("rehydrated stream missing: %q", log)
 	}
 }
 
