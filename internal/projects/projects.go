@@ -23,6 +23,12 @@ import (
 // continue?").
 var ErrDirtyTree = errors.New("workspace has uncommitted changes")
 
+// ErrAuthRequired signals that a clone refused because the remote demands
+// credentials. In Phase 3 there is no auth path yet; Phase 6's GitHub Device
+// Flow will fill this gap. The mobile UI translates this into "this repo is
+// private — sign in to GitHub to import it."
+var ErrAuthRequired = errors.New("remote requires authentication")
+
 // ErrNotFound mirrors store.ErrNotFound at this layer so callers don't need to
 // import the store package.
 var ErrNotFound = store.ErrNotFound
@@ -92,8 +98,11 @@ func (m *Manager) Import(name, url string) (store.Project, error) {
 	if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
 		return store.Project{}, err
 	}
-	if _, err := run(m.Root, "git", "clone", "--quiet", url, dir); err != nil {
+	if out, err := run(m.Root, "git", "clone", "--quiet", url, dir); err != nil {
 		_ = os.RemoveAll(dir)
+		if isAuthError(out) {
+			return store.Project{}, fmt.Errorf("%w: %s", ErrAuthRequired, url)
+		}
 		return store.Project{}, fmt.Errorf("git clone: %w", err)
 	}
 	p := store.Project{ID: id, Name: name, RemoteURL: url}
@@ -228,6 +237,23 @@ func run(dir, name string, args ...string) (string, error) {
 		return string(out), fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
 	return string(out), nil
+}
+
+// isAuthError reports whether git's combined output looks like a credentials
+// refusal (private repo, bad creds, terminal prompts disabled). Phase 3 has
+// no credential path; Phase 6 wires in the GitHub Device Flow token.
+func isAuthError(out string) bool {
+	s := strings.ToLower(out)
+	switch {
+	case strings.Contains(s, "terminal prompts disabled"),
+		strings.Contains(s, "could not read username"),
+		strings.Contains(s, "could not read password"),
+		strings.Contains(s, "authentication failed"),
+		strings.Contains(s, "invalid username or password"),
+		strings.Contains(s, "repository not found"):
+		return true
+	}
+	return false
 }
 
 func countNonEmptyLines(s string) int {

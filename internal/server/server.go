@@ -199,7 +199,7 @@ func (s *Server) dispatchProject(ctx context.Context, c *websocket.Conn, f Frame
 		}
 		p, err := mgr.Import(in.Name, in.URL)
 		if err != nil {
-			s.writeError(ctx, c, f.ID, "internal", err.Error())
+			s.writeProjectErr(ctx, c, f.ID, err)
 			return
 		}
 		s.writeOK(ctx, c, f.ID, "project.import", toDTO(p))
@@ -271,6 +271,8 @@ func (s *Server) writeProjectErr(ctx context.Context, c *websocket.Conn, id stri
 		s.writeError(ctx, c, id, "dirty_tree", err.Error())
 	case errors.Is(err, projects.ErrNotFound):
 		s.writeError(ctx, c, id, "not_found", err.Error())
+	case errors.Is(err, projects.ErrAuthRequired):
+		s.writeError(ctx, c, id, "auth_required", err.Error())
 	default:
 		s.writeError(ctx, c, id, "internal", err.Error())
 	}
