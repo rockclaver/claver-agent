@@ -297,7 +297,12 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *sync.
 		s.dispatchAuth(ctx, c, writeMu, f)
 	case "docker.status",
 		"docker.container.list",
-		"docker.container.get":
+		"docker.container.get",
+		"docker.image.list",
+		"docker.image.get",
+		"docker.volume.list",
+		"docker.network.list",
+		"docker.info":
 		s.dispatchDocker(ctx, c, writeMu, f)
 	case "github.repo_list",
 		"github.repo_import",
@@ -1229,6 +1234,48 @@ func (s *Server) dispatchDocker(ctx context.Context, c *websocket.Conn, writeMu 
 			return
 		}
 		s.writeOK(ctx, c, writeMu, f.ID, "docker.container.get", map[string]any{"container": container})
+	case "docker.image.list":
+		images, err := s.cfg.Docker.Images(ctx)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "docker_error", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "docker.image.list", map[string]any{"images": images})
+	case "docker.image.get":
+		var in struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
+			return
+		}
+		image, err := s.cfg.Docker.Image(ctx, in.ID)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "docker_error", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "docker.image.get", map[string]any{"image": image})
+	case "docker.volume.list":
+		volumes, err := s.cfg.Docker.Volumes(ctx)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "docker_error", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "docker.volume.list", map[string]any{"volumes": volumes})
+	case "docker.network.list":
+		networks, err := s.cfg.Docker.Networks(ctx)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "docker_error", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "docker.network.list", map[string]any{"networks": networks})
+	case "docker.info":
+		info, err := s.cfg.Docker.Info(ctx)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "docker_error", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "docker.info", map[string]any{"info": info})
 	}
 }
 

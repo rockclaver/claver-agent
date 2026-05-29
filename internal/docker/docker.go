@@ -51,6 +51,11 @@ type Client interface {
 	Version(ctx context.Context) (VersionInfo, error)
 	Containers(ctx context.Context) ([]ContainerSummary, error)
 	Container(ctx context.Context, id string) (ContainerDetail, error)
+	Images(ctx context.Context) ([]ImageSummary, error)
+	Image(ctx context.Context, id string) (ImageDetail, error)
+	Volumes(ctx context.Context) ([]VolumeSummary, error)
+	Networks(ctx context.Context) ([]NetworkSummary, error)
+	Info(ctx context.Context) (DaemonInfo, error)
 }
 
 // Status is the typed daemon status returned by Manager.Status.
@@ -201,6 +206,94 @@ func (m *Manager) enrichDetail(d *ContainerDetail) {
 	d.ComposeService = composeService(d.Labels)
 	d.Managed = d.ComposeProject != "" || d.ComposeService != ""
 	d.ProjectID = projectID(d.Labels, m.projectRoot, d.Mounts)
+}
+
+// ImageSummary is the read-only image inventory row.
+type ImageSummary struct {
+	ID         string            `json:"id"`
+	Tags       []string          `json:"tags,omitempty"`
+	Digests    []string          `json:"digests,omitempty"`
+	Created    int64             `json:"created"`
+	Size       int64             `json:"size"`
+	Labels     map[string]string `json:"labels,omitempty"`
+	Containers int               `json:"containers"`
+}
+
+// ImageDetail is the safe inspect subset for a single image.
+type ImageDetail struct {
+	ImageSummary
+	Architecture string   `json:"architecture,omitempty"`
+	OS           string   `json:"os,omitempty"`
+	Author       string   `json:"author,omitempty"`
+	Comment      string   `json:"comment,omitempty"`
+	ParentID     string   `json:"parent_id,omitempty"`
+	RepoDigests  []string `json:"repo_digests,omitempty"`
+}
+
+// VolumeSummary is the read-only volume inventory row.
+type VolumeSummary struct {
+	Name       string            `json:"name"`
+	Driver     string            `json:"driver"`
+	Mountpoint string            `json:"mountpoint,omitempty"`
+	Scope      string            `json:"scope,omitempty"`
+	CreatedAt  string            `json:"created_at,omitempty"`
+	Labels     map[string]string `json:"labels,omitempty"`
+	// InUseCount is a best-effort hint computed from container mounts. -1
+	// means the daemon did not report usage data.
+	InUseCount int `json:"in_use_count"`
+}
+
+// NetworkSummary is the read-only network inventory row.
+type NetworkSummary struct {
+	ID            string            `json:"id"`
+	Name          string            `json:"name"`
+	Driver        string            `json:"driver"`
+	Scope         string            `json:"scope,omitempty"`
+	Internal      bool              `json:"internal,omitempty"`
+	Labels        map[string]string `json:"labels,omitempty"`
+	AttachedCount int               `json:"attached_count"`
+}
+
+// DaemonInfo is the read-only daemon-level inventory snapshot.
+type DaemonInfo struct {
+	Containers        int    `json:"containers"`
+	ContainersRunning int    `json:"containers_running"`
+	ContainersPaused  int    `json:"containers_paused"`
+	ContainersStopped int    `json:"containers_stopped"`
+	Images            int    `json:"images"`
+	ServerVersion     string `json:"server_version,omitempty"`
+	OperatingSystem   string `json:"operating_system,omitempty"`
+	Architecture      string `json:"architecture,omitempty"`
+	KernelVersion     string `json:"kernel_version,omitempty"`
+}
+
+// Images returns every local image with safe metadata.
+func (m *Manager) Images(ctx context.Context) ([]ImageSummary, error) {
+	return m.client.Images(ctx)
+}
+
+// Image returns inspect-level safe metadata for a single image.
+func (m *Manager) Image(ctx context.Context, id string) (ImageDetail, error) {
+	if strings.TrimSpace(id) == "" {
+		return ImageDetail{}, errors.New("docker: image id required")
+	}
+	return m.client.Image(ctx, id)
+}
+
+// Volumes returns every local volume with usage hints when available.
+func (m *Manager) Volumes(ctx context.Context) ([]VolumeSummary, error) {
+	return m.client.Volumes(ctx)
+}
+
+// Networks returns every local network with attached-container counts when
+// the daemon reports them.
+func (m *Manager) Networks(ctx context.Context) ([]NetworkSummary, error) {
+	return m.client.Networks(ctx)
+}
+
+// Info returns the daemon-level inventory snapshot from Docker /info.
+func (m *Manager) Info(ctx context.Context) (DaemonInfo, error) {
+	return m.client.Info(ctx)
 }
 
 func composeProject(labels map[string]string) string {
@@ -466,6 +559,191 @@ func (c *SocketClient) Container(ctx context.Context, id string) (ContainerDetai
 		Labels:          composeLabels(raw.Config.Labels),
 		EnvironmentVars: redactEnv(raw.Config.Env),
 	}, nil
+}
+
+// Images calls GET /images/json and maps it into the agent's stable summary.
+func (c *SocketClient) Images(ctx context.Context) ([]ImageSummary, error) {
+	var raw []struct {
+		ID          string            `json:"Id"`
+		RepoTags    []string          `json:"RepoTags"`
+		RepoDigests []string          `json:"RepoDigests"`
+		Created     int64             `json:"Created"`
+		Size        int64             `json:"Size"`
+		Labels      map[string]string `json:"Labels"`
+		Containers  int               `json:"Containers"`
+	}
+	if err := c.getJSON(ctx, "/images/json", &raw); err != nil {
+		return nil, err
+	}
+	out := make([]ImageSummary, 0, len(raw))
+	for _, r := range raw {
+		containers := r.Containers
+		// Docker reports -1 when usage data is not computed; keep the
+		// sentinel so the UI can distinguish unknown from zero.
+		out = append(out, ImageSummary{
+			ID:         r.ID,
+			Tags:       dropNoneTags(r.RepoTags),
+			Digests:    r.RepoDigests,
+			Created:    r.Created,
+			Size:       r.Size,
+			Labels:     r.Labels,
+			Containers: containers,
+		})
+	}
+	return out, nil
+}
+
+// Image calls GET /images/{id}/json for full inspect metadata.
+func (c *SocketClient) Image(ctx context.Context, id string) (ImageDetail, error) {
+	var raw struct {
+		ID           string   `json:"Id"`
+		RepoTags     []string `json:"RepoTags"`
+		RepoDigests  []string `json:"RepoDigests"`
+		Parent       string   `json:"Parent"`
+		Comment      string   `json:"Comment"`
+		Created      string   `json:"Created"`
+		Author       string   `json:"Author"`
+		Architecture string   `json:"Architecture"`
+		Os           string   `json:"Os"`
+		Size         int64    `json:"Size"`
+		Config       struct {
+			Labels map[string]string `json:"Labels"`
+		} `json:"Config"`
+	}
+	if err := c.getJSON(ctx, "/images/"+id+"/json", &raw); err != nil {
+		return ImageDetail{}, err
+	}
+	created, _ := time.Parse(time.RFC3339Nano, raw.Created)
+	return ImageDetail{
+		ImageSummary: ImageSummary{
+			ID:      raw.ID,
+			Tags:    dropNoneTags(raw.RepoTags),
+			Digests: raw.RepoDigests,
+			Created: created.Unix(),
+			Size:    raw.Size,
+			Labels:  raw.Config.Labels,
+		},
+		Architecture: raw.Architecture,
+		OS:           raw.Os,
+		Author:       raw.Author,
+		Comment:      raw.Comment,
+		ParentID:     raw.Parent,
+		RepoDigests:  raw.RepoDigests,
+	}, nil
+}
+
+// Volumes calls GET /volumes and folds in usage data when the daemon
+// computes it; otherwise sets InUseCount to -1.
+func (c *SocketClient) Volumes(ctx context.Context) ([]VolumeSummary, error) {
+	var raw struct {
+		Volumes []struct {
+			Name       string            `json:"Name"`
+			Driver     string            `json:"Driver"`
+			Mountpoint string            `json:"Mountpoint"`
+			CreatedAt  string            `json:"CreatedAt"`
+			Scope      string            `json:"Scope"`
+			Labels     map[string]string `json:"Labels"`
+			UsageData  *struct {
+				RefCount int64 `json:"RefCount"`
+			} `json:"UsageData"`
+		} `json:"Volumes"`
+	}
+	if err := c.getJSON(ctx, "/volumes", &raw); err != nil {
+		return nil, err
+	}
+	out := make([]VolumeSummary, 0, len(raw.Volumes))
+	for _, v := range raw.Volumes {
+		count := -1
+		if v.UsageData != nil {
+			count = int(v.UsageData.RefCount)
+		}
+		out = append(out, VolumeSummary{
+			Name:       v.Name,
+			Driver:     v.Driver,
+			Mountpoint: v.Mountpoint,
+			Scope:      v.Scope,
+			CreatedAt:  v.CreatedAt,
+			Labels:     v.Labels,
+			InUseCount: count,
+		})
+	}
+	return out, nil
+}
+
+// Networks calls GET /networks and counts attached containers from the
+// payload when present.
+func (c *SocketClient) Networks(ctx context.Context) ([]NetworkSummary, error) {
+	var raw []struct {
+		ID         string                 `json:"Id"`
+		Name       string                 `json:"Name"`
+		Driver     string                 `json:"Driver"`
+		Scope      string                 `json:"Scope"`
+		Internal   bool                   `json:"Internal"`
+		Labels     map[string]string      `json:"Labels"`
+		Containers map[string]interface{} `json:"Containers"`
+	}
+	if err := c.getJSON(ctx, "/networks", &raw); err != nil {
+		return nil, err
+	}
+	out := make([]NetworkSummary, 0, len(raw))
+	for _, n := range raw {
+		out = append(out, NetworkSummary{
+			ID:            n.ID,
+			Name:          n.Name,
+			Driver:        n.Driver,
+			Scope:         n.Scope,
+			Internal:      n.Internal,
+			Labels:        n.Labels,
+			AttachedCount: len(n.Containers),
+		})
+	}
+	return out, nil
+}
+
+// Info calls GET /info and maps the daemon-level inventory snapshot.
+func (c *SocketClient) Info(ctx context.Context) (DaemonInfo, error) {
+	var raw struct {
+		Containers        int    `json:"Containers"`
+		ContainersRunning int    `json:"ContainersRunning"`
+		ContainersPaused  int    `json:"ContainersPaused"`
+		ContainersStopped int    `json:"ContainersStopped"`
+		Images            int    `json:"Images"`
+		ServerVersion     string `json:"ServerVersion"`
+		OperatingSystem   string `json:"OperatingSystem"`
+		Architecture      string `json:"Architecture"`
+		KernelVersion     string `json:"KernelVersion"`
+	}
+	if err := c.getJSON(ctx, "/info", &raw); err != nil {
+		return DaemonInfo{}, err
+	}
+	return DaemonInfo{
+		Containers:        raw.Containers,
+		ContainersRunning: raw.ContainersRunning,
+		ContainersPaused:  raw.ContainersPaused,
+		ContainersStopped: raw.ContainersStopped,
+		Images:            raw.Images,
+		ServerVersion:     raw.ServerVersion,
+		OperatingSystem:   raw.OperatingSystem,
+		Architecture:      raw.Architecture,
+		KernelVersion:     raw.KernelVersion,
+	}, nil
+}
+
+func dropNoneTags(tags []string) []string {
+	if len(tags) == 0 {
+		return nil
+	}
+	out := tags[:0:0]
+	for _, t := range tags {
+		if t == "<none>:<none>" || t == "" {
+			continue
+		}
+		out = append(out, t)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func (c *SocketClient) getJSON(ctx context.Context, path string, out any) error {

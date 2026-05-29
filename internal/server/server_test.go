@@ -908,11 +908,158 @@ func TestDockerContainerGet(t *testing.T) {
 	}
 }
 
+// AC: docker.image.list is exposed over the WebSocket with safe metadata.
+func TestDockerImageList(t *testing.T) {
+	mgr, err := docker.New(docker.Config{Client: fakeDockerClient{images: []docker.ImageSummary{
+		{ID: "sha256:abc", Tags: []string{"nginx:latest"}, Size: 1024, Containers: 1},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := dockerRoundTrip(t, mgr, "docker.image.list", nil)
+	if resp.Kind != "docker.image.list" {
+		t.Fatalf("kind = %q payload %s", resp.Kind, resp.Payload)
+	}
+	var dto struct {
+		Images []docker.ImageSummary `json:"images"`
+	}
+	if err := json.Unmarshal(resp.Payload, &dto); err != nil {
+		t.Fatal(err)
+	}
+	if len(dto.Images) != 1 || dto.Images[0].ID != "sha256:abc" || dto.Images[0].Tags[0] != "nginx:latest" {
+		t.Fatalf("images payload = %+v", dto.Images)
+	}
+}
+
+// AC: docker.image.get returns inspect-level safe metadata.
+func TestDockerImageGet(t *testing.T) {
+	mgr, err := docker.New(docker.Config{Client: fakeDockerClient{imageDetail: docker.ImageDetail{
+		ImageSummary: docker.ImageSummary{ID: "sha256:abc", Tags: []string{"app:v1"}},
+		Architecture: "arm64", OS: "linux",
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(map[string]string{"id": "sha256:abc"})
+	resp := dockerRoundTrip(t, mgr, "docker.image.get", payload)
+	if resp.Kind != "docker.image.get" {
+		t.Fatalf("kind = %q payload %s", resp.Kind, resp.Payload)
+	}
+	var dto struct {
+		Image docker.ImageDetail `json:"image"`
+	}
+	if err := json.Unmarshal(resp.Payload, &dto); err != nil {
+		t.Fatal(err)
+	}
+	if dto.Image.Architecture != "arm64" || dto.Image.OS != "linux" {
+		t.Fatalf("image detail payload = %+v", dto.Image)
+	}
+}
+
+// AC: docker.volume.list exposes name, driver, mountpoint, labels, in-use hint.
+func TestDockerVolumeList(t *testing.T) {
+	mgr, err := docker.New(docker.Config{Client: fakeDockerClient{volumes: []docker.VolumeSummary{
+		{Name: "data", Driver: "local", Mountpoint: "/var/lib/docker/volumes/data/_data",
+			Labels: map[string]string{"app": "api"}, InUseCount: 2},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := dockerRoundTrip(t, mgr, "docker.volume.list", nil)
+	if resp.Kind != "docker.volume.list" {
+		t.Fatalf("kind = %q payload %s", resp.Kind, resp.Payload)
+	}
+	var dto struct {
+		Volumes []docker.VolumeSummary `json:"volumes"`
+	}
+	if err := json.Unmarshal(resp.Payload, &dto); err != nil {
+		t.Fatal(err)
+	}
+	if len(dto.Volumes) != 1 || dto.Volumes[0].Driver != "local" || dto.Volumes[0].InUseCount != 2 {
+		t.Fatalf("volumes payload = %+v", dto.Volumes)
+	}
+}
+
+// AC: docker.network.list exposes name, driver, scope, attached count.
+func TestDockerNetworkList(t *testing.T) {
+	mgr, err := docker.New(docker.Config{Client: fakeDockerClient{networks: []docker.NetworkSummary{
+		{ID: "n1", Name: "bridge", Driver: "bridge", Scope: "local", AttachedCount: 4},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := dockerRoundTrip(t, mgr, "docker.network.list", nil)
+	if resp.Kind != "docker.network.list" {
+		t.Fatalf("kind = %q payload %s", resp.Kind, resp.Payload)
+	}
+	var dto struct {
+		Networks []docker.NetworkSummary `json:"networks"`
+	}
+	if err := json.Unmarshal(resp.Payload, &dto); err != nil {
+		t.Fatal(err)
+	}
+	if len(dto.Networks) != 1 || dto.Networks[0].Driver != "bridge" || dto.Networks[0].AttachedCount != 4 {
+		t.Fatalf("networks payload = %+v", dto.Networks)
+	}
+}
+
+// AC: docker.info exposes daemon-level inventory totals.
+func TestDockerInfo(t *testing.T) {
+	mgr, err := docker.New(docker.Config{Client: fakeDockerClient{daemon: docker.DaemonInfo{
+		Containers: 5, ContainersRunning: 3, Images: 9, ServerVersion: "26.0.0",
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := dockerRoundTrip(t, mgr, "docker.info", nil)
+	if resp.Kind != "docker.info" {
+		t.Fatalf("kind = %q payload %s", resp.Kind, resp.Payload)
+	}
+	var dto struct {
+		Info docker.DaemonInfo `json:"info"`
+	}
+	if err := json.Unmarshal(resp.Payload, &dto); err != nil {
+		t.Fatal(err)
+	}
+	if dto.Info.Containers != 5 || dto.Info.ContainersRunning != 3 || dto.Info.Images != 9 {
+		t.Fatalf("info payload = %+v", dto.Info)
+	}
+}
+
+func dockerRoundTrip(t *testing.T, mgr *docker.Manager, kind string, payload []byte) Frame {
+	t.Helper()
+	wsURL, stop := startTestServerWith(t, Config{Addr: "127.0.0.1:0", Docker: mgr})
+	t.Cleanup(stop)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+	c, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close(websocket.StatusNormalClosure, "") })
+	req, _ := json.Marshal(Frame{ID: "1", Kind: kind, Payload: payload})
+	if err := c.Write(ctx, websocket.MessageText, req); err != nil {
+		t.Fatal(err)
+	}
+	_, data, err := c.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp Frame
+	_ = json.Unmarshal(data, &resp)
+	return resp
+}
+
 type fakeDockerClient struct {
-	v          docker.VersionInfo
-	err        error
-	containers []docker.ContainerSummary
-	detail     docker.ContainerDetail
+	v           docker.VersionInfo
+	err         error
+	containers  []docker.ContainerSummary
+	detail      docker.ContainerDetail
+	images      []docker.ImageSummary
+	imageDetail docker.ImageDetail
+	volumes     []docker.VolumeSummary
+	networks    []docker.NetworkSummary
+	daemon      docker.DaemonInfo
 }
 
 func (f fakeDockerClient) Version(context.Context) (docker.VersionInfo, error) {
@@ -925,6 +1072,26 @@ func (f fakeDockerClient) Containers(context.Context) ([]docker.ContainerSummary
 
 func (f fakeDockerClient) Container(context.Context, string) (docker.ContainerDetail, error) {
 	return f.detail, f.err
+}
+
+func (f fakeDockerClient) Images(context.Context) ([]docker.ImageSummary, error) {
+	return f.images, f.err
+}
+
+func (f fakeDockerClient) Image(context.Context, string) (docker.ImageDetail, error) {
+	return f.imageDetail, f.err
+}
+
+func (f fakeDockerClient) Volumes(context.Context) ([]docker.VolumeSummary, error) {
+	return f.volumes, f.err
+}
+
+func (f fakeDockerClient) Networks(context.Context) ([]docker.NetworkSummary, error) {
+	return f.networks, f.err
+}
+
+func (f fakeDockerClient) Info(context.Context) (docker.DaemonInfo, error) {
+	return f.daemon, f.err
 }
 
 type fakeErr struct{ cause error }

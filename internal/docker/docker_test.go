@@ -10,10 +10,15 @@ import (
 // Each case exercises a distinct unavailable reason so the AC mapping is
 // covered end-to-end.
 type fakeClient struct {
-	info       VersionInfo
-	err        error
-	containers []ContainerSummary
-	detail     ContainerDetail
+	info        VersionInfo
+	err         error
+	containers  []ContainerSummary
+	detail      ContainerDetail
+	images      []ImageSummary
+	imageDetail ImageDetail
+	volumes     []VolumeSummary
+	networks    []NetworkSummary
+	daemon      DaemonInfo
 }
 
 func (f fakeClient) Version(ctx context.Context) (VersionInfo, error) {
@@ -26,6 +31,26 @@ func (f fakeClient) Containers(ctx context.Context) ([]ContainerSummary, error) 
 
 func (f fakeClient) Container(ctx context.Context, id string) (ContainerDetail, error) {
 	return f.detail, f.err
+}
+
+func (f fakeClient) Images(ctx context.Context) ([]ImageSummary, error) {
+	return f.images, f.err
+}
+
+func (f fakeClient) Image(ctx context.Context, id string) (ImageDetail, error) {
+	return f.imageDetail, f.err
+}
+
+func (f fakeClient) Volumes(ctx context.Context) ([]VolumeSummary, error) {
+	return f.volumes, f.err
+}
+
+func (f fakeClient) Networks(ctx context.Context) ([]NetworkSummary, error) {
+	return f.networks, f.err
+}
+
+func (f fakeClient) Info(ctx context.Context) (DaemonInfo, error) {
+	return f.daemon, f.err
 }
 
 func newManager(t *testing.T, c Client) *Manager {
@@ -256,6 +281,126 @@ func TestRedactEnvRedactsConnectionStringKeys(t *testing.T) {
 	}
 	if got[4].Redacted {
 		t.Fatalf("non-secret host value should remain visible: %+v", got[4])
+	}
+}
+
+// AC: docker.image.list exposes image IDs, tags, created time, size, labels.
+func TestImageListMapsSafeMetadata(t *testing.T) {
+	m := newManager(t, fakeClient{images: []ImageSummary{{
+		ID:         "sha256:abc",
+		Tags:       []string{"nginx:latest"},
+		Created:    1700000000,
+		Size:       12345,
+		Labels:     map[string]string{"maintainer": "team"},
+		Containers: 2,
+	}}})
+	got, err := m.Images(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != "sha256:abc" || got[0].Tags[0] != "nginx:latest" {
+		t.Fatalf("image summary not mapped: %+v", got)
+	}
+	if got[0].Created != 1700000000 || got[0].Size != 12345 || got[0].Containers != 2 {
+		t.Fatalf("metadata fields not mapped: %+v", got[0])
+	}
+}
+
+// AC: docker.image.get exposes safe inspect metadata.
+func TestImageDetailMapsSafeMetadata(t *testing.T) {
+	m := newManager(t, fakeClient{imageDetail: ImageDetail{
+		ImageSummary: ImageSummary{ID: "sha256:abc", Tags: []string{"app:v1"}, Size: 99},
+		Architecture: "arm64",
+		OS:           "linux",
+		Author:       "team",
+		ParentID:     "sha256:parent",
+	}})
+	got, err := m.Image(context.Background(), "sha256:abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Architecture != "arm64" || got.OS != "linux" || got.ParentID != "sha256:parent" {
+		t.Fatalf("image inspect not mapped: %+v", got)
+	}
+}
+
+func TestImageGetRejectsBlankID(t *testing.T) {
+	m := newManager(t, fakeClient{})
+	if _, err := m.Image(context.Background(), "  "); err == nil {
+		t.Fatal("expected error for blank id")
+	}
+}
+
+// AC: docker.volume.list exposes volume names, drivers, mountpoint, labels,
+// and in-use hints when available.
+func TestVolumeListMapsFieldsIncludingUsageHint(t *testing.T) {
+	m := newManager(t, fakeClient{volumes: []VolumeSummary{
+		{Name: "data", Driver: "local", Mountpoint: "/var/lib/docker/volumes/data/_data",
+			Labels: map[string]string{"app": "api"}, InUseCount: 2},
+		{Name: "orphan", Driver: "local", InUseCount: -1},
+	}})
+	got, err := m.Volumes(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Name != "data" || got[0].Driver != "local" {
+		t.Fatalf("volume list not mapped: %+v", got)
+	}
+	if got[0].Mountpoint == "" || got[0].InUseCount != 2 {
+		t.Fatalf("volume mountpoint/usage not mapped: %+v", got[0])
+	}
+	if got[1].InUseCount != -1 {
+		t.Fatalf("unknown usage hint must remain -1: %+v", got[1])
+	}
+}
+
+// AC: docker.network.list exposes network IDs, names, drivers, scopes,
+// labels, and attached-container counts when available.
+func TestNetworkListMapsFieldsIncludingAttachedCount(t *testing.T) {
+	m := newManager(t, fakeClient{networks: []NetworkSummary{{
+		ID: "net1", Name: "bridge", Driver: "bridge", Scope: "local",
+		Labels:        map[string]string{"env": "dev"},
+		AttachedCount: 3,
+	}}})
+	got, err := m.Networks(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != "net1" || got[0].Driver != "bridge" {
+		t.Fatalf("network list not mapped: %+v", got)
+	}
+	if got[0].Scope != "local" || got[0].AttachedCount != 3 {
+		t.Fatalf("network scope/attached not mapped: %+v", got[0])
+	}
+}
+
+// AC: agent tests cover daemon inventory mapping.
+func TestDaemonInfoMapsCountsAndVersion(t *testing.T) {
+	m := newManager(t, fakeClient{daemon: DaemonInfo{
+		Containers: 7, ContainersRunning: 4, ContainersStopped: 3,
+		Images: 11, ServerVersion: "26.0.0", OperatingSystem: "Ubuntu 22.04",
+	}})
+	got, err := m.Info(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Containers != 7 || got.ContainersRunning != 4 || got.Images != 11 {
+		t.Fatalf("daemon counts not mapped: %+v", got)
+	}
+	if got.ServerVersion != "26.0.0" || got.OperatingSystem != "Ubuntu 22.04" {
+		t.Fatalf("daemon metadata not mapped: %+v", got)
+	}
+}
+
+// SocketClient image list strips Docker's "<none>:<none>" placeholders so the
+// UI never has to special-case them.
+func TestDropNoneTagsStripsPlaceholders(t *testing.T) {
+	got := dropNoneTags([]string{"<none>:<none>", "", "real:tag"})
+	if len(got) != 1 || got[0] != "real:tag" {
+		t.Fatalf("expected only 'real:tag', got %v", got)
+	}
+	if dropNoneTags([]string{"<none>:<none>"}) != nil {
+		t.Fatal("placeholder-only slice must collapse to nil")
 	}
 }
 
