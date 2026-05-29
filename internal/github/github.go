@@ -228,7 +228,12 @@ func (m *Manager) Push(projectID, account, confirmationToken string, files []str
 		_, _ = m.logPush(projectID, false, err.Error())
 		return err
 	}
-	if _, err := gitRunWithEnv(m.Projects.WorkspaceDir(projectID), githubGitEnv(token), "push"); err != nil {
+	dir := m.Projects.WorkspaceDir(projectID)
+	args := []string{"push"}
+	if !hasUpstream(dir) {
+		args = []string{"push", "-u", "origin", "HEAD"}
+	}
+	if _, err := gitRunWithEnv(dir, githubGitEnv(token), args...); err != nil {
 		_, _ = m.logPush(projectID, false, err.Error())
 		return err
 	}
@@ -352,13 +357,38 @@ func (m *Manager) requireApproved(projectID string, files []string) error {
 		return err
 	}
 	want := normalized(files)
+	current, err := m.currentRevisions(projectID, want)
+	if err != nil {
+		return err
+	}
 	for _, e := range entries {
 		var ev review.ReviewEvent
-		if err := json.Unmarshal([]byte(e.Data), &ev); err == nil && equalStrings(normalized(ev.Files), want) {
+		if err := json.Unmarshal([]byte(e.Data), &ev); err == nil && equalStrings(normalized(ev.Files), want) && revisionsMatch(ev.Revisions, current, want) {
 			return nil
 		}
 	}
 	return ErrUnapprovedChanges
+}
+
+func (m *Manager) currentRevisions(projectID string, files []string) (map[string]string, error) {
+	status, err := m.Review.Status(projectID)
+	if err != nil {
+		return nil, err
+	}
+	want := map[string]struct{}{}
+	for _, f := range files {
+		want[f] = struct{}{}
+	}
+	out := map[string]string{}
+	for _, f := range status {
+		if _, ok := want[f.Path]; ok {
+			out[f.Path] = f.Revision
+		}
+	}
+	if len(out) != len(want) {
+		return nil, ErrUnapprovedChanges
+	}
+	return out, nil
 }
 
 func (m *Manager) viewer(ctx context.Context, token string) (string, error) {
@@ -465,6 +495,11 @@ func gitRunWithEnv(dir string, extraEnv []string, args ...string) (string, error
 	return string(out), nil
 }
 
+func hasUpstream(dir string) bool {
+	_, err := gitRun(dir, "rev-parse", "--abbrev-ref", "@{upstream}")
+	return err == nil
+}
+
 func githubGitEnv(token string) []string {
 	return []string{
 		"GIT_CONFIG_COUNT=1",
@@ -491,6 +526,18 @@ func equalStrings(a, b []string) bool {
 	}
 	for i := range a {
 		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func revisionsMatch(approved, current map[string]string, files []string) bool {
+	if len(approved) == 0 {
+		return false
+	}
+	for _, f := range files {
+		if approved[f] != current[f] {
 			return false
 		}
 	}

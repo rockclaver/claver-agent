@@ -203,6 +203,20 @@ func TestCommit_RequiresApprovedChangeSet(t *testing.T) {
 	}
 }
 
+// Review comment 3323688519: approval must be bound to the reviewed revision,
+// not just to the path list.
+func TestCommit_RejectsFileModifiedAfterApproval(t *testing.T) {
+	m, _, _, rm, ws := fixture(t)
+	mustWrite(t, ws, "reviewed.txt", "approved version\n")
+	if _, _, err := rm.Approve("proj", "", []string{"reviewed.txt"}, "ok"); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, ws, "reviewed.txt", "unreviewed version\n")
+	if _, err := m.Commit("proj", "should fail", []string{"reviewed.txt"}); !errors.Is(err, ErrUnapprovedChanges) {
+		t.Fatalf("modified-after-approval commit got %v want ErrUnapprovedChanges", err)
+	}
+}
+
 // AC: "Push requires a valid biometric `confirmation_token` and writes an
 // Audit Log entry; pushes without a token are rejected and logged."
 func TestPush_RequiresConfirmationTokenAndAuditsFailures(t *testing.T) {
@@ -225,6 +239,42 @@ func TestPush_RequiresConfirmationTokenAndAuditsFailures(t *testing.T) {
 	}
 	if err := rm.ConsumeToken(tok.Token, "github.push", "proj", []string{"README.md"}, "wrong"); !errors.Is(err, review.ErrTokenMismatch) {
 		t.Fatalf("token should be action-bound, got %v", err)
+	}
+}
+
+// Review comment 3323688524: locally-created branches have no upstream, so
+// push must set origin/HEAD explicitly.
+func TestPush_NewLocalBranchSetsUpstream(t *testing.T) {
+	m, _, _, rm, ws := fixture(t)
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	mustGit(t, t.TempDir(), "init", "--bare", remote)
+	mustGit(t, ws, "remote", "add", "origin", remote)
+	mustGit(t, ws, "push", "-u", "origin", "main")
+	mustGit(t, ws, "checkout", "-b", "feature")
+	mustWrite(t, ws, "branch.txt", "branch\n")
+	if _, _, err := rm.Approve("proj", "", []string{"branch.txt"}, "ok"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Commit("proj", "branch commit", []string{"branch.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gitRun(ws, "rev-parse", "--abbrev-ref", "@{upstream}"); err == nil {
+		t.Fatal("feature branch unexpectedly already has upstream")
+	}
+	storeToken(t, m, "octo", "token")
+	tok, err := rm.MintConfirmationToken("github.push", "proj", []string{"branch.txt"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Push("proj", "octo", tok.Token, []string{"branch.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	upstream, err := gitRun(ws, "rev-parse", "--abbrev-ref", "@{upstream}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(upstream) != "origin/feature" {
+		t.Fatalf("upstream = %q want origin/feature", strings.TrimSpace(upstream))
 	}
 }
 

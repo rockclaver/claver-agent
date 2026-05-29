@@ -25,12 +25,12 @@ import (
 // Errors returned by the review module. Callers translate them to wire-level
 // error kinds.
 var (
-	ErrTokenInvalid     = errors.New("confirmation_token is invalid")
-	ErrTokenExpired     = errors.New("confirmation_token is expired")
-	ErrTokenUsed        = errors.New("confirmation_token has already been used")
-	ErrTokenMismatch    = errors.New("confirmation_token does not match this action")
-	ErrSessionMismatch  = errors.New("session_id does not belong to project_id")
-	ErrNotFound         = projects.ErrNotFound
+	ErrTokenInvalid    = errors.New("confirmation_token is invalid")
+	ErrTokenExpired    = errors.New("confirmation_token is expired")
+	ErrTokenUsed       = errors.New("confirmation_token has already been used")
+	ErrTokenMismatch   = errors.New("confirmation_token does not match this action")
+	ErrSessionMismatch = errors.New("session_id does not belong to project_id")
+	ErrNotFound        = projects.ErrNotFound
 )
 
 // Status group buckets exposed on the wire. Matching `git status` porcelain
@@ -278,11 +278,12 @@ const (
 // ReviewEvent is the structured payload appended to the session event log so
 // `session.subscribe` clients observe the review decision in order.
 type ReviewEvent struct {
-	Decision  Decision `json:"decision"`
-	ProjectID string   `json:"project_id"`
-	Files     []string `json:"files"`
-	Comment   string   `json:"comment"`
-	CreatedAt int64    `json:"created_at"`
+	Decision  Decision          `json:"decision"`
+	ProjectID string            `json:"project_id"`
+	Files     []string          `json:"files"`
+	Revisions map[string]string `json:"revisions,omitempty"`
+	Comment   string            `json:"comment"`
+	CreatedAt int64             `json:"created_at"`
 }
 
 // Approve writes a review event for the given files. The caller (server.go)
@@ -307,7 +308,7 @@ func (m *Manager) recordDecision(d Decision, auditType, projectID, sessionID str
 		return store.SessionEvent{}, store.AuditEntry{}, err
 	}
 	now := m.Now()
-	ev := ReviewEvent{Decision: d, ProjectID: projectID, Files: files, Comment: comment, CreatedAt: now.Unix()}
+	ev := ReviewEvent{Decision: d, ProjectID: projectID, Files: files, Revisions: m.revisionsFor(projectID, files), Comment: comment, CreatedAt: now.Unix()}
 	body, _ := jsonMarshal(ev)
 	var sessEv store.SessionEvent
 	if sessionID != "" {
@@ -345,6 +346,27 @@ func (m *Manager) recordDecision(d Decision, auditType, projectID, sessionID str
 		return store.SessionEvent{}, store.AuditEntry{}, err
 	}
 	return sessEv, audit, nil
+}
+
+func (m *Manager) revisionsFor(projectID string, files []string) map[string]string {
+	status, err := m.Status(projectID)
+	if err != nil {
+		return nil
+	}
+	want := map[string]struct{}{}
+	for _, f := range files {
+		want[f] = struct{}{}
+	}
+	out := map[string]string{}
+	for _, f := range status {
+		if _, ok := want[f.Path]; ok {
+			out[f.Path] = f.Revision
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // LogAudit is a generic audit append used by callers outside this package
