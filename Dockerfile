@@ -9,7 +9,7 @@ COPY . .
 RUN CGO_ENABLED=0 go build -o /out/claver-agent ./cmd/claver-agent
 
 FROM alpine:3.20
-RUN apk add --no-cache git tmux ca-certificates openssh-client bash
+RUN apk add --no-cache git tmux ca-certificates openssh-client bash bubblewrap
 COPY --from=build /out/claver-agent /usr/local/bin/claver-agent
 RUN mkdir -p /var/lib/claver
 ENV CLAVER_DATA_DIR=/var/lib/claver
