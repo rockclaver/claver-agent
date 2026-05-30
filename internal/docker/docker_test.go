@@ -403,6 +403,82 @@ func TestRedactEnvRedactsConnectionStringKeys(t *testing.T) {
 	}
 }
 
+// AC issue #27: redaction covers auth-style env keys (Authorization, JWT,
+// Bearer, Cookie, Session) in addition to the connection-string keys covered
+// elsewhere. These tests validate the AC checkbox on redaction coverage.
+func TestRedactEnvRedactsAuthStyleKeys(t *testing.T) {
+	got := redactEnv([]string{
+		"AUTHORIZATION=Bearer abc.def.ghi",
+		"BEARER_TOKEN=xyz",
+		"JWT_SECRET=supersecret",
+		"COOKIE_SECRET=opaque",
+		"SESSION_KEY=abc",
+		"SALT=peppercorn",
+		"PRIVATE_KEY=-----BEGIN-----",
+		"USERNAME=alice",
+	})
+	wantRedacted := []string{
+		"AUTHORIZATION", "BEARER_TOKEN", "JWT_SECRET", "COOKIE_SECRET",
+		"SESSION_KEY", "SALT", "PRIVATE_KEY",
+	}
+	for i, key := range wantRedacted {
+		if got[i].Key != key || !got[i].Redacted || got[i].Value != "REDACTED" {
+			t.Fatalf("%s not redacted: %+v", key, got[i])
+		}
+	}
+	if got[7].Redacted || got[7].Value != "alice" {
+		t.Fatalf("USERNAME should remain visible: %+v", got[7])
+	}
+}
+
+// AC issue #27: only the small set of known compose/claver labels is forwarded
+// to the client. Free-form labels — which operators sometimes use to stash
+// secrets — must be filtered out at the agent boundary so the UI never
+// receives them, regardless of what the Docker daemon returns.
+func TestComposeLabelsDropsArbitraryLabels(t *testing.T) {
+	got := composeLabels(map[string]string{
+		"com.docker.compose.project": "nest",
+		"com.docker.compose.service": "api",
+		"com.example.secret":         "should-not-leak",
+		"jwt-token":                  "shhh",
+		"app.kubernetes.io/secret":   "shhh",
+	})
+	if got["com.docker.compose.project"] != "nest" || got["com.docker.compose.service"] != "api" {
+		t.Fatalf("expected compose labels kept: %+v", got)
+	}
+	for _, forbidden := range []string{"com.example.secret", "jwt-token", "app.kubernetes.io/secret"} {
+		if _, ok := got[forbidden]; ok {
+			t.Fatalf("arbitrary label %q must be filtered: %+v", forbidden, got)
+		}
+	}
+}
+
+// AC issue #27: mount details flow through unchanged because the UI needs
+// source/destination to make the bind visible, but the agent must never
+// invent extra fields. This guards against a regression that adds an
+// "exec" / "command" / similar shell-like field to MountSummary.
+func TestContainerDetailMountsCarryOnlySafeFields(t *testing.T) {
+	m := newManager(t, fakeClient{detail: ContainerDetail{
+		Mounts: []MountSummary{{
+			Type:        "bind",
+			Source:      "/srv/data",
+			Destination: "/data",
+			ReadOnly:    true,
+		}},
+	}})
+	got, err := m.Container(context.Background(), "id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Mounts) != 1 {
+		t.Fatalf("mounts = %+v", got.Mounts)
+	}
+	mm := got.Mounts[0]
+	if mm.Source != "/srv/data" || mm.Destination != "/data" || !mm.ReadOnly || mm.Type != "bind" {
+		t.Fatalf("mount fields not preserved: %+v", mm)
+	}
+}
+
 // AC: docker.image.list exposes image IDs, tags, created time, size, labels.
 func TestImageListMapsSafeMetadata(t *testing.T) {
 	m := newManager(t, fakeClient{images: []ImageSummary{{

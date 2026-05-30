@@ -1293,6 +1293,13 @@ func isSecretKey(key string) bool {
 		"URL",
 		"URI",
 		"DSN",
+		"AUTH",
+		"BEARER",
+		"JWT",
+		"COOKIE",
+		"SESSION",
+		"SALT",
+		"PRIVATE",
 	} {
 		if strings.Contains(k, needle) {
 			return true
