@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -23,8 +24,10 @@ import (
 )
 
 var (
-	ErrBadAgent = errors.New("agent must be claude or codex")
-	ErrNotFound = store.ErrNotFound
+	ErrBadAgent     = errors.New("agent must be claude or codex")
+	ErrBadMode      = errors.New("run mode must be manual or yolo")
+	ErrAuthRequired = errors.New("agent cli is not authenticated")
+	ErrNotFound     = store.ErrNotFound
 )
 
 type Runtime interface {
@@ -32,6 +35,7 @@ type Runtime interface {
 	Attach(ctx context.Context, spec RuntimeSpec) error
 	SendPrompt(ctx context.Context, sessionID, prompt string) error
 	Interrupt(ctx context.Context, sessionID string) error
+	Resize(ctx context.Context, sessionID string, cols, rows int) error
 	Stop(ctx context.Context, sessionID string) error
 	Capture(ctx context.Context, sessionID string) (string, error)
 	Alive(ctx context.Context, sessionID string) bool
@@ -40,6 +44,7 @@ type Runtime interface {
 type RuntimeSpec struct {
 	SessionID string
 	Agent     string
+	RunMode   string
 	WorkDir   string
 	Output    io.Writer
 }
@@ -50,15 +55,24 @@ type Manager struct {
 	Runtime  Runtime
 	Now      func() time.Time
 	IDGen    func() string
+	AuthOK   func(context.Context, string) bool
 
 	mu   sync.Mutex
-	subs map[string]map[chan store.SessionEvent]struct{}
+	subs map[string]map[*subscriber]struct{}
+}
+
+// subscriber is one live consumer of a session's event stream. ch is never
+// closed; teardown signals via done instead, which lets fanout deliver outside
+// the manager lock without risking a send on a closed channel.
+type subscriber struct {
+	ch   chan store.SessionEvent
+	done chan struct{}
 }
 
 func New(st *store.Store, projectMgr *projects.Manager, runtime Runtime) *Manager {
 	return &Manager{
 		Store: st, Projects: projectMgr, Runtime: runtime, Now: time.Now, IDGen: randomID,
-		subs: make(map[string]map[chan store.SessionEvent]struct{}),
+		subs: make(map[string]map[*subscriber]struct{}),
 	}
 }
 
@@ -68,9 +82,16 @@ func randomID() string {
 	return hex.EncodeToString(b[:])
 }
 
-func (m *Manager) Start(ctx context.Context, projectID, agent string) (store.Session, error) {
+func (m *Manager) Start(ctx context.Context, projectID, agent, runMode string) (store.Session, error) {
 	if agent != "claude" && agent != "codex" {
 		return store.Session{}, ErrBadAgent
+	}
+	runMode = normalizeRunMode(runMode)
+	if runMode != "manual" && runMode != "yolo" {
+		return store.Session{}, ErrBadMode
+	}
+	if m.AuthOK != nil && !m.AuthOK(ctx, agent) {
+		return store.Session{}, ErrAuthRequired
 	}
 	if _, err := m.Projects.Get(projectID); err != nil {
 		return store.Session{}, err
@@ -84,6 +105,7 @@ func (m *Manager) Start(ctx context.Context, projectID, agent string) (store.Ses
 	if err := m.Runtime.Start(ctx, RuntimeSpec{
 		SessionID: id,
 		Agent:     agent,
+		RunMode:   runMode,
 		WorkDir:   m.Projects.WorkspaceDir(projectID),
 		Output:    w,
 	}); err != nil {
@@ -92,6 +114,13 @@ func (m *Manager) Start(ctx context.Context, projectID, agent string) (store.Ses
 	}
 	_, _ = m.Publish(store.SessionEvent{SessionID: id, Type: "lifecycle", Data: "started"})
 	return sess, nil
+}
+
+func normalizeRunMode(mode string) string {
+	if strings.TrimSpace(mode) == "" {
+		return "manual"
+	}
+	return mode
 }
 
 func (m *Manager) SendPrompt(ctx context.Context, sessionID, prompt string) error {
@@ -103,6 +132,19 @@ func (m *Manager) SendPrompt(ctx context.Context, sessionID, prompt string) erro
 	}
 	_, _ = m.Publish(store.SessionEvent{SessionID: sessionID, Type: "prompt", Data: prompt})
 	return m.Runtime.SendPrompt(ctx, sessionID, prompt)
+}
+
+// Resize sets the session's pty grid so the agent TUI redraws for the client's
+// actual viewport. Without this the pane stays at tmux's 80x24 default and
+// cursor-addressed redraws land in the wrong cells on a narrower phone screen.
+func (m *Manager) Resize(ctx context.Context, sessionID string, cols, rows int) error {
+	if cols <= 0 || rows <= 0 {
+		return nil
+	}
+	if _, err := m.Store.GetSession(sessionID); err != nil {
+		return err
+	}
+	return m.Runtime.Resize(ctx, sessionID, cols, rows)
 }
 
 func (m *Manager) Interrupt(ctx context.Context, sessionID string) error {
@@ -143,9 +185,9 @@ func (m *Manager) Delete(ctx context.Context, sessionID string) error {
 		return err
 	}
 	m.mu.Lock()
-	for ch := range m.subs[sessionID] {
-		delete(m.subs[sessionID], ch)
-		close(ch)
+	for sub := range m.subs[sessionID] {
+		delete(m.subs[sessionID], sub)
+		close(sub.done)
 	}
 	delete(m.subs, sessionID)
 	m.mu.Unlock()
@@ -234,11 +276,7 @@ func (m *Manager) Rehydrate(ctx context.Context) error {
 // PublishExisting fans an event that has already been persisted (by another
 // subsystem such as review) out to live subscribers without re-appending it.
 func (m *Manager) PublishExisting(ev store.SessionEvent) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for ch := range m.subs[ev.SessionID] {
-		ch <- ev
-	}
+	m.fanout(ev)
 }
 
 func (m *Manager) Publish(ev store.SessionEvent) (store.SessionEvent, error) {
@@ -249,12 +287,29 @@ func (m *Manager) Publish(ev store.SessionEvent) (store.SessionEvent, error) {
 	if in, out, ok := parseUsage(ev.Data); ok {
 		_ = m.Store.UpdateSessionUsage(ev.SessionID, in, out)
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for ch := range m.subs[ev.SessionID] {
-		ch <- ev
-	}
+	m.fanout(ev)
 	return ev, nil
+}
+
+// fanout delivers ev to every live subscriber of the session. Terminal output
+// is a stateful byte stream — a dropped ANSI redraw chunk corrupts the client's
+// screen — so delivery must never drop. We snapshot the subscribers under the
+// lock, then send outside it: this bounds backpressure to the one slow session
+// (its writer waits for its consumer) instead of letting a held lock freeze
+// every session's output. A torn-down subscriber unblocks via its done channel.
+func (m *Manager) fanout(ev store.SessionEvent) {
+	m.mu.Lock()
+	subs := make([]*subscriber, 0, len(m.subs[ev.SessionID]))
+	for sub := range m.subs[ev.SessionID] {
+		subs = append(subs, sub)
+	}
+	m.mu.Unlock()
+	for _, sub := range subs {
+		select {
+		case sub.ch <- ev:
+		case <-sub.done:
+		}
+	}
 }
 
 func (m *Manager) Subscribe(ctx context.Context, sessionID string, afterSeq int64) (<-chan store.SessionEvent, func(), error) {
@@ -262,28 +317,30 @@ func (m *Manager) Subscribe(ctx context.Context, sessionID string, afterSeq int6
 		return nil, nil, err
 	}
 	subCtx, cancelSub := context.WithCancel(ctx)
-	live := make(chan store.SessionEvent, 64)
-	out := make(chan store.SessionEvent, 64)
+	sub := &subscriber{
+		ch:   make(chan store.SessionEvent, 256),
+		done: make(chan struct{}),
+	}
+	out := make(chan store.SessionEvent, 256)
 	m.mu.Lock()
 	if m.subs[sessionID] == nil {
-		m.subs[sessionID] = make(map[chan store.SessionEvent]struct{})
+		m.subs[sessionID] = make(map[*subscriber]struct{})
 	}
-	m.subs[sessionID][live] = struct{}{}
+	m.subs[sessionID][sub] = struct{}{}
 	replay, err := m.Store.SessionEventsAfter(sessionID, afterSeq)
 	if err != nil {
-		delete(m.subs[sessionID], live)
+		delete(m.subs[sessionID], sub)
 		m.mu.Unlock()
-		close(live)
 		close(out)
 		cancelSub()
 		return nil, nil, err
 	}
 	m.mu.Unlock()
 
-	done := make(chan struct{})
+	finished := make(chan struct{})
 	go func() {
 		defer close(out)
-		defer close(done)
+		defer close(finished)
 		for _, ev := range replay {
 			select {
 			case out <- ev:
@@ -293,16 +350,17 @@ func (m *Manager) Subscribe(ctx context.Context, sessionID string, afterSeq int6
 		}
 		for {
 			select {
-			case ev, ok := <-live:
-				if !ok {
-					return
-				}
+			case ev := <-sub.ch:
 				select {
 				case out <- ev:
 				case <-subCtx.Done():
 					return
+				case <-sub.done:
+					return
 				}
 			case <-subCtx.Done():
+				return
+			case <-sub.done:
 				return
 			}
 		}
@@ -310,12 +368,12 @@ func (m *Manager) Subscribe(ctx context.Context, sessionID string, afterSeq int6
 	cancel := func() {
 		cancelSub()
 		m.mu.Lock()
-		if _, ok := m.subs[sessionID][live]; ok {
-			delete(m.subs[sessionID], live)
-			close(live)
+		if _, ok := m.subs[sessionID][sub]; ok {
+			delete(m.subs[sessionID], sub)
+			close(sub.done)
 		}
 		m.mu.Unlock()
-		<-done
+		<-finished
 	}
 	return out, cancel, nil
 }
@@ -365,11 +423,23 @@ func cleanTerminalText(s string) string {
 	}, s)
 }
 
-func isClaudeFirstRunSetup(s string) bool {
+func claudeFirstRunSetupStep(s string) string {
 	compact := strings.ToLower(strings.ReplaceAll(s, " ", ""))
-	return strings.Contains(compact, "choosethetextstyle") ||
+	if strings.Contains(compact, "selectloginmethod") ||
+		(strings.Contains(compact, "claudeaccountwithsubscription") &&
+			strings.Contains(compact, "anthropicconsoleaccount")) {
+		return "login_method"
+	}
+	if strings.Contains(compact, "choosethetextstyle") ||
 		strings.Contains(compact, "syntaxtheme:") ||
-		(strings.Contains(compact, "welcometoclaudecode") && strings.Contains(compact, "let'sgetstarted"))
+		(strings.Contains(compact, "welcometoclaudecode") && strings.Contains(compact, "let'sgetstarted")) {
+		return "theme"
+	}
+	return ""
+}
+
+func isClaudeFirstRunSetup(s string) bool {
+	return claudeFirstRunSetupStep(s) != ""
 }
 
 // TmuxRuntime exec's tmux to host agent CLIs. ExtraPath, when set, is
@@ -379,6 +449,7 @@ func isClaudeFirstRunSetup(s string) bool {
 // the CLI inherits subscription credentials.
 type TmuxRuntime struct {
 	ExtraPath string
+	HomeDir   string
 	Secrets   func(agent string) map[string]string
 }
 
@@ -386,17 +457,21 @@ func (r TmuxRuntime) Start(ctx context.Context, spec RuntimeSpec) error {
 	if spec.Agent != "claude" && spec.Agent != "codex" {
 		return ErrBadAgent
 	}
+	if normalizeRunMode(spec.RunMode) != "manual" && normalizeRunMode(spec.RunMode) != "yolo" {
+		return ErrBadMode
+	}
 	if err := os.MkdirAll(spec.WorkDir, 0o700); err != nil {
 		return err
 	}
 	name := tmuxName(spec.SessionID)
 	args := []string{"new-session", "-d", "-s", name, "-n", spec.SessionID, "-c", spec.WorkDir}
+	args = append(args, r.tmuxEnvFlags()...)
 	if r.Secrets != nil {
 		for k, v := range r.Secrets(spec.Agent) {
 			args = append(args, "-e", k+"="+v)
 		}
 	}
-	args = append(args, spec.Agent)
+	args = append(args, agentCommandArgs(spec.Agent, spec.RunMode)...)
 	cmd := exec.CommandContext(ctx, "tmux", args...)
 	cmd.Env = r.envWithPath()
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -406,24 +481,95 @@ func (r TmuxRuntime) Start(ctx context.Context, spec RuntimeSpec) error {
 	return r.Attach(ctx, spec)
 }
 
+func agentCommandArgs(agent, runMode string) []string {
+	mode := normalizeRunMode(runMode)
+	switch agent {
+	case "claude":
+		if mode == "yolo" {
+			return []string{"claude", "--dangerously-skip-permissions"}
+		}
+		return []string{"claude", "--permission-mode", "default"}
+	case "codex":
+		if mode == "yolo" {
+			return []string{"codex", "--dangerously-bypass-approvals-and-sandbox"}
+		}
+		return []string{"codex", "--ask-for-approval", "untrusted", "--sandbox", "workspace-write"}
+	default:
+		return []string{agent}
+	}
+}
+
 func (r TmuxRuntime) envWithPath() []string {
 	env := os.Environ()
-	if r.ExtraPath == "" {
+	if r.ExtraPath == "" && r.HomeDir == "" {
 		return env
 	}
 	cur := os.Getenv("PATH")
-	newPath := r.ExtraPath
-	if cur != "" {
+	newPath := cur
+	if r.ExtraPath != "" && cur != "" {
 		newPath = r.ExtraPath + ":" + cur
+	} else if r.ExtraPath != "" {
+		newPath = r.ExtraPath
 	}
 	out := make([]string, 0, len(env))
 	for _, kv := range env {
-		if strings.HasPrefix(kv, "PATH=") {
+		if shouldReplaceEnv(kv) {
 			continue
 		}
 		out = append(out, kv)
 	}
-	return append(out, "PATH="+newPath)
+	if newPath != "" {
+		out = append(out, "PATH="+newPath)
+	}
+	if r.HomeDir != "" {
+		out = append(out, "HOME="+r.HomeDir)
+		out = append(out, "CLAUDE_CONFIG_DIR="+r.claudeConfigDir())
+	}
+	return out
+}
+
+func (r TmuxRuntime) tmuxEnvFlags() []string {
+	flags := []string{}
+	if r.HomeDir != "" {
+		flags = append(flags, "-e", "HOME="+r.HomeDir)
+		flags = append(flags, "-e", "CLAUDE_CONFIG_DIR="+r.claudeConfigDir())
+	}
+	if path := pathWithPrefix(r.ExtraPath); path != "" {
+		flags = append(flags, "-e", "PATH="+path)
+	}
+	return flags
+}
+
+func (r TmuxRuntime) claudeConfigDir() string {
+	return filepath.Join(r.HomeDir, ".claude")
+}
+
+func shouldReplaceEnv(kv string) bool {
+	for _, prefix := range []string{
+		"PATH=",
+		"HOME=",
+		"CLAUDE_CONFIG_DIR=",
+		"ANTHROPIC_API_KEY=",
+		"ANTHROPIC_AUTH_TOKEN=",
+		"CLAUDE_CODE_OAUTH_TOKEN=",
+	} {
+		if strings.HasPrefix(kv, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func pathWithPrefix(prefix string) string {
+	cur := os.Getenv("PATH")
+	switch {
+	case prefix != "" && cur != "":
+		return prefix + ":" + cur
+	case prefix != "":
+		return prefix
+	default:
+		return cur
+	}
 }
 
 func (r TmuxRuntime) Attach(ctx context.Context, spec RuntimeSpec) error {
@@ -444,7 +590,9 @@ func (r TmuxRuntime) Attach(ctx context.Context, spec RuntimeSpec) error {
 		if spec.Agent == "claude" {
 			output = newClaudeFirstRunAdvancer(spec.Output, spec.SessionID, sendTmuxEnter)
 		}
-		scanPipe(f, output)
+		coalesced := newCoalescingWriter(output, 16*time.Millisecond, 32*1024)
+		scanPipe(f, coalesced)
+		coalesced.Close()
 	}()
 	pipeCmd := "cat > " + shellQuote(fifo)
 	if out, err := exec.CommandContext(ctx, "tmux", "pipe-pane", "-t", target, "-o", pipeCmd).CombinedOutput(); err != nil {
@@ -461,7 +609,7 @@ func (r TmuxRuntime) advanceClaudeFirstRunSetup(ctx context.Context, sessionID s
 	if err != nil || data == "" {
 		return
 	}
-	if isClaudeFirstRunSetup(cleanTerminalText(data)) {
+	if claudeFirstRunSetupStep(cleanTerminalText(data)) != "" {
 		_ = sendTmuxEnter(ctx, sessionID)
 	}
 }
@@ -472,7 +620,7 @@ type claudeFirstRunAdvancer struct {
 	sendEnter func(context.Context, string) error
 
 	mu       sync.Mutex
-	advanced bool
+	advanced map[string]bool
 	buffer   string
 }
 
@@ -481,6 +629,7 @@ func newClaudeFirstRunAdvancer(out io.Writer, sessionID string, sendEnter func(c
 		out:       out,
 		sessionID: sessionID,
 		sendEnter: sendEnter,
+		advanced:  map[string]bool{},
 	}
 }
 
@@ -491,9 +640,6 @@ func (w *claudeFirstRunAdvancer) Write(p []byte) (int, error) {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.advanced {
-		return n, err
-	}
 	clean := cleanTerminalText(string(p))
 	if clean == "" {
 		return n, err
@@ -502,11 +648,76 @@ func (w *claudeFirstRunAdvancer) Write(p []byte) (int, error) {
 	if len(w.buffer) > 4096 {
 		w.buffer = w.buffer[len(w.buffer)-4096:]
 	}
-	if isClaudeFirstRunSetup(w.buffer) {
-		w.advanced = true
+	if step := claudeFirstRunSetupStep(w.buffer); step != "" && !w.advanced[step] {
+		w.advanced[step] = true
 		_ = w.sendEnter(context.Background(), w.sessionID)
 	}
 	return n, err
+}
+
+// coalescingWriter batches pty bytes over a short window before forwarding
+// them downstream. Full-screen TUIs emit many tiny reads per redraw; without
+// batching each read became its own SQLite insert, websocket frame, and
+// client stream event, which is the dominant source of churn and jitter.
+// Bytes flush when the buffer reaches maxBytes or after window elapses,
+// whichever comes first, so latency stays bounded while volume collapses.
+type coalescingWriter struct {
+	out      io.Writer
+	window   time.Duration
+	maxBytes int
+
+	mu     sync.Mutex
+	buf    []byte
+	timer  *time.Timer
+	closed bool
+}
+
+func newCoalescingWriter(out io.Writer, window time.Duration, maxBytes int) *coalescingWriter {
+	return &coalescingWriter{out: out, window: window, maxBytes: maxBytes}
+}
+
+func (w *coalescingWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return len(p), nil
+	}
+	w.buf = append(w.buf, p...)
+	if len(w.buf) >= w.maxBytes {
+		w.flushLocked()
+	} else if w.timer == nil {
+		w.timer = time.AfterFunc(w.window, w.flush)
+	}
+	return len(p), nil
+}
+
+func (w *coalescingWriter) flush() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.flushLocked()
+}
+
+func (w *coalescingWriter) flushLocked() {
+	if w.timer != nil {
+		w.timer.Stop()
+		w.timer = nil
+	}
+	if len(w.buf) == 0 {
+		return
+	}
+	_, _ = w.out.Write(w.buf)
+	w.buf = nil
+}
+
+// Close flushes any buffered bytes and stops accepting new ones.
+func (w *coalescingWriter) Close() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.flushLocked()
+	w.closed = true
 }
 
 // scanPipe forwards pty bytes from the tmux pipe as soon as they arrive.
@@ -541,6 +752,19 @@ func sendTmuxEnter(ctx context.Context, sessionID string) error {
 	target := tmuxName(sessionID) + ":0.0"
 	if out, err := exec.CommandContext(ctx, "tmux", "send-keys", "-t", target, "Enter").CombinedOutput(); err != nil {
 		return fmt.Errorf("tmux send enter: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func (TmuxRuntime) Resize(ctx context.Context, sessionID string, cols, rows int) error {
+	if cols <= 0 || rows <= 0 {
+		return nil
+	}
+	target := tmuxName(sessionID)
+	out, err := exec.CommandContext(ctx, "tmux", "resize-window", "-t", target,
+		"-x", strconv.Itoa(cols), "-y", strconv.Itoa(rows)).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("tmux resize: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

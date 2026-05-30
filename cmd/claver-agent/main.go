@@ -73,8 +73,13 @@ func main() {
 	}
 	sessionMgr := sessions.New(st, mgr, sessions.TmuxRuntime{
 		ExtraPath: toolingMgr.BinDir(),
+		HomeDir:   homeDirOr(*dataDir),
 		Secrets:   authMgr.Secrets,
 	})
+	sessionMgr.AuthOK = func(ctx context.Context, agent string) bool {
+		st, err := authMgr.Status(ctx, agent)
+		return err == nil && st.LoggedIn
+	}
 
 	previewMgr, err := previews.New(previews.Config{
 		FragmentsDir: *caddyFragmentsDir,

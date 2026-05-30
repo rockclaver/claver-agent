@@ -173,8 +173,10 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer c.Close(websocket.StatusInternalError, "internal")
 
-	ctx := r.Context()
-	var writeMu sync.Mutex
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	writeMu := newConnWriter(cancel)
+	go s.writerLoop(ctx, c, writeMu)
 	// Request-id dedupe spans reconnects (the cache lives on Server, not this
 	// connection). When the mobile transport replays a frame after a tunnel
 	// drop on a new WebSocket, this branch still fires so side-effecting
@@ -186,14 +188,69 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		}
 		var f Frame
 		if err := json.Unmarshal(data, &f); err != nil {
-			s.writeError(ctx, c, &writeMu, "", "bad_frame", err.Error())
+			s.writeError(ctx, c, writeMu, "", "bad_frame", err.Error())
 			continue
 		}
 		if f.ID != "" && s.seen.add(f.ID) {
-			s.writeOK(ctx, c, &writeMu, f.ID, f.Kind, map[string]any{"replay": true})
+			s.writeOK(ctx, c, writeMu, f.ID, f.Kind, map[string]any{"replay": true})
 			continue
 		}
-		s.dispatch(ctx, c, &writeMu, f)
+		s.dispatch(ctx, c, writeMu, f)
+	}
+}
+
+// connWriter serializes every outbound frame for one connection onto a single
+// writer goroutine. The read loop and all streaming goroutines enqueue here
+// instead of writing inline, so a slow client can never block the read loop —
+// the condition that previously deadlocked the connection (read loop waiting on
+// the write lock while the streamer waited on a client that had stopped
+// reading). Delivery is in-order and lossless until the queue overflows, at
+// which point the client is too far behind to be alive and we drop the
+// connection; the mobile transport reconnects and replays from its last seq.
+type connWriter struct {
+	send   chan []byte
+	cancel context.CancelFunc
+	once   sync.Once
+	done   chan struct{}
+}
+
+func newConnWriter(cancel context.CancelFunc) *connWriter {
+	return &connWriter{
+		send:   make(chan []byte, 1024),
+		cancel: cancel,
+		done:   make(chan struct{}),
+	}
+}
+
+func (w *connWriter) enqueue(b []byte) {
+	select {
+	case w.send <- b:
+	case <-w.done:
+	default:
+		w.shutdown()
+	}
+}
+
+func (w *connWriter) shutdown() {
+	w.once.Do(func() {
+		close(w.done)
+		w.cancel()
+	})
+}
+
+func (s *Server) writerLoop(ctx context.Context, c *websocket.Conn, w *connWriter) {
+	for {
+		select {
+		case b := <-w.send:
+			if err := c.Write(ctx, websocket.MessageText, b); err != nil {
+				w.shutdown()
+				return
+			}
+		case <-w.done:
+			return
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 
@@ -255,7 +312,7 @@ func (s *idSet) add(id string) bool {
 	return false
 }
 
-func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, f Frame) {
+func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
 	switch f.Kind {
 	case "server.health":
 		uptime := int64(s.cfg.Now().Sub(s.startAt).Seconds())
@@ -274,6 +331,7 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *sync.
 	case "session.start",
 		"session.prompt",
 		"session.interrupt",
+		"session.resize",
 		"session.stop",
 		"session.delete",
 		"session.list",
@@ -387,7 +445,7 @@ func toSessionEventDTO(ev store.SessionEvent) SessionEventDTO {
 	return SessionEventDTO{SessionID: ev.SessionID, Seq: ev.Seq, Type: ev.Type, Data: ev.Data, CreatedAt: ev.CreatedAt.Unix()}
 }
 
-func (s *Server) dispatchProject(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, f Frame) {
+func (s *Server) dispatchProject(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
 	if s.cfg.Projects == nil {
 		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "projects subsystem not configured")
 		return
@@ -487,7 +545,7 @@ func (s *Server) dispatchProject(ctx context.Context, c *websocket.Conn, writeMu
 	}
 }
 
-func (s *Server) dispatchSession(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, f Frame) {
+func (s *Server) dispatchSession(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
 	if s.cfg.Sessions == nil {
 		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "sessions subsystem not configured")
 		return
@@ -498,12 +556,13 @@ func (s *Server) dispatchSession(ctx context.Context, c *websocket.Conn, writeMu
 		var in struct {
 			ProjectID string `json:"project_id"`
 			Agent     string `json:"agent"`
+			RunMode   string `json:"run_mode"`
 		}
 		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ProjectID == "" || in.Agent == "" {
 			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "project_id and agent required")
 			return
 		}
-		sess, err := mgr.Start(ctx, in.ProjectID, in.Agent)
+		sess, err := mgr.Start(ctx, in.ProjectID, in.Agent, in.RunMode)
 		if err != nil {
 			s.writeSessionErr(ctx, c, writeMu, f.ID, err)
 			return
@@ -536,6 +595,21 @@ func (s *Server) dispatchSession(ctx context.Context, c *websocket.Conn, writeMu
 			return
 		}
 		s.writeOK(ctx, c, writeMu, f.ID, "session.interrupt", map[string]any{"session_id": in.SessionID})
+	case "session.resize":
+		var in struct {
+			SessionID string `json:"session_id"`
+			Cols      int    `json:"cols"`
+			Rows      int    `json:"rows"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.SessionID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "session_id required")
+			return
+		}
+		if err := mgr.Resize(ctx, in.SessionID, in.Cols, in.Rows); err != nil {
+			s.writeSessionErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "session.resize", map[string]any{"session_id": in.SessionID})
 	case "session.stop":
 		var in struct {
 			SessionID string `json:"session_id"`
@@ -644,7 +718,7 @@ type AuditDTO struct {
 	CreatedAt int64  `json:"created_at"`
 }
 
-func (s *Server) dispatchReview(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, f Frame) {
+func (s *Server) dispatchReview(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
 	if s.cfg.Review == nil {
 		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "review subsystem not configured")
 		return
@@ -757,7 +831,7 @@ func (s *Server) dispatchReview(ctx context.Context, c *websocket.Conn, writeMu 
 	}
 }
 
-func (s *Server) dispatchReviewDecision(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, f Frame, mgr *review.Manager, action string, requireToken bool) {
+func (s *Server) dispatchReviewDecision(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame, mgr *review.Manager, action string, requireToken bool) {
 	var in struct {
 		ProjectID         string   `json:"project_id"`
 		SessionID         string   `json:"session_id"`
@@ -804,7 +878,7 @@ func (s *Server) dispatchReviewDecision(ctx context.Context, c *websocket.Conn, 
 	})
 }
 
-func (s *Server) writeReviewErr(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, id string, err error) {
+func (s *Server) writeReviewErr(ctx context.Context, c *websocket.Conn, writeMu *connWriter, id string, err error) {
 	switch {
 	case errors.Is(err, review.ErrTokenInvalid):
 		s.writeError(ctx, c, writeMu, id, "token_invalid", err.Error())
@@ -823,7 +897,7 @@ func (s *Server) writeReviewErr(ctx context.Context, c *websocket.Conn, writeMu 
 	}
 }
 
-func (s *Server) dispatchGitHub(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, f Frame) {
+func (s *Server) dispatchGitHub(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
 	if s.cfg.GitHub == nil {
 		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "github subsystem not configured")
 		return
@@ -965,7 +1039,7 @@ func (s *Server) dispatchGitHub(ctx context.Context, c *websocket.Conn, writeMu 
 	}
 }
 
-func (s *Server) writeGitHubErr(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, id string, err error) {
+func (s *Server) writeGitHubErr(ctx context.Context, c *websocket.Conn, writeMu *connWriter, id string, err error) {
 	switch {
 	case errors.Is(err, gh.ErrTokenMissing):
 		s.writeError(ctx, c, writeMu, id, "github_reauth_required", err.Error())
@@ -986,10 +1060,14 @@ func (s *Server) writeGitHubErr(ctx context.Context, c *websocket.Conn, writeMu 
 	}
 }
 
-func (s *Server) writeSessionErr(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, id string, err error) {
+func (s *Server) writeSessionErr(ctx context.Context, c *websocket.Conn, writeMu *connWriter, id string, err error) {
 	switch {
 	case errors.Is(err, sessions.ErrBadAgent):
 		s.writeError(ctx, c, writeMu, id, "bad_agent", err.Error())
+	case errors.Is(err, sessions.ErrBadMode):
+		s.writeError(ctx, c, writeMu, id, "bad_mode", err.Error())
+	case errors.Is(err, sessions.ErrAuthRequired):
+		s.writeError(ctx, c, writeMu, id, "auth_required", err.Error())
 	case errors.Is(err, sessions.ErrNotFound), errors.Is(err, projects.ErrNotFound):
 		s.writeError(ctx, c, writeMu, id, "not_found", err.Error())
 	default:
@@ -997,7 +1075,7 @@ func (s *Server) writeSessionErr(ctx context.Context, c *websocket.Conn, writeMu
 	}
 }
 
-func (s *Server) writeProjectErr(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, id string, err error) {
+func (s *Server) writeProjectErr(ctx context.Context, c *websocket.Conn, writeMu *connWriter, id string, err error) {
 	switch {
 	case errors.Is(err, projects.ErrDirtyTree):
 		s.writeError(ctx, c, writeMu, id, "dirty_tree", err.Error())
@@ -1040,7 +1118,7 @@ func toPreviewDTO(p store.Preview) PreviewDTO {
 	}
 }
 
-func (s *Server) dispatchPreview(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, f Frame) {
+func (s *Server) dispatchPreview(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
 	if s.cfg.Previews == nil {
 		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "previews subsystem not configured")
 		return
@@ -1176,7 +1254,7 @@ func (s *Server) dispatchPreview(ctx context.Context, c *websocket.Conn, writeMu
 	}
 }
 
-func (s *Server) writePreviewErr(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, id string, err error) {
+func (s *Server) writePreviewErr(ctx context.Context, c *websocket.Conn, writeMu *connWriter, id string, err error) {
 	switch {
 	case errors.Is(err, previews.ErrBaseDomainUnset):
 		s.writeError(ctx, c, writeMu, id, "preview_no_domain", err.Error())
@@ -1264,7 +1342,7 @@ func (s *Server) auditDockerLifecycle(id, action string, ok bool, summary string
 	return entry
 }
 
-func (s *Server) dispatchDocker(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, f Frame) {
+func (s *Server) dispatchDocker(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
 	if s.cfg.Docker == nil {
 		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "docker subsystem not configured")
 		return
@@ -1575,7 +1653,7 @@ func toToolingDTO(st tooling.Status) ToolingStatusDTO {
 	}
 }
 
-func (s *Server) dispatchTooling(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, f Frame) {
+func (s *Server) dispatchTooling(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
 	if s.cfg.Tooling == nil {
 		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "tooling subsystem not configured")
 		return
@@ -1669,7 +1747,7 @@ func toAuthDTO(st cliauth.Status) CliAuthStatusDTO {
 	}
 }
 
-func (s *Server) dispatchAuth(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, f Frame) {
+func (s *Server) dispatchAuth(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
 	if s.cfg.Auth == nil {
 		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "auth subsystem not configured")
 		return
@@ -1820,22 +1898,18 @@ func (s *Server) dispatchAuth(ctx context.Context, c *websocket.Conn, writeMu *s
 	}
 }
 
-func (s *Server) writeOK(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, id, kind string, payload any) {
+func (s *Server) writeOK(ctx context.Context, c *websocket.Conn, writeMu *connWriter, id, kind string, payload any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		s.writeError(ctx, c, writeMu, id, "marshal_error", err.Error())
 		return
 	}
 	out, _ := json.Marshal(Frame{ID: id, Kind: kind, Payload: raw})
-	writeMu.Lock()
-	defer writeMu.Unlock()
-	_ = c.Write(ctx, websocket.MessageText, out)
+	writeMu.enqueue(out)
 }
 
-func (s *Server) writeError(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, id, kind, msg string) {
+func (s *Server) writeError(ctx context.Context, c *websocket.Conn, writeMu *connWriter, id, kind, msg string) {
 	raw, _ := json.Marshal(map[string]string{"error": msg})
 	out, _ := json.Marshal(Frame{ID: id, Kind: "error." + kind, Payload: raw})
-	writeMu.Lock()
-	defer writeMu.Unlock()
-	_ = c.Write(ctx, websocket.MessageText, out)
+	writeMu.enqueue(out)
 }

@@ -3,6 +3,7 @@ package sessions
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"path/filepath"
 	"strings"
@@ -18,6 +19,7 @@ type fakeRuntime struct {
 	attached    []RuntimeSpec
 	prompts     []string
 	interrupts  int
+	resizes     [][2]int
 	stops       int
 	captureText string
 	dead        bool
@@ -39,6 +41,10 @@ func (f *fakeRuntime) SendPrompt(_ context.Context, sessionID, prompt string) er
 }
 func (f *fakeRuntime) Interrupt(context.Context, string) error {
 	f.interrupts++
+	return nil
+}
+func (f *fakeRuntime) Resize(_ context.Context, _ string, cols, rows int) error {
+	f.resizes = append(f.resizes, [2]int{cols, rows})
 	return nil
 }
 func (f *fakeRuntime) Stop(context.Context, string) error {
@@ -79,12 +85,15 @@ func newTestManager(t *testing.T) (*Manager, *fakeRuntime) {
 // pipe-pane streams output into Stream Hub."
 func TestStartSession_CreatesRuntimePaneAndStreamsOutput(t *testing.T) {
 	m, rt := newTestManager(t)
-	sess, err := m.Start(context.Background(), "p1", "codex")
+	sess, err := m.Start(context.Background(), "p1", "codex", "manual")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if sess.ID != "s1" || len(rt.started) != 1 || rt.started[0].SessionID != "s1" {
 		t.Fatalf("runtime start mismatch: sess=%+v started=%+v", sess, rt.started)
+	}
+	if rt.started[0].RunMode != "manual" {
+		t.Fatalf("run mode = %q want manual", rt.started[0].RunMode)
 	}
 	evs, err := m.Store.SessionEventsAfter("s1", 0)
 	if err != nil {
@@ -99,7 +108,7 @@ func TestStartSession_CreatesRuntimePaneAndStreamsOutput(t *testing.T) {
 // backpressure; no event loss observed under simulated slow client."
 func TestStreamHub_NoEventLossWithSlowClient(t *testing.T) {
 	m, _ := newTestManager(t)
-	if _, err := m.Start(context.Background(), "p1", "claude"); err != nil {
+	if _, err := m.Start(context.Background(), "p1", "claude", "manual"); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -132,7 +141,7 @@ func TestStreamHub_NoEventLossWithSlowClient(t *testing.T) {
 // must not block Subscribe before the caller can start reading.
 func TestSubscribe_ReplaysMoreThanBufferWithoutDeadlock(t *testing.T) {
 	m, _ := newTestManager(t)
-	if _, err := m.Start(context.Background(), "p1", "claude"); err != nil {
+	if _, err := m.Start(context.Background(), "p1", "claude", "manual"); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 80; i++ {
@@ -178,7 +187,7 @@ func TestSubscribe_ReplaysMoreThanBufferWithoutDeadlock(t *testing.T) {
 
 func TestSubscribe_CleanupDoesNotRequireParentContextCancel(t *testing.T) {
 	m, _ := newTestManager(t)
-	if _, err := m.Start(context.Background(), "p1", "claude"); err != nil {
+	if _, err := m.Start(context.Background(), "p1", "claude", "manual"); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 80; i++ {
@@ -207,7 +216,7 @@ func TestSubscribe_CleanupDoesNotRequireParentContextCancel(t *testing.T) {
 // streamed output within the NFR latency budget."
 func TestPrompt_ReachesRuntimePaneAndCanStreamOutput(t *testing.T) {
 	m, rt := newTestManager(t)
-	if _, err := m.Start(context.Background(), "p1", "codex"); err != nil {
+	if _, err := m.Start(context.Background(), "p1", "codex", "manual"); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.SendPrompt(context.Background(), "s1", "explain"); err != nil {
@@ -242,13 +251,46 @@ func TestClaudeFirstRunAdvancer_SelectsDefaultThemeOnce(t *testing.T) {
 	if len(sends) != 1 || sends[0] != "s1" {
 		t.Fatalf("enter sends mismatch: %+v", sends)
 	}
+
+	if _, err := w.Write([]byte("Syntax theme: Monokai Extended\n")); err != nil {
+		t.Fatal(err)
+	}
+	if len(sends) != 1 {
+		t.Fatalf("theme enter repeated: %+v", sends)
+	}
+}
+
+func TestClaudeFirstRunAdvancer_AdvancesLoginMethodAfterTheme(t *testing.T) {
+	var out bytes.Buffer
+	var sends []string
+	w := newClaudeFirstRunAdvancer(&out, "s1", func(_ context.Context, sessionID string) error {
+		sends = append(sends, sessionID)
+		return nil
+	})
+
+	if _, err := w.Write([]byte("Choose the text style that looks best with your terminal\n")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("Select login method:\n")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("1. Claude account with subscription - Pro, Max, Team, or Enterprise\n")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("2. Anthropic Console account - API usage billing\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(sends) != 2 {
+		t.Fatalf("enter sends mismatch: %+v", sends)
+	}
 }
 
 // AC: "Interrupt sends a signal that stops generation without killing the
 // pane; the session can receive another prompt afterward."
 func TestInterrupt_LeavesSessionPromptable(t *testing.T) {
 	m, rt := newTestManager(t)
-	if _, err := m.Start(context.Background(), "p1", "codex"); err != nil {
+	if _, err := m.Start(context.Background(), "p1", "codex", "manual"); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.Interrupt(context.Background(), "s1"); err != nil {
@@ -266,7 +308,7 @@ func TestInterrupt_LeavesSessionPromptable(t *testing.T) {
 // session; the user sees no data loss beyond what tmux itself drops."
 func TestRehydrate_CapturesActiveTmuxPane(t *testing.T) {
 	m, rt := newTestManager(t)
-	if _, err := m.Start(context.Background(), "p1", "claude"); err != nil {
+	if _, err := m.Start(context.Background(), "p1", "claude", "manual"); err != nil {
 		t.Fatal(err)
 	}
 	rt.captureText = "still running\n"
@@ -286,7 +328,7 @@ func TestRehydrate_CapturesActiveTmuxPane(t *testing.T) {
 // existing tmux panes, not only capture a one-time snapshot.
 func TestRehydrate_AttachesStreamingToActiveTmuxPane(t *testing.T) {
 	m, rt := newTestManager(t)
-	if _, err := m.Start(context.Background(), "p1", "claude"); err != nil {
+	if _, err := m.Start(context.Background(), "p1", "claude", "manual"); err != nil {
 		t.Fatal(err)
 	}
 	rt.captureText = "still running\n"
@@ -333,7 +375,7 @@ func TestRehydrate_AcrossAgentRestart_LosesNoCommittedEvent(t *testing.T) {
 	m1 := New(st, pm, rt1)
 	m1.IDGen = func() string { return "s1" }
 	m1.Now = func() time.Time { return time.Unix(100, 0) }
-	if _, err := m1.Start(context.Background(), "p1", "codex"); err != nil {
+	if _, err := m1.Start(context.Background(), "p1", "codex", "manual"); err != nil {
 		t.Fatal(err)
 	}
 	// Publish committed events that should survive the crash.
@@ -410,7 +452,7 @@ func contains(xs []string, s string) bool {
 // (parsed from the agent's own usage output)."
 func TestUsageOutput_UpdatesSessionList(t *testing.T) {
 	m, _ := newTestManager(t)
-	if _, err := m.Start(context.Background(), "p1", "claude"); err != nil {
+	if _, err := m.Start(context.Background(), "p1", "claude", "manual"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.Publish(store.SessionEvent{SessionID: "s1", Type: "stdout", Data: "input tokens: 12 output tokens: 34"}); err != nil {
@@ -428,8 +470,98 @@ func TestUsageOutput_UpdatesSessionList(t *testing.T) {
 // AC: "No code path exposes an arbitrary shell command to the mobile UI."
 func TestStartSession_RejectsArbitraryAgentCommand(t *testing.T) {
 	m, _ := newTestManager(t)
-	_, err := m.Start(context.Background(), "p1", "sh -c rm -rf /")
+	_, err := m.Start(context.Background(), "p1", "sh -c rm -rf /", "manual")
 	if err == nil {
 		t.Fatal("expected bad agent error")
+	}
+}
+
+func TestStartSession_RejectsUnknownRunMode(t *testing.T) {
+	m, _ := newTestManager(t)
+	_, err := m.Start(context.Background(), "p1", "codex", "custom")
+	if !errors.Is(err, ErrBadMode) {
+		t.Fatalf("err = %v want ErrBadMode", err)
+	}
+}
+
+func TestStartSession_RejectsUnauthenticatedAgent(t *testing.T) {
+	m, rt := newTestManager(t)
+	m.AuthOK = func(context.Context, string) bool { return false }
+	_, err := m.Start(context.Background(), "p1", "claude", "manual")
+	if !errors.Is(err, ErrAuthRequired) {
+		t.Fatalf("err = %v want ErrAuthRequired", err)
+	}
+	if len(rt.started) != 0 {
+		t.Fatalf("runtime should not start unauthenticated agent: %+v", rt.started)
+	}
+}
+
+func TestAgentCommandArgs_MapRunModesToCliFlags(t *testing.T) {
+	cases := []struct {
+		name    string
+		agent   string
+		mode    string
+		wantArg string
+	}{
+		{"codex manual", "codex", "manual", "--ask-for-approval"},
+		{"codex yolo", "codex", "yolo", "--dangerously-bypass-approvals-and-sandbox"},
+		{"claude manual", "claude", "manual", "--permission-mode"},
+		{"claude yolo", "claude", "yolo", "--dangerously-skip-permissions"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := agentCommandArgs(tc.agent, tc.mode)
+			if !contains(got, tc.wantArg) {
+				t.Fatalf("args = %#v want %q", got, tc.wantArg)
+			}
+		})
+	}
+}
+
+func TestTmuxRuntimeEnvUsesConfiguredHome(t *testing.T) {
+	rt := TmuxRuntime{ExtraPath: "/opt/claver/bin", HomeDir: "/var/lib/claver"}
+	env := rt.envWithPath()
+	if !contains(env, "HOME=/var/lib/claver") {
+		t.Fatalf("env missing configured HOME: %#v", env)
+	}
+	if !contains(env, "CLAUDE_CONFIG_DIR=/var/lib/claver/.claude") {
+		t.Fatalf("env missing configured CLAUDE_CONFIG_DIR: %#v", env)
+	}
+	foundPath := false
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "PATH=/opt/claver/bin:") || kv == "PATH=/opt/claver/bin" {
+			foundPath = true
+			break
+		}
+	}
+	if !foundPath {
+		t.Fatalf("env missing configured PATH prefix: %#v", env)
+	}
+	flags := strings.Join(rt.tmuxEnvFlags(), "\n")
+	if !strings.Contains(flags, "HOME=/var/lib/claver") {
+		t.Fatalf("tmux flags missing HOME: %q", flags)
+	}
+	if !strings.Contains(flags, "CLAUDE_CONFIG_DIR=/var/lib/claver/.claude") {
+		t.Fatalf("tmux flags missing CLAUDE_CONFIG_DIR: %q", flags)
+	}
+	if !strings.Contains(flags, "PATH=/opt/claver/bin") {
+		t.Fatalf("tmux flags missing PATH prefix: %q", flags)
+	}
+}
+
+func TestTmuxRuntimeEnvStripsAmbientAnthropicCredentials(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "bad")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "bad")
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "bad")
+	rt := TmuxRuntime{ExtraPath: "/opt/claver/bin", HomeDir: "/var/lib/claver"}
+	env := strings.Join(rt.envWithPath(), "\n")
+	for _, forbidden := range []string{
+		"ANTHROPIC_API_KEY=bad",
+		"ANTHROPIC_AUTH_TOKEN=bad",
+		"CLAUDE_CODE_OAUTH_TOKEN=bad",
+	} {
+		if strings.Contains(env, forbidden) {
+			t.Fatalf("env leaked %s: %q", forbidden, env)
+		}
 	}
 }

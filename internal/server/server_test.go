@@ -31,6 +31,7 @@ func (fakeSessionRuntime) Start(_ context.Context, spec sessions.RuntimeSpec) er
 func (fakeSessionRuntime) Attach(context.Context, sessions.RuntimeSpec) error { return nil }
 func (fakeSessionRuntime) SendPrompt(context.Context, string, string) error   { return nil }
 func (fakeSessionRuntime) Interrupt(context.Context, string) error            { return nil }
+func (fakeSessionRuntime) Resize(context.Context, string, int, int) error     { return nil }
 func (fakeSessionRuntime) Stop(context.Context, string) error                 { return nil }
 func (fakeSessionRuntime) Capture(context.Context, string) (string, error)    { return "", nil }
 func (fakeSessionRuntime) Alive(context.Context, string) bool                 { return true }
@@ -468,7 +469,7 @@ func TestSession_SubscribeReplaysFromSequenceOverWS(t *testing.T) {
 	}
 	sm := sessions.New(st, pm, fakeSessionRuntime{})
 	sm.IDGen = func() string { return "s1" }
-	if _, err := sm.Start(context.Background(), "p1", "codex"); err != nil {
+	if _, err := sm.Start(context.Background(), "p1", "codex", "manual"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := sm.Publish(store.SessionEvent{SessionID: "s1", Type: "stdout", Data: "after\n"}); err != nil {
@@ -574,7 +575,7 @@ func TestReview_ApproveFlow_OverWS(t *testing.T) {
 	rm := review.New(pm, st, review.HeuristicSummarizer{})
 	sm := sessions.New(st, pm, fakeSessionRuntime{})
 	sm.IDGen = func() string { return "s1" }
-	if _, err := sm.Start(context.Background(), "p1", "codex"); err != nil {
+	if _, err := sm.Start(context.Background(), "p1", "codex", "manual"); err != nil {
 		t.Fatal(err)
 	}
 
