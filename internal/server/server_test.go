@@ -1720,10 +1720,10 @@ func (e fakeErr) Error() string { return "fake: " + e.cause.Error() }
 func (e fakeErr) Unwrap() error { return e.cause }
 
 type fakeSystemdClient struct {
-	units   []systemd.Unit
-	details map[string]systemd.UnitDetail
+	units     []systemd.Unit
+	details   map[string]systemd.UnitDetail
 	available error
-	actions []string
+	actions   []string
 	actionErr error
 }
 
@@ -1811,7 +1811,7 @@ func TestSystemdServiceGet(t *testing.T) {
 		t.Fatalf("kind = %q payload = %s", resp.Kind, resp.Payload)
 	}
 	var out struct {
-		Available bool              `json:"available"`
+		Available bool               `json:"available"`
 		Unit      systemd.UnitDetail `json:"unit"`
 	}
 	if err := json.Unmarshal(resp.Payload, &out); err != nil {
