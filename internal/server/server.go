@@ -102,9 +102,9 @@ func New(cfg Config) *Server {
 		cfg.Now = time.Now
 	}
 	return &Server{
-		cfg:              cfg,
-		startAt:          cfg.Now(),
-		seen:             newIDSet(1024, replayWindow, cfg.Now),
+		cfg:                cfg,
+		startAt:            cfg.Now(),
+		seen:               newIDSet(1024, replayWindow, cfg.Now),
 		dockerLogCancels:   make(map[string]dockerLogCancel),
 		dockerStatsCancels: make(map[string]dockerLogCancel),
 	}
