@@ -2,6 +2,7 @@ package cliauth
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -48,6 +49,114 @@ func TestStatusUnauthenticated(t *testing.T) {
 	}
 	if st.Method != MethodNone {
 		t.Errorf("method = %q want none", st.Method)
+	}
+}
+
+func TestStatusClaudeUsesCLIAuthStatusWithConfiguredHome(t *testing.T) {
+	m := newTestManager(t)
+	if err := os.MkdirAll(m.cfg.BinDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	claudeBin := filepath.Join(m.cfg.BinDir, "claude")
+	marker := filepath.Join(m.cfg.HomeDir, "home-marker")
+	if err := os.WriteFile(claudeBin, []byte(`#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "claude-stub 1.0.0"
+  exit 0
+fi
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  touch "$HOME/home-marker"
+  printf '{"loggedIn":true,"authMethod":"claude.ai","email":"dev@example.com","subscriptionType":"pro"}'
+  exit 0
+fi
+exit 1
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	st, err := m.Status(context.Background(), KindClaude)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.LoggedIn || st.Method != MethodSubscription || st.Account != "dev@example.com" {
+		t.Fatalf("status = %+v", st)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("configured HOME was not used: %v", err)
+	}
+}
+
+func TestTmuxEnvFlagsCarryConfiguredHomeAndPath(t *testing.T) {
+	m := newTestManager(t)
+	flags := strings.Join(m.tmuxEnvFlags(), "\n")
+	if !strings.Contains(flags, "HOME="+m.cfg.HomeDir) {
+		t.Fatalf("flags missing HOME: %q", flags)
+	}
+	if !strings.Contains(flags, "CLAUDE_CONFIG_DIR="+filepath.Join(m.cfg.HomeDir, ".claude")) {
+		t.Fatalf("flags missing CLAUDE_CONFIG_DIR: %q", flags)
+	}
+	if !strings.Contains(flags, "PATH="+m.cfg.BinDir) {
+		t.Fatalf("flags missing BinDir PATH prefix: %q", flags)
+	}
+}
+
+func TestEnvForCaptiveStripsAmbientAnthropicCredentials(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "bad")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "bad")
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "bad")
+	m := newTestManager(t)
+	env := strings.Join(m.envForCaptive(), "\n")
+	for _, forbidden := range []string{
+		"ANTHROPIC_API_KEY=bad",
+		"ANTHROPIC_AUTH_TOKEN=bad",
+		"CLAUDE_CODE_OAUTH_TOKEN=bad",
+	} {
+		if strings.Contains(env, forbidden) {
+			t.Fatalf("env leaked %s: %q", forbidden, env)
+		}
+	}
+	if !strings.Contains(env, "CLAUDE_CONFIG_DIR="+filepath.Join(m.cfg.HomeDir, ".claude")) {
+		t.Fatalf("env missing CLAUDE_CONFIG_DIR: %q", env)
+	}
+}
+
+func TestNewSeedsClaudeOnboarding(t *testing.T) {
+	m := newTestManager(t)
+	path := filepath.Join(m.claudeConfigDir(), ".claude.json")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read seeded config: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(b, &doc); err != nil {
+		t.Fatalf("unmarshal seeded config: %v", err)
+	}
+	if done, _ := doc["hasCompletedOnboarding"].(bool); !done {
+		t.Fatalf("hasCompletedOnboarding not set: %v", doc)
+	}
+}
+
+func TestEnsureClaudeOnboardedPreservesExistingState(t *testing.T) {
+	m := newTestManager(t)
+	path := filepath.Join(m.claudeConfigDir(), ".claude.json")
+	// Simulate Claude having written its own state with onboarding not yet done.
+	seed := []byte(`{"firstStartTime":"2026-01-01T00:00:00Z","migrationVersion":13}`)
+	if err := os.WriteFile(path, seed, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m.ensureClaudeOnboarded()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(b, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if done, _ := doc["hasCompletedOnboarding"].(bool); !done {
+		t.Fatalf("onboarding flag not merged: %v", doc)
+	}
+	if doc["migrationVersion"] == nil || doc["firstStartTime"] == nil {
+		t.Fatalf("existing Claude state was clobbered: %v", doc)
 	}
 }
 
@@ -201,6 +310,7 @@ func TestIsClaudeFirstRunSetup(t *testing.T) {
 		"Let's get started.\nChoose the text style that looks best with your terminal",
 		"Syntax theme: Monokai Extended (ctrl+t to disable)",
 		"WelcometoClaudeCodev2.1.156 Let'sgetstarted",
+		"Select login method:\n1. Claude account with subscription\n2. Anthropic Console account",
 	}
 	for _, tc := range cases {
 		if !isClaudeFirstRunSetup(tc) {

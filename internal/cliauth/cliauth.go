@@ -166,22 +166,68 @@ func New(cfg Config) (*Manager, error) {
 	if cfg.Timeout == 0 {
 		cfg.Timeout = 5 * time.Minute
 	}
-	return &Manager{
+	m := &Manager{
 		cfg:     cfg,
 		running: make(map[string]*Login),
 		byID:    make(map[string]*Login),
-	}, nil
+	}
+	// Pin the Claude config dir into existence and mark onboarding complete so
+	// the captive login and later sessions never replay the first-run "Choose
+	// the text style" / "Select login method" screens. This is best-effort:
+	// a read-only or unwritable home must not stop the agent from booting.
+	m.ensureClaudeOnboarded()
+	return m, nil
+}
+
+// ensureClaudeOnboarded guarantees $CLAUDE_CONFIG_DIR exists and that
+// .claude.json records hasCompletedOnboarding=true. Both the captive
+// `claude auth login` and normal `claude` sessions read this dir (it is the
+// single CLAUDE_CONFIG_DIR every code path now pins), so seeding it once here
+// makes onboarding state persist deterministically instead of relying on
+// scraping and Enter-advancing the TUI on every launch. It merges into any
+// existing file rather than clobbering Claude's own state.
+func (m *Manager) ensureClaudeOnboarded() {
+	dir := m.claudeConfigDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return
+	}
+	path := filepath.Join(dir, ".claude.json")
+	doc := map[string]any{}
+	if b, err := os.ReadFile(path); err == nil {
+		if err := json.Unmarshal(b, &doc); err != nil {
+			// An existing but unparseable file is Claude's to own; do not
+			// risk corrupting it.
+			return
+		}
+		if done, ok := doc["hasCompletedOnboarding"].(bool); ok && done {
+			return
+		}
+	}
+	doc["hasCompletedOnboarding"] = true
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, path)
 }
 
 // credPath returns the on-disk credential path for one kind.
 func (m *Manager) credPath(kind string) string {
 	switch kind {
 	case KindClaude:
-		return filepath.Join(m.cfg.HomeDir, ".claude", ".credentials.json")
+		return filepath.Join(m.claudeConfigDir(), ".credentials.json")
 	case KindCodex:
 		return filepath.Join(m.cfg.HomeDir, ".codex", "auth.json")
 	}
 	return ""
+}
+
+func (m *Manager) claudeConfigDir() string {
+	return filepath.Join(m.cfg.HomeDir, ".claude")
 }
 
 // Status reports whether the named CLI is logged in. It checks the vault
@@ -202,7 +248,13 @@ func (m *Manager) Status(ctx context.Context, kind string) (Status, error) {
 	}
 
 	if !out.LoggedIn {
-		if p := m.credPath(kind); p != "" {
+		if kind == KindClaude {
+			if st, ok := m.claudeStatusFromCLI(ctx); ok {
+				out.LoggedIn = st.LoggedIn
+				out.Method = st.Method
+				out.Account = st.Account
+			}
+		} else if p := m.credPath(kind); p != "" {
 			if _, err := os.Stat(p); err == nil {
 				out.LoggedIn = true
 				out.Method = MethodSubscription
@@ -217,6 +269,44 @@ func (m *Manager) Status(ctx context.Context, kind string) (Status, error) {
 		out.Version = v
 	}
 	return out, nil
+}
+
+func (m *Manager) claudeStatusFromCLI(ctx context.Context) (Status, bool) {
+	out := Status{Kind: KindClaude, Method: MethodNone}
+	bin := m.resolveBin(KindClaude)
+	if bin == "" {
+		return out, false
+	}
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, bin, "auth", "status", "--json")
+	cmd.Env = m.envForCaptive()
+	raw, err := cmd.CombinedOutput()
+	if err != nil {
+		return out, false
+	}
+	var doc struct {
+		LoggedIn         bool   `json:"loggedIn"`
+		AuthMethod       string `json:"authMethod"`
+		Email            string `json:"email"`
+		SubscriptionType string `json:"subscriptionType"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return out, false
+	}
+	if !doc.LoggedIn {
+		return out, true
+	}
+	out.LoggedIn = true
+	out.Method = MethodSubscription
+	if doc.AuthMethod == "apiKey" {
+		out.Method = MethodAPIKey
+	}
+	out.Account = doc.Email
+	if out.Account == "" {
+		out.Account = doc.SubscriptionType
+	}
+	return out, true
 }
 
 func (m *Manager) probeVersion(ctx context.Context, kind string) string {
@@ -558,6 +648,7 @@ func (m *Manager) driveLogin(ctx context.Context, login *Login, bin string) {
 	defer m.cleanupLogin(login)
 
 	args := []string{"new-session", "-d", "-s", login.sessionName, "-c", m.cfg.HomeDir}
+	args = append(args, m.tmuxEnvFlags()...)
 	args = append(args, loginCommandArgs(login.Kind, bin)...)
 	cmd := exec.CommandContext(ctx, "tmux", args...)
 	cmd.Env = m.envForCaptive()
@@ -587,7 +678,7 @@ func (m *Manager) driveLogin(ctx context.Context, login *Login, bin string) {
 	// Reader goroutine for pipe output.
 	urlSeen := false
 	pasteSeen := false
-	claudeSetupAdvanced := false
+	claudeSetupAdvanced := map[string]bool{}
 	githubGitPromptAdvanced := false
 	githubBrowserPromptAdvanced := false
 	githubLoginSucceeded := false
@@ -650,6 +741,12 @@ func (m *Manager) driveLogin(ctx context.Context, login *Login, bin string) {
 						return
 					}
 				}
+				if login.Kind == KindClaude {
+					if st, err := m.Status(ctx, login.Kind); err == nil && st.LoggedIn {
+						m.finishOK(ctx, login)
+						return
+					}
+				}
 				if mtimeNewer(m.credPath(login.Kind), credBaseline) {
 					m.finishOK(ctx, login)
 					return
@@ -669,12 +766,12 @@ func (m *Manager) driveLogin(ctx context.Context, login *Login, bin string) {
 					githubAccount = acct
 				}
 			}
-			if login.Kind == KindClaude && !claudeSetupAdvanced && isClaudeFirstRunSetup(clean) {
-				claudeSetupAdvanced = true
+			if step := claudeFirstRunSetupStep(clean); login.Kind == KindClaude && step != "" && !claudeSetupAdvanced[step] {
+				claudeSetupAdvanced[step] = true
 				if err := sendEnter(ctx, login.sessionName); err != nil {
 					login.emit(Event{Type: EvtProgress, Stream: "system", Line: "Could not advance Claude setup: " + err.Error()})
 				} else {
-					login.emit(Event{Type: EvtProgress, Stream: "system", Line: "Selected the default Claude Code theme to continue sign-in."})
+					login.emit(Event{Type: EvtProgress, Stream: "system", Line: "Advanced Claude setup to continue sign-in."})
 				}
 			}
 			if login.Kind == KindGitHub && !githubGitPromptAdvanced && isGitHubGitCredentialPrompt(clean) {
@@ -728,10 +825,9 @@ func (m *Manager) driveLogin(ctx context.Context, login *Login, bin string) {
 				login.emit(Event{Type: EvtPromptPaste})
 			}
 		case <-poll.C:
-			if login.Kind == KindGitHub {
+			if login.Kind == KindGitHub || login.Kind == KindClaude {
 				if st, err := m.Status(ctx, login.Kind); err == nil && st.LoggedIn {
-					_ = killTmux(login.sessionName)
-					login.emitDone(true, "", st)
+					m.finishOK(ctx, login)
 					return
 				}
 			}
@@ -752,6 +848,12 @@ func (m *Manager) driveLogin(ctx context.Context, login *Login, bin string) {
 					}
 					if st, err := m.Status(ctx, login.Kind); err == nil && st.LoggedIn {
 						login.emitDone(true, "", st)
+						return
+					}
+				}
+				if login.Kind == KindClaude {
+					if st, err := m.Status(ctx, login.Kind); err == nil && st.LoggedIn {
+						m.finishOK(ctx, login)
 						return
 					}
 				}
@@ -781,7 +883,11 @@ func (m *Manager) finishOK(ctx context.Context, login *Login) {
 		_ = m.cfg.Store.DeleteCliToken(login.Kind)
 		_ = killTmux(login.sessionName)
 		st, _ := m.Status(ctx, login.Kind)
-		login.emitDone(true, "", st)
+		if st.LoggedIn {
+			login.emitDone(true, "", st)
+		} else {
+			login.emitDone(false, "claude login completed but auth status is not persisted", st)
+		}
 		return
 	}
 
@@ -850,23 +956,70 @@ func (l *Login) emitDone(ok bool, errMsg string, st Status) {
 	l.emit(Event{Type: EvtDone, OK: ok, Error: errMsg, Status: st})
 }
 
-// envForCaptive returns the env we hand to the captive tmux process so the
-// CLI it spawns can resolve binaries under BinDir.
+// envForCaptive returns the env we hand to captive CLI probes and tmux
+// sessions. HOME is explicit so auth.status, auth.login, and normal sessions
+// all read/write the same Claude/Codex credential files.
 func (m *Manager) envForCaptive() []string {
 	env := os.Environ()
 	cur := os.Getenv("PATH")
-	newPath := m.cfg.BinDir
-	if cur != "" {
+	newPath := cur
+	if m.cfg.BinDir != "" && cur != "" {
 		newPath = m.cfg.BinDir + ":" + cur
+	} else if m.cfg.BinDir != "" {
+		newPath = m.cfg.BinDir
 	}
 	out := make([]string, 0, len(env))
 	for _, kv := range env {
-		if strings.HasPrefix(kv, "PATH=") {
+		if shouldReplaceEnv(kv) {
 			continue
 		}
 		out = append(out, kv)
 	}
-	return append(out, "PATH="+newPath)
+	return append(out,
+		"PATH="+newPath,
+		"HOME="+m.cfg.HomeDir,
+		"CLAUDE_CONFIG_DIR="+m.claudeConfigDir(),
+	)
+}
+
+func (m *Manager) tmuxEnvFlags() []string {
+	flags := []string{}
+	if m.cfg.HomeDir != "" {
+		flags = append(flags, "-e", "HOME="+m.cfg.HomeDir)
+		flags = append(flags, "-e", "CLAUDE_CONFIG_DIR="+m.claudeConfigDir())
+	}
+	if path := pathWithPrefix(m.cfg.BinDir); path != "" {
+		flags = append(flags, "-e", "PATH="+path)
+	}
+	return flags
+}
+
+func shouldReplaceEnv(kv string) bool {
+	for _, prefix := range []string{
+		"PATH=",
+		"HOME=",
+		"CLAUDE_CONFIG_DIR=",
+		"ANTHROPIC_API_KEY=",
+		"ANTHROPIC_AUTH_TOKEN=",
+		"CLAUDE_CODE_OAUTH_TOKEN=",
+	} {
+		if strings.HasPrefix(kv, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func pathWithPrefix(prefix string) string {
+	cur := os.Getenv("PATH")
+	switch {
+	case prefix != "" && cur != "":
+		return prefix + ":" + cur
+	case prefix != "":
+		return prefix
+	default:
+		return cur
+	}
 }
 
 // extractToken pulls a usable token out of a credential file, when possible.
@@ -1042,11 +1195,23 @@ func cleanTerminalLine(s string) string {
 	}, s)
 }
 
-func isClaudeFirstRunSetup(s string) bool {
+func claudeFirstRunSetupStep(s string) string {
 	compact := strings.ToLower(strings.ReplaceAll(s, " ", ""))
-	return strings.Contains(compact, "choosethetextstyle") ||
+	if strings.Contains(compact, "selectloginmethod") ||
+		(strings.Contains(compact, "claudeaccountwithsubscription") &&
+			strings.Contains(compact, "anthropicconsoleaccount")) {
+		return "login_method"
+	}
+	if strings.Contains(compact, "choosethetextstyle") ||
 		strings.Contains(compact, "syntaxtheme:") ||
-		(strings.Contains(compact, "welcometoclaudecode") && strings.Contains(compact, "let'sgetstarted"))
+		(strings.Contains(compact, "welcometoclaudecode") && strings.Contains(compact, "let'sgetstarted")) {
+		return "theme"
+	}
+	return ""
+}
+
+func isClaudeFirstRunSetup(s string) bool {
+	return claudeFirstRunSetupStep(s) != ""
 }
 
 func isGitHubGitCredentialPrompt(s string) bool {
