@@ -566,8 +566,14 @@ const DefaultSocketPath = "/var/run/docker.sock"
 type SocketClient struct {
 	socketPath string
 	httpc      *http.Client
+	actionc    *http.Client
 	streamc    *http.Client
 }
+
+const (
+	dockerActionHTTPTimeout  = 30 * time.Second
+	dockerActionGraceSeconds = 20
+)
 
 // NewSocketClient returns a SocketClient bound to socketPath. If socketPath is
 // empty, DefaultSocketPath is used.
@@ -585,6 +591,7 @@ func NewSocketClient(socketPath string) *SocketClient {
 	return &SocketClient{
 		socketPath: socketPath,
 		httpc:      &http.Client{Transport: tr, Timeout: 5 * time.Second},
+		actionc:    &http.Client{Transport: tr, Timeout: dockerActionHTTPTimeout},
 		streamc:    &http.Client{Transport: tr},
 	}
 }
@@ -876,16 +883,20 @@ func (c *SocketClient) ContainerStatsStream(ctx context.Context, id string, emit
 }
 
 func (c *SocketClient) ContainerAction(ctx context.Context, id string, action ContainerAction) error {
+	path := "/containers/" + url.PathEscape(id) + "/" + string(action)
+	if action == ActionStop || action == ActionRestart {
+		path += fmt.Sprintf("?t=%d", dockerActionGraceSeconds)
+	}
 	req, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodPost,
-		"http://docker/containers/"+url.PathEscape(id)+"/"+string(action),
+		"http://docker"+path,
 		nil,
 	)
 	if err != nil {
 		return err
 	}
-	resp, err := c.httpc.Do(req)
+	resp, err := c.actionc.Do(req)
 	if err != nil {
 		return translateDialError(err)
 	}
@@ -896,7 +907,7 @@ func (c *SocketClient) ContainerAction(ctx context.Context, id string, action Co
 	if resp.StatusCode >= 500 {
 		return fmt.Errorf("%w: docker returned %d", ErrDaemonDown, resp.StatusCode)
 	}
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		msg := strings.TrimSpace(string(body))
 		if msg == "" {

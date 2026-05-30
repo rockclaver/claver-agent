@@ -5,6 +5,11 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -156,6 +161,38 @@ func TestContainerAction_AllowsOnlyLifecycleVerbs(t *testing.T) {
 	}
 	if len(calls) != 5 {
 		t.Fatalf("unsupported action mutated Docker: %+v", calls)
+	}
+}
+
+func TestSocketClientContainerAction_UsesActionDeadlineAndStrictStatus(t *testing.T) {
+	// Review #3327946019: stop/restart need longer than the generic 5s Docker
+	// client because Docker's default stop grace period is 10s.
+	var gotPath, gotQuery string
+	socket := startUnixDockerServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotQuery = r.URL.RawQuery
+		w.WriteHeader(http.StatusNoContent)
+	})
+	c := NewSocketClient(socket)
+	if c.actionc.Timeout <= 10*time.Second {
+		t.Fatalf("action timeout = %s, must exceed Docker's default 10s stop grace", c.actionc.Timeout)
+	}
+	if err := c.ContainerAction(context.Background(), "abc", ActionRestart); err != nil {
+		t.Fatalf("ContainerAction restart: %v", err)
+	}
+	if gotPath != "/containers/abc/restart" || gotQuery != "t=20" {
+		t.Fatalf("restart request path/query = %q ?%q", gotPath, gotQuery)
+	}
+
+	// Review #3327946020: Docker uses 304 for no-op lifecycle requests; that
+	// must not be audited or shown as a successful mutation.
+	socket = startUnixDockerServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotModified)
+	})
+	c = NewSocketClient(socket)
+	err := c.ContainerAction(context.Background(), "abc", ActionStart)
+	if err == nil || !strings.Contains(err.Error(), "304") {
+		t.Fatalf("304 response err = %v", err)
 	}
 }
 
@@ -671,6 +708,28 @@ func TestDropNoneTagsStripsPlaceholders(t *testing.T) {
 	if dropNoneTags([]string{"<none>:<none>"}) != nil {
 		t.Fatal("placeholder-only slice must collapse to nil")
 	}
+}
+
+func startUnixDockerServer(t *testing.T, handler http.HandlerFunc) string {
+	t.Helper()
+	socketPath := fmt.Sprintf("/tmp/claver-docker-%d.sock", time.Now().UnixNano())
+	_ = os.Remove(socketPath)
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("listen unix socket: %v", err)
+	}
+	srv := &http.Server{Handler: handler}
+	done := make(chan struct{})
+	go func() {
+		_ = srv.Serve(ln)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		_ = srv.Close()
+		<-done
+		_ = os.Remove(socketPath)
+	})
+	return socketPath
 }
 
 // wrap returns an error chain whose root is sentinel, so errors.Is works.
