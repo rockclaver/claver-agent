@@ -64,6 +64,7 @@ type Client interface {
 	ContainerLogStream(ctx context.Context, id string, since time.Time, emit func(LogEntry)) error
 	ContainerStats(ctx context.Context, id string) (StatsSample, error)
 	ContainerStatsStream(ctx context.Context, id string, emit func(StatsSample)) error
+	ContainerAction(ctx context.Context, id string, action ContainerAction) error
 }
 
 // Status is the typed daemon status returned by Manager.Status.
@@ -90,6 +91,24 @@ type Config struct {
 type Manager struct {
 	client      Client
 	projectRoot string
+}
+
+type ContainerAction string
+
+const (
+	ActionStart   ContainerAction = "start"
+	ActionStop    ContainerAction = "stop"
+	ActionRestart ContainerAction = "restart"
+	ActionPause   ContainerAction = "pause"
+	ActionUnpause ContainerAction = "unpause"
+)
+
+var allowedContainerActions = map[ContainerAction]struct{}{
+	ActionStart:   {},
+	ActionStop:    {},
+	ActionRestart: {},
+	ActionPause:   {},
+	ActionUnpause: {},
 }
 
 // New constructs a Manager backed by client. client must be non-nil.
@@ -200,6 +219,16 @@ func (m *Manager) Container(ctx context.Context, id string) (ContainerDetail, er
 	}
 	m.enrichDetail(&d)
 	return d, nil
+}
+
+func (m *Manager) ContainerAction(ctx context.Context, id string, action ContainerAction) error {
+	if strings.TrimSpace(id) == "" {
+		return errors.New("docker: container id required")
+	}
+	if _, ok := allowedContainerActions[action]; !ok {
+		return fmt.Errorf("docker: unsupported container action %q", action)
+	}
+	return m.client.ContainerAction(ctx, id, action)
 }
 
 func (m *Manager) enrichSummary(c *ContainerSummary) {
@@ -844,6 +873,38 @@ func (c *SocketClient) ContainerStatsStream(ctx context.Context, id string, emit
 		}
 		emit(sample)
 	}
+}
+
+func (c *SocketClient) ContainerAction(ctx context.Context, id string, action ContainerAction) error {
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		"http://docker/containers/"+url.PathEscape(id)+"/"+string(action),
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+	resp, err := c.httpc.Do(req)
+	if err != nil {
+		return translateDialError(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("%w: docker returned %d", ErrPermissionDenied, resp.StatusCode)
+	}
+	if resp.StatusCode >= 500 {
+		return fmt.Errorf("%w: docker returned %d", ErrDaemonDown, resp.StatusCode)
+	}
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		msg := strings.TrimSpace(string(body))
+		if msg == "" {
+			msg = fmt.Sprintf("docker returned %d", resp.StatusCode)
+		}
+		return fmt.Errorf("docker: %s", msg)
+	}
+	return nil
 }
 
 // Images calls GET /images/json and maps it into the agent's stable summary.

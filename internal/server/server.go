@@ -313,6 +313,7 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *sync.
 	case "docker.status",
 		"docker.container.list",
 		"docker.container.get",
+		"docker.container.action",
 		"docker.container.logs",
 		"docker.container.logs_subscribe",
 		"docker.container.logs_unsubscribe",
@@ -1225,6 +1226,44 @@ func toDockerDTO(st docker.Status) DockerStatusDTO {
 	}
 }
 
+func isAllowedDockerContainerAction(action docker.ContainerAction) bool {
+	switch action {
+	case docker.ActionStart, docker.ActionStop, docker.ActionRestart, docker.ActionPause, docker.ActionUnpause:
+		return true
+	default:
+		return false
+	}
+}
+
+func dockerLifecycleTokenBinding(id string, action docker.ContainerAction) (string, string, []string) {
+	return "docker.container.action." + string(action), "docker", []string{id}
+}
+
+func (s *Server) auditDockerLifecycle(id, action string, ok bool, summary string) store.AuditEntry {
+	if s.cfg.Review == nil {
+		return store.AuditEntry{}
+	}
+	status := "failed"
+	if ok {
+		status = "succeeded"
+	}
+	body, _ := json.Marshal(map[string]any{
+		"container_id": id,
+		"action":       action,
+		"ok":           ok,
+		"summary":      summary,
+	})
+	entry, _ := s.cfg.Review.LogAudit(store.AuditEntry{
+		Type:      "docker.container.action",
+		ProjectID: "docker",
+		Actor:     "mobile",
+		Summary:   fmt.Sprintf("docker %s %s for %s: %s", action, status, id, summary),
+		Data:      string(body),
+		CreatedAt: s.cfg.Now(),
+	})
+	return entry
+}
+
 func (s *Server) dispatchDocker(ctx context.Context, c *websocket.Conn, writeMu *sync.Mutex, f Frame) {
 	if s.cfg.Docker == nil {
 		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "docker subsystem not configured")
@@ -1255,6 +1294,43 @@ func (s *Server) dispatchDocker(ctx context.Context, c *websocket.Conn, writeMu 
 			return
 		}
 		s.writeOK(ctx, c, writeMu, f.ID, "docker.container.get", map[string]any{"container": container})
+	case "docker.container.action":
+		var in struct {
+			ID                string `json:"id"`
+			Action            string `json:"action"`
+			ConfirmationToken string `json:"confirmation_token"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" || in.Action == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id and action required")
+			return
+		}
+		action := docker.ContainerAction(in.Action)
+		if !isAllowedDockerContainerAction(action) {
+			s.auditDockerLifecycle(in.ID, in.Action, false, "unsupported action")
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "unsupported docker container action")
+			return
+		}
+		if s.cfg.Review == nil {
+			s.writeError(ctx, c, writeMu, f.ID, "unavailable", "confirmation subsystem not configured")
+			return
+		}
+		tokenAction, projectID, files := dockerLifecycleTokenBinding(in.ID, action)
+		if err := s.cfg.Review.ConsumeToken(in.ConfirmationToken, tokenAction, projectID, files, ""); err != nil {
+			s.auditDockerLifecycle(in.ID, in.Action, false, err.Error())
+			s.writeReviewErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		if err := s.cfg.Docker.ContainerAction(ctx, in.ID, action); err != nil {
+			s.auditDockerLifecycle(in.ID, in.Action, false, err.Error())
+			s.writeError(ctx, c, writeMu, f.ID, "docker_error", err.Error())
+			return
+		}
+		audit := s.auditDockerLifecycle(in.ID, in.Action, true, "ok")
+		s.writeOK(ctx, c, writeMu, f.ID, "docker.container.action", map[string]any{
+			"id":       in.ID,
+			"action":   in.Action,
+			"audit_id": audit.ID,
+		})
 	case "docker.container.logs":
 		var in struct {
 			ID   string `json:"id"`

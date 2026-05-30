@@ -908,6 +908,134 @@ func TestDockerContainerGet(t *testing.T) {
 	}
 }
 
+func TestDockerContainerAction_RequiresBoundConfirmationTokenAndAudits(t *testing.T) {
+	// AC issue #25: lifecycle requests require a valid single-use token bound
+	// to the exact action and container, and failed attempts are audited
+	// without mutating Docker.
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	rm := review.New(nil, st, review.HeuristicSummarizer{})
+	calls := []string{}
+	mgr, err := docker.New(docker.Config{Client: fakeDockerClient{actionCalls: &calls}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	payload, _ := json.Marshal(map[string]any{"id": "abc", "action": "start"})
+	resp := dockerRoundTripConfig(t, Config{Addr: "127.0.0.1:0", Docker: mgr, Review: rm}, "docker.container.action", payload)
+	if resp.Kind != "error.token_invalid" {
+		t.Fatalf("missing token response kind = %q", resp.Kind)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("missing token mutated Docker: %+v", calls)
+	}
+
+	wrongAction, projectID, files := dockerLifecycleTokenBinding("abc", docker.ActionStop)
+	wrong, err := rm.MintConfirmationToken(wrongAction, projectID, files, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ = json.Marshal(map[string]any{"id": "abc", "action": "start", "confirmation_token": wrong.Token})
+	resp = dockerRoundTripConfig(t, Config{Addr: "127.0.0.1:0", Docker: mgr, Review: rm}, "docker.container.action", payload)
+	if resp.Kind != "error.token_mismatch" {
+		t.Fatalf("mismatched token response kind = %q", resp.Kind)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("mismatched token mutated Docker: %+v", calls)
+	}
+
+	action, projectID, files := dockerLifecycleTokenBinding("abc", docker.ActionStart)
+	tok, err := rm.MintConfirmationToken(action, projectID, files, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ = json.Marshal(map[string]any{"id": "abc", "action": "start", "confirmation_token": tok.Token})
+	resp = dockerRoundTripConfig(t, Config{Addr: "127.0.0.1:0", Docker: mgr, Review: rm}, "docker.container.action", payload)
+	if resp.Kind != "docker.container.action" {
+		t.Fatalf("valid token response kind = %q", resp.Kind)
+	}
+	if len(calls) != 1 || calls[0] != "abc:start" {
+		t.Fatalf("valid token did not mutate once: %+v", calls)
+	}
+
+	entries, err := rm.ListAudit("docker.container.action", "docker", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("audit entries = %d want 3: %+v", len(entries), entries)
+	}
+	if !strings.Contains(entries[0].Summary, "succeeded") ||
+		!strings.Contains(entries[1].Summary, "does not match") ||
+		!strings.Contains(entries[2].Summary, "invalid") {
+		t.Fatalf("audit entries missing outcome metadata: %+v", entries)
+	}
+
+	resp = dockerRoundTripConfig(t, Config{Addr: "127.0.0.1:0", Docker: mgr, Review: rm}, "docker.container.action", payload)
+	if resp.Kind != "error.token_used" {
+		t.Fatalf("reused token response kind = %q", resp.Kind)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("reused token mutated Docker: %+v", calls)
+	}
+}
+
+func TestDockerContainerAction_RejectsUnsupportedActionAndAuditsDockerFailure(t *testing.T) {
+	// AC issue #25: unsupported actions are rejected, Docker failures surface
+	// clearly, and each failed lifecycle attempt is audited.
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	rm := review.New(nil, st, review.HeuristicSummarizer{})
+	calls := []string{}
+	mgr, err := docker.New(docker.Config{Client: fakeDockerClient{
+		actionCalls: &calls,
+		actionErr:   errors.New("daemon refused stop"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	payload, _ := json.Marshal(map[string]any{"id": "abc", "action": "delete", "confirmation_token": "tok"})
+	resp := dockerRoundTripConfig(t, Config{Addr: "127.0.0.1:0", Docker: mgr, Review: rm}, "docker.container.action", payload)
+	if resp.Kind != "error.bad_payload" {
+		t.Fatalf("unsupported action response kind = %q", resp.Kind)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("unsupported action mutated Docker: %+v", calls)
+	}
+
+	action, projectID, files := dockerLifecycleTokenBinding("abc", docker.ActionStop)
+	tok, err := rm.MintConfirmationToken(action, projectID, files, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ = json.Marshal(map[string]any{"id": "abc", "action": "stop", "confirmation_token": tok.Token})
+	resp = dockerRoundTripConfig(t, Config{Addr: "127.0.0.1:0", Docker: mgr, Review: rm}, "docker.container.action", payload)
+	if resp.Kind != "error.docker_error" {
+		t.Fatalf("docker failure response kind = %q", resp.Kind)
+	}
+	if len(calls) != 1 || calls[0] != "abc:stop" {
+		t.Fatalf("docker failure should attempt exactly once: %+v", calls)
+	}
+	entries, err := rm.ListAudit("docker.container.action", "docker", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 ||
+		!strings.Contains(entries[0].Summary, "daemon refused stop") ||
+		!strings.Contains(entries[1].Summary, "unsupported action") {
+		t.Fatalf("failure audits missing metadata: %+v", entries)
+	}
+}
+
 // AC: docker.image.list is exposed over the WebSocket with safe metadata.
 func TestDockerImageList(t *testing.T) {
 	mgr, err := docker.New(docker.Config{Client: fakeDockerClient{images: []docker.ImageSummary{
@@ -1323,7 +1451,12 @@ func TestDockerContainerStatsUnsubscribeCancelsStream(t *testing.T) {
 
 func dockerRoundTrip(t *testing.T, mgr *docker.Manager, kind string, payload []byte) Frame {
 	t.Helper()
-	wsURL, stop := startTestServerWith(t, Config{Addr: "127.0.0.1:0", Docker: mgr})
+	return dockerRoundTripConfig(t, Config{Addr: "127.0.0.1:0", Docker: mgr}, kind, payload)
+}
+
+func dockerRoundTripConfig(t *testing.T, cfg Config, kind string, payload []byte) Frame {
+	t.Helper()
+	wsURL, stop := startTestServerWith(t, cfg)
 	t.Cleanup(stop)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	t.Cleanup(cancel)
@@ -1369,6 +1502,9 @@ type fakeDockerClient struct {
 	statsBlockStream bool
 	statsStarted     chan struct{}
 	statsCancelled   chan struct{}
+
+	actionCalls *[]string
+	actionErr   error
 }
 
 func (f fakeDockerClient) Version(context.Context) (docker.VersionInfo, error) {
@@ -1443,6 +1579,16 @@ func (f fakeDockerClient) ContainerStatsStream(ctx context.Context, id string, e
 		emit(s)
 	}
 	return f.statsStreamErr
+}
+
+func (f fakeDockerClient) ContainerAction(_ context.Context, id string, action docker.ContainerAction) error {
+	if f.actionCalls != nil {
+		*f.actionCalls = append(*f.actionCalls, id+":"+string(action))
+	}
+	if f.actionErr != nil {
+		return f.actionErr
+	}
+	return f.err
 }
 
 type fakeErr struct{ cause error }

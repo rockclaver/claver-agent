@@ -35,6 +35,9 @@ type fakeClient struct {
 	statsStreamBlock bool
 	statsStarted     chan struct{}
 	statsCancelled   chan struct{}
+
+	actionCalls *[]string
+	actionErr   error
 }
 
 func (f fakeClient) Version(ctx context.Context) (VersionInfo, error) {
@@ -101,6 +104,16 @@ func (f fakeClient) ContainerStatsStream(ctx context.Context, id string, emit fu
 	return f.statsStreamErr
 }
 
+func (f fakeClient) ContainerAction(_ context.Context, id string, action ContainerAction) error {
+	if f.actionCalls != nil {
+		*f.actionCalls = append(*f.actionCalls, id+":"+string(action))
+	}
+	if f.actionErr != nil {
+		return f.actionErr
+	}
+	return f.err
+}
+
 func newManager(t *testing.T, c Client) *Manager {
 	t.Helper()
 	m, err := New(Config{Client: c})
@@ -122,6 +135,27 @@ func TestStatusReachable(t *testing.T) {
 	}
 	if st.UnavailableReason != "" {
 		t.Errorf("reachable status must not carry an unavailable reason, got %q", st.UnavailableReason)
+	}
+}
+
+func TestContainerAction_AllowsOnlyLifecycleVerbs(t *testing.T) {
+	// AC issue #25: docker.container.action accepts only start, stop, restart,
+	// pause, and unpause.
+	calls := []string{}
+	m := newManager(t, fakeClient{actionCalls: &calls})
+	for _, action := range []ContainerAction{ActionStart, ActionStop, ActionRestart, ActionPause, ActionUnpause} {
+		if err := m.ContainerAction(context.Background(), "abc", action); err != nil {
+			t.Fatalf("ContainerAction(%s): %v", action, err)
+		}
+	}
+	if len(calls) != 5 {
+		t.Fatalf("allowed actions not forwarded: %+v", calls)
+	}
+	if err := m.ContainerAction(context.Background(), "abc", ContainerAction("delete")); err == nil {
+		t.Fatal("unsupported action was accepted")
+	}
+	if len(calls) != 5 {
+		t.Fatalf("unsupported action mutated Docker: %+v", calls)
 	}
 }
 
