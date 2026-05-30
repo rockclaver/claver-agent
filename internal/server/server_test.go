@@ -14,6 +14,7 @@ import (
 
 	"nhooyr.io/websocket"
 
+	"github.com/rockclaver/claver/agent/internal/alerts"
 	"github.com/rockclaver/claver/agent/internal/cliauth"
 	"github.com/rockclaver/claver/agent/internal/docker"
 	"github.com/rockclaver/claver/agent/internal/firewall"
@@ -1749,6 +1750,73 @@ func (f *fakeSystemdClient) Action(_ context.Context, name string, action system
 func systemdRoundTrip(t *testing.T, cfg Config, kind string, payload []byte) Frame {
 	t.Helper()
 	return dockerRoundTripConfig(t, cfg, kind, payload)
+}
+
+func TestAlertsConfigRPCUsesSnakeCaseRules(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	infraMgr, err := infra.New(infra.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	alertMgr, err := alerts.New(alerts.Config{Store: st, Metrics: infraMgr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := systemdRoundTrip(t, Config{Addr: "127.0.0.1:0", Alerts: alertMgr}, "infra.alerts.config", nil)
+	if resp.Kind != "infra.alerts.config" {
+		t.Fatalf("kind = %q payload = %s", resp.Kind, resp.Payload)
+	}
+	var out struct {
+		Rules []store.InfraAlertRule `json:"rules"`
+	}
+	if err := json.Unmarshal(resp.Payload, &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Rules) != 3 || out.Rules[0].Kind != alerts.RuleDiskUsage || !out.Rules[0].Enabled {
+		t.Fatalf("rules mismatch: %+v", out.Rules)
+	}
+	if !strings.Contains(string(resp.Payload), `"server_id"`) || !strings.Contains(string(resp.Payload), `"updated_at"`) {
+		t.Fatalf("expected snake_case alert rule payload, got %s", resp.Payload)
+	}
+}
+
+func TestAlertsConfigSetRPCPersistsRule(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	infraMgr, err := infra.New(infra.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	alertMgr, err := alerts.New(alerts.Config{Store: st, Metrics: infraMgr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"server_id": "local",
+		"kind":      alerts.RuleDiskUsage,
+		"enabled":   false,
+		"threshold": 85,
+	})
+	resp := systemdRoundTrip(t, Config{Addr: "127.0.0.1:0", Alerts: alertMgr}, "infra.alerts.config_set", payload)
+	if resp.Kind != "infra.alerts.config_set" {
+		t.Fatalf("kind = %q payload = %s", resp.Kind, resp.Payload)
+	}
+	rules, err := st.ListInfraAlertRules(alerts.ServerLocal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range rules {
+		if r.Kind == alerts.RuleDiskUsage && (r.Enabled || r.Threshold != 85) {
+			t.Fatalf("persisted rule mismatch: %+v", r)
+		}
+	}
 }
 
 // AC issue #42: infra.service.list returns units; degrades on non-systemd hosts.

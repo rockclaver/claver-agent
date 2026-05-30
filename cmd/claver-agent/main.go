@@ -9,11 +9,13 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"github.com/rockclaver/claver/agent/internal/alerts"
 	"github.com/rockclaver/claver/agent/internal/cliauth"
 	"github.com/rockclaver/claver/agent/internal/docker"
 	"github.com/rockclaver/claver/agent/internal/firewall"
 	gh "github.com/rockclaver/claver/agent/internal/github"
 	"github.com/rockclaver/claver/agent/internal/infra"
+	"github.com/rockclaver/claver/agent/internal/notifications"
 	"github.com/rockclaver/claver/agent/internal/previews"
 	agentprocess "github.com/rockclaver/claver/agent/internal/process"
 	"github.com/rockclaver/claver/agent/internal/projects"
@@ -125,21 +127,33 @@ func main() {
 	if err != nil {
 		log.Fatalf("claver-agent: init firewall: %v", err)
 	}
+	notificationHub := notifications.NewHub()
+	alertMgr, err := alerts.New(alerts.Config{
+		Store:   st,
+		Metrics: infraMgr,
+		Systemd: systemdMgr,
+		Sink:    notificationHub,
+	})
+	if err != nil {
+		log.Fatalf("claver-agent: init alerts: %v", err)
+	}
 
 	srv := server.New(server.Config{
-		Addr:      *addr,
-		Projects:  mgr,
-		Sessions:  sessionMgr,
-		Review:    reviewMgr,
-		GitHub:    githubMgr,
-		Previews:  previewMgr,
-		Tooling:   toolingMgr,
-		Auth:      authMgr,
-		Docker:    dockerMgr,
-		Infra:     infraMgr,
-		Systemd:   systemdMgr,
-		Processes: processMgr,
-		Firewall:  firewallMgr,
+		Addr:          *addr,
+		Projects:      mgr,
+		Sessions:      sessionMgr,
+		Review:        reviewMgr,
+		GitHub:        githubMgr,
+		Previews:      previewMgr,
+		Tooling:       toolingMgr,
+		Auth:          authMgr,
+		Docker:        dockerMgr,
+		Infra:         infraMgr,
+		Systemd:       systemdMgr,
+		Processes:     processMgr,
+		Firewall:      firewallMgr,
+		Alerts:        alertMgr,
+		Notifications: notificationHub,
 	})
 	ln, err := srv.Listen()
 	if err != nil {
@@ -153,6 +167,7 @@ func main() {
 		log.Printf("claver-agent: rehydrate sessions: %v", err)
 	}
 	sessionMgr.StartReaper(ctx, 0)
+	alertMgr.Start(ctx)
 	if err := srv.Serve(ctx, ln); err != nil {
 		log.Fatalf("claver-agent serve: %v", err)
 	}

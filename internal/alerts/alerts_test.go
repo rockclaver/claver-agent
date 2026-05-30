@@ -1,0 +1,234 @@
+package alerts
+
+import (
+	"context"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/rockclaver/claver/agent/internal/infra"
+	"github.com/rockclaver/claver/agent/internal/notifications"
+	"github.com/rockclaver/claver/agent/internal/store"
+	"github.com/rockclaver/claver/agent/internal/systemd"
+)
+
+type fakeMetrics struct {
+	samples []infra.HostMetrics
+	i       int
+}
+
+func (f *fakeMetrics) Sample(context.Context) infra.HostMetrics {
+	if f.i >= len(f.samples) {
+		return f.samples[len(f.samples)-1]
+	}
+	s := f.samples[f.i]
+	f.i++
+	return s
+}
+
+type fakeUnits struct {
+	units [][]systemd.Unit
+	i     int
+}
+
+func (f *fakeUnits) Status(context.Context) systemd.Status {
+	return systemd.Status{Available: true}
+}
+
+func (f *fakeUnits) List(context.Context) ([]systemd.Unit, error) {
+	if len(f.units) == 0 {
+		return nil, nil
+	}
+	if f.i >= len(f.units) {
+		return f.units[len(f.units)-1], nil
+	}
+	u := f.units[f.i]
+	f.i++
+	return u, nil
+}
+
+type captureSink struct {
+	got []notifications.Notification
+}
+
+func (s *captureSink) Publish(_ context.Context, n notifications.Notification) error {
+	s.got = append(s.got, n)
+	return nil
+}
+
+func newTestManager(t *testing.T, samples []infra.HostMetrics, units [][]systemd.Unit) (*Manager, *captureSink, *store.Store) {
+	t.Helper()
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &captureSink{}
+	m, err := New(Config{
+		Store:               st,
+		Metrics:             &fakeMetrics{samples: samples},
+		Systemd:             &fakeUnits{units: units},
+		Sink:                sink,
+		Now:                 func() time.Time { return time.Unix(1700000000, 0) },
+		LoadConsecutiveHits: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m, sink, st
+}
+
+func sample(disk, load float64) infra.HostMetrics {
+	return infra.HostMetrics{
+		Timestamp: time.Unix(1700000000, 0),
+		Load: infra.LoadMetric{
+			MetricReason: infra.MetricReason{Available: true},
+			One:          load,
+		},
+		Disks: []infra.DiskMetric{{
+			Mountpoint: "/",
+			Available:  true,
+			Percent:    disk,
+		}},
+	}
+}
+
+func TestAlertEngine_DefaultRulesEnabledAndPersistedConfig(t *testing.T) {
+	m, _, st := newTestManager(t, []infra.HostMetrics{sample(1, 1)}, nil)
+	defer st.Close()
+
+	rules, err := m.Config(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rules) != 3 {
+		t.Fatalf("default rule count=%d", len(rules))
+	}
+	for _, r := range rules {
+		if !r.Enabled {
+			t.Fatalf("default %s disabled", r.Kind)
+		}
+	}
+	if _, err := m.SetConfig(context.Background(), store.InfraAlertRule{
+		ServerID:  ServerLocal,
+		Kind:      RuleDiskUsage,
+		Enabled:   false,
+		Threshold: 80,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAlertEngine_ConfigPersistsAcrossRestart(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "state.db")
+	st, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := New(Config{Store: st, Metrics: &fakeMetrics{samples: []infra.HostMetrics{sample(1, 1)}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.SetConfig(context.Background(), store.InfraAlertRule{
+		ServerID:  ServerLocal,
+		Kind:      RuleLoadSustained,
+		Enabled:   false,
+		Threshold: 2.5,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_ = st.Close()
+	st2, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close()
+	got, err := st2.ListInfraAlertRules(ServerLocal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range got {
+		if r.Kind == RuleLoadSustained && (r.Enabled || r.Threshold != 2.5) {
+			t.Fatalf("persisted rule mismatch: %+v", r)
+		}
+	}
+}
+
+func TestAlertEngine_DiskThresholdDedupeHysteresisAndClear(t *testing.T) {
+	m, sink, st := newTestManager(t, []infra.HostMetrics{
+		sample(91, 1),
+		sample(92, 1),
+		sample(88, 1),
+		sample(84, 1),
+	}, nil)
+	defer st.Close()
+
+	for range 4 {
+		m.Evaluate(context.Background())
+	}
+	if len(sink.got) != 2 {
+		t.Fatalf("notifications=%d want fire+clear: %+v", len(sink.got), sink.got)
+	}
+	if sink.got[0].Severity != "warning" || sink.got[1].Severity != "resolved" {
+		t.Fatalf("unexpected severities: %+v", sink.got)
+	}
+}
+
+func TestAlertEngine_LoadRequiresSustainedSamplesAndClear(t *testing.T) {
+	m, sink, st := newTestManager(t, []infra.HostMetrics{
+		sample(1, 4.2),
+		sample(1, 4.3),
+		sample(1, 4.4),
+		sample(1, 3.2),
+	}, nil)
+	defer st.Close()
+
+	for range 4 {
+		m.Evaluate(context.Background())
+	}
+	if len(sink.got) != 2 {
+		t.Fatalf("notifications=%d want sustained fire+clear", len(sink.got))
+	}
+	if sink.got[0].Data["rule"] != RuleLoadSustained {
+		t.Fatalf("wrong rule: %+v", sink.got[0])
+	}
+}
+
+func TestAlertEngine_UnitFailedFiresOnceAndClears(t *testing.T) {
+	m, sink, st := newTestManager(
+		t,
+		[]infra.HostMetrics{sample(1, 1), sample(1, 1), sample(1, 1)},
+		[][]systemd.Unit{
+			{{Name: "api.service", ActiveState: "failed", SubState: "failed"}},
+			{{Name: "api.service", ActiveState: "failed", SubState: "failed"}},
+			{{Name: "api.service", ActiveState: "active", SubState: "running"}},
+		},
+	)
+	defer st.Close()
+
+	for range 3 {
+		m.Evaluate(context.Background())
+	}
+	if len(sink.got) != 2 {
+		t.Fatalf("notifications=%d want unit fire+clear", len(sink.got))
+	}
+	if sink.got[0].Data["target"] != "api.service" || sink.got[1].Severity != "resolved" {
+		t.Fatalf("unexpected unit notifications: %+v", sink.got)
+	}
+}
+
+func TestAlertEngine_DisabledRuleSuppressesNotification(t *testing.T) {
+	m, sink, st := newTestManager(t, []infra.HostMetrics{sample(95, 1)}, nil)
+	defer st.Close()
+	if _, err := m.SetConfig(context.Background(), store.InfraAlertRule{
+		ServerID:  ServerLocal,
+		Kind:      RuleDiskUsage,
+		Enabled:   false,
+		Threshold: 90,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m.Evaluate(context.Background())
+	if len(sink.got) != 0 {
+		t.Fatalf("disabled rule emitted: %+v", sink.got)
+	}
+}

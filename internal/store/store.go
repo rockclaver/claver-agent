@@ -104,6 +104,16 @@ type AgentSetting struct {
 	Value string
 }
 
+// InfraAlertRule stores one per-server alert rule override. Missing rows are
+// materialized from defaults by ListInfraAlertRules.
+type InfraAlertRule struct {
+	ServerID  string    `json:"server_id"`
+	Kind      string    `json:"kind"`
+	Enabled   bool      `json:"enabled"`
+	Threshold float64   `json:"threshold"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 // GitHubToken stores the encrypted OAuth access token material for one agent.
 // CiphertextPath points at the on-disk encrypted blob; token plaintext never
 // lives in SQLite.
@@ -249,6 +259,15 @@ CREATE TABLE IF NOT EXISTS agent_settings (
 	value TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS infra_alert_rules (
+	server_id  TEXT NOT NULL,
+	kind       TEXT NOT NULL,
+	enabled    INTEGER NOT NULL,
+	threshold  REAL NOT NULL,
+	updated_at INTEGER NOT NULL,
+	PRIMARY KEY(server_id, kind)
+);
+
 CREATE TABLE IF NOT EXISTS cli_tokens (
 	kind            TEXT PRIMARY KEY,
 	method          TEXT NOT NULL,
@@ -258,6 +277,83 @@ CREATE TABLE IF NOT EXISTS cli_tokens (
 	updated_at      INTEGER NOT NULL
 );
 `)
+	return err
+}
+
+// DefaultInfraAlertRule returns the shipped enabled defaults for one rule.
+func DefaultInfraAlertRule(serverID, kind string) InfraAlertRule {
+	r := InfraAlertRule{ServerID: serverID, Kind: kind, Enabled: true}
+	switch kind {
+	case "disk_usage":
+		r.Threshold = 90
+	case "load_sustained":
+		r.Threshold = 4
+	case "unit_failed":
+		r.Threshold = 0
+	}
+	return r
+}
+
+// ListInfraAlertRules returns defaults overlaid by persisted per-server rows.
+func (s *Store) ListInfraAlertRules(serverID string) ([]InfraAlertRule, error) {
+	if serverID == "" {
+		serverID = "local"
+	}
+	rules := []InfraAlertRule{
+		DefaultInfraAlertRule(serverID, "disk_usage"),
+		DefaultInfraAlertRule(serverID, "load_sustained"),
+		DefaultInfraAlertRule(serverID, "unit_failed"),
+	}
+	byKind := map[string]int{}
+	for i, r := range rules {
+		byKind[r.Kind] = i
+	}
+	rows, err := s.db.Query(
+		`SELECT kind, enabled, threshold, updated_at FROM infra_alert_rules WHERE server_id = ?`,
+		serverID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var r InfraAlertRule
+		var enabled int
+		var updated int64
+		r.ServerID = serverID
+		if err := rows.Scan(&r.Kind, &enabled, &r.Threshold, &updated); err != nil {
+			return nil, err
+		}
+		r.Enabled = enabled != 0
+		r.UpdatedAt = time.Unix(updated, 0)
+		if i, ok := byKind[r.Kind]; ok {
+			rules[i] = r
+		}
+	}
+	return rules, rows.Err()
+}
+
+// PutInfraAlertRule upserts a per-server alert rule.
+func (s *Store) PutInfraAlertRule(r InfraAlertRule) error {
+	if r.ServerID == "" {
+		r.ServerID = "local"
+	}
+	if r.UpdatedAt.IsZero() {
+		r.UpdatedAt = time.Now()
+	}
+	enabled := 0
+	if r.Enabled {
+		enabled = 1
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO infra_alert_rules (server_id, kind, enabled, threshold, updated_at)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(server_id, kind) DO UPDATE SET
+		   enabled = excluded.enabled,
+		   threshold = excluded.threshold,
+		   updated_at = excluded.updated_at`,
+		r.ServerID, r.Kind, enabled, r.Threshold, r.UpdatedAt.Unix(),
+	)
 	return err
 }
 

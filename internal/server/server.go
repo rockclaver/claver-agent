@@ -17,11 +17,13 @@ import (
 
 	"nhooyr.io/websocket"
 
+	"github.com/rockclaver/claver/agent/internal/alerts"
 	"github.com/rockclaver/claver/agent/internal/cliauth"
 	"github.com/rockclaver/claver/agent/internal/docker"
 	"github.com/rockclaver/claver/agent/internal/firewall"
 	gh "github.com/rockclaver/claver/agent/internal/github"
 	"github.com/rockclaver/claver/agent/internal/infra"
+	"github.com/rockclaver/claver/agent/internal/notifications"
 	"github.com/rockclaver/claver/agent/internal/previews"
 	agentprocess "github.com/rockclaver/claver/agent/internal/process"
 	"github.com/rockclaver/claver/agent/internal/projects"
@@ -77,6 +79,10 @@ type Config struct {
 	Processes *agentprocess.Manager
 	// Firewall, when non-nil, enables infra.firewall.* kinds.
 	Firewall *firewall.Manager
+	// Alerts, when non-nil, enables infra.alerts.* kinds.
+	Alerts *alerts.Manager
+	// Notifications fans background task.notification events to connected clients.
+	Notifications *notifications.Hub
 }
 
 // Server is the agent's control-plane server.
@@ -193,6 +199,13 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	writeMu := newConnWriter(cancel)
+	var unsubscribeNotifications func()
+	if s.cfg.Notifications != nil {
+		unsubscribeNotifications = s.cfg.Notifications.Subscribe(func(n notifications.Notification) {
+			s.writeOK(ctx, c, writeMu, "", "task.notification", n)
+		})
+		defer unsubscribeNotifications()
+	}
 	go s.writerLoop(ctx, c, writeMu)
 	// Request-id dedupe spans reconnects (the cache lives on Server, not this
 	// connection). When the mobile transport replays a frame after a tunnel
@@ -418,6 +431,9 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 		"infra.firewall.rule_add",
 		"infra.firewall.rule_remove":
 		s.dispatchFirewall(ctx, c, writeMu, f)
+	case "infra.alerts.config",
+		"infra.alerts.config_set":
+		s.dispatchAlerts(ctx, c, writeMu, f)
 	case "github.repo_list",
 		"github.repo_import",
 		"github.commit",
@@ -2146,6 +2162,54 @@ func (s *Server) dispatchFirewall(ctx context.Context, c *websocket.Conn, writeM
 			"rule":     rule,
 			"audit_id": audit.ID,
 		})
+	}
+}
+
+func (s *Server) dispatchAlerts(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
+	if s.cfg.Alerts == nil {
+		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "alerts subsystem not configured")
+		return
+	}
+	switch f.Kind {
+	case "infra.alerts.config":
+		var in struct {
+			ServerID string `json:"server_id"`
+		}
+		if len(f.Payload) > 0 {
+			if err := json.Unmarshal(f.Payload, &in); err != nil {
+				s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "invalid alerts config payload")
+				return
+			}
+		}
+		rules, err := s.cfg.Alerts.Config(ctx, in.ServerID)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "alerts_error", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "infra.alerts.config", map[string]any{"rules": rules})
+	case "infra.alerts.config_set":
+		var in struct {
+			ServerID  string  `json:"server_id"`
+			Kind      string  `json:"kind"`
+			Enabled   bool    `json:"enabled"`
+			Threshold float64 `json:"threshold"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Kind == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "kind required")
+			return
+		}
+		rule, err := s.cfg.Alerts.SetConfig(ctx, store.InfraAlertRule{
+			ServerID:  in.ServerID,
+			Kind:      in.Kind,
+			Enabled:   in.Enabled,
+			Threshold: in.Threshold,
+			UpdatedAt: s.cfg.Now(),
+		})
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "alerts_error", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "infra.alerts.config_set", map[string]any{"rule": rule})
 	}
 }
 
