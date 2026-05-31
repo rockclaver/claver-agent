@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/rockclaver/claver/agent/internal/notifications"
+	"github.com/rockclaver/claver/agent/internal/store"
 )
 
 func staticSource(items ...Item) Source {
@@ -102,6 +103,103 @@ func TestList_LimitClampedAndEmptyItemsNeverNil(t *testing.T) {
 	}
 	if len(res.Items) != 0 {
 		t.Fatalf("expected 0 items")
+	}
+}
+
+type fakeStateStore struct {
+	states map[string]store.InboxState
+}
+
+func (f *fakeStateStore) InboxStates(ids []string) (map[string]store.InboxState, error) {
+	out := map[string]store.InboxState{}
+	for _, id := range ids {
+		if st, ok := f.states[id]; ok {
+			out[id] = st
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeStateStore) MarkInboxRead(ids []string, now time.Time) error {
+	for _, id := range ids {
+		st := f.states[id]
+		st.ItemID = id
+		if st.ReadAt == nil {
+			t := now
+			st.ReadAt = &t
+		}
+		f.states[id] = st
+	}
+	return nil
+}
+
+func (f *fakeStateStore) ResolveInbox(id, action string, now time.Time) error {
+	st := f.states[id]
+	st.ItemID = id
+	t := now
+	if st.ReadAt == nil {
+		st.ReadAt = &t
+	}
+	st.ResolvedAt = &t
+	st.ResolvedAction = action
+	f.states[id] = st
+	return nil
+}
+
+func TestList_AnnotatesReadExcludesResolvedAndCountsUnread(t *testing.T) {
+	base := time.Unix(1_700_000_000, 0)
+	read := base
+	resolved := base
+	fake := &fakeStateStore{states: map[string]store.InboxState{
+		"b": {ItemID: "b", ReadAt: &read},                            // read, unresolved
+		"c": {ItemID: "c", ReadAt: &resolved, ResolvedAt: &resolved}, // resolved -> hidden
+	}}
+	m := New()
+	m.SetStateStore(fake)
+	m.AddSource(staticSource(
+		mkItem("a", base.Add(3*time.Second)), // unread
+		mkItem("b", base.Add(2*time.Second)), // read
+		mkItem("c", base.Add(1*time.Second)), // resolved (excluded)
+	))
+
+	res, err := m.List(context.Background(), "", 0)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(res.Items) != 2 {
+		t.Fatalf("expected 2 items (resolved hidden), got %d", len(res.Items))
+	}
+	for _, it := range res.Items {
+		if it.ID == "c" {
+			t.Fatalf("resolved item c should be hidden")
+		}
+		if it.ID == "a" && it.Read {
+			t.Fatalf("item a should be unread")
+		}
+		if it.ID == "b" && !it.Read {
+			t.Fatalf("item b should be read")
+		}
+	}
+	if res.UnreadCount != 1 {
+		t.Fatalf("UnreadCount=%d want 1 (only 'a')", res.UnreadCount)
+	}
+}
+
+func TestManager_MarkReadAndResolveDelegate(t *testing.T) {
+	fake := &fakeStateStore{states: map[string]store.InboxState{}}
+	m := New()
+	m.SetStateStore(fake)
+	if err := m.MarkRead([]string{"x"}); err != nil {
+		t.Fatalf("MarkRead: %v", err)
+	}
+	if fake.states["x"].ReadAt == nil {
+		t.Fatalf("x should be read")
+	}
+	if err := m.Resolve("y", "approve"); err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if fake.states["y"].ResolvedAt == nil || fake.states["y"].ResolvedAction != "approve" {
+		t.Fatalf("y should be resolved with action approve: %+v", fake.states["y"])
 	}
 }
 

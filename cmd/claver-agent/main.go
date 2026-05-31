@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/rockclaver/claver/agent/internal/aiproposal"
 	"github.com/rockclaver/claver/agent/internal/alerts"
@@ -221,6 +222,7 @@ func main() {
 	}
 
 	inboxMgr := inbox.New()
+	inboxMgr.SetStateStore(st)
 	inboxMgr.AddSource(&inbox.ProposalSource{Mgr: aiProposalMgr})
 	inboxMgr.AddSource(&inbox.AlertSource{Mgr: alertMgr})
 	inboxMgr.AddSource(&inbox.SessionSource{Store: st})
@@ -299,6 +301,23 @@ func main() {
 	}
 
 	githubSource.Start(ctx)
+	// Reap resolved inbox-state rows so the table can't grow without bound as
+	// item ids churn. Resolved entries older than 30 days are well past any
+	// chance of their source item reappearing.
+	go func() {
+		t := time.NewTicker(12 * time.Hour)
+		defer t.Stop()
+		for {
+			if _, err := st.GCInboxState(time.Now().Add(-30 * 24 * time.Hour)); err != nil {
+				log.Printf("claver-agent: inbox-state GC: %v", err)
+			}
+			select {
+			case <-t.C:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 	if err := srv.Serve(ctx, ln); err != nil {
 		log.Fatalf("claver-agent serve: %v", err)
 	}

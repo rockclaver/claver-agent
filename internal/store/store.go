@@ -121,6 +121,18 @@ type InfraAlertRule struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// InboxState is the persisted read/resolved state for one inbox item. Item IDs
+// are the stable "<type>:<id>" identifiers minted by the inbox sources. Rows
+// exist only once an item has been read or resolved; absence means "unread,
+// unresolved". State is per-agent, so every device hitting this host shares it.
+type InboxState struct {
+	ItemID         string
+	ReadAt         *time.Time
+	ResolvedAt     *time.Time
+	ResolvedAction string
+	UpdatedAt      time.Time
+}
+
 // GitHubToken stores the encrypted OAuth access token material for one agent.
 // CiphertextPath points at the on-disk encrypted blob; token plaintext never
 // lives in SQLite.
@@ -416,6 +428,30 @@ CREATE TABLE IF NOT EXISTS infra_cost (
 );
 
 CREATE INDEX IF NOT EXISTS infra_cost_month_idx ON infra_cost(month);
+
+CREATE TABLE IF NOT EXISTS inbox_state (
+	item_id         TEXT PRIMARY KEY,
+	read_at         INTEGER,
+	resolved_at     INTEGER,
+	resolved_action TEXT NOT NULL DEFAULT '',
+	updated_at      INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS inbox_state_resolved_idx ON inbox_state(resolved_at);
+
+CREATE TABLE IF NOT EXISTS alert_silences (
+	key        TEXT PRIMARY KEY,
+	rule       TEXT NOT NULL,
+	target     TEXT NOT NULL,
+	until      INTEGER NOT NULL,
+	created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS alert_acks (
+	key        TEXT PRIMARY KEY,
+	fired_at   INTEGER NOT NULL,
+	created_at INTEGER NOT NULL
+);
 `)
 	if err != nil {
 		return err
@@ -526,6 +562,187 @@ func (s *Store) PutInfraAlertRule(r InfraAlertRule) error {
 		r.ServerID, r.Kind, enabled, r.Threshold, r.UpdatedAt.Unix(),
 	)
 	return err
+}
+
+// InboxStates returns persisted state for the given item ids. Ids without a row
+// are simply absent from the result (caller treats them as unread/unresolved).
+func (s *Store) InboxStates(ids []string) (map[string]InboxState, error) {
+	out := make(map[string]InboxState, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	rows, err := s.db.Query(
+		`SELECT item_id, read_at, resolved_at, resolved_action, updated_at
+		 FROM inbox_state WHERE item_id IN (`+placeholders+`)`,
+		args...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var st InboxState
+		var readAt, resolvedAt sql.NullInt64
+		var updated int64
+		if err := rows.Scan(&st.ItemID, &readAt, &resolvedAt, &st.ResolvedAction, &updated); err != nil {
+			return nil, err
+		}
+		if readAt.Valid {
+			t := time.Unix(readAt.Int64, 0)
+			st.ReadAt = &t
+		}
+		if resolvedAt.Valid {
+			t := time.Unix(resolvedAt.Int64, 0)
+			st.ResolvedAt = &t
+		}
+		st.UpdatedAt = time.Unix(updated, 0)
+		out[st.ItemID] = st
+	}
+	return out, rows.Err()
+}
+
+// MarkInboxRead stamps read_at=now for each id that is not already read. It
+// never clears resolved state and is safe to call repeatedly.
+func (s *Store) MarkInboxRead(ids []string, now time.Time) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, id := range ids {
+		if _, err := tx.Exec(
+			`INSERT INTO inbox_state (item_id, read_at, updated_at)
+			 VALUES (?, ?, ?)
+			 ON CONFLICT(item_id) DO UPDATE SET
+			   read_at = COALESCE(inbox_state.read_at, excluded.read_at),
+			   updated_at = excluded.updated_at`,
+			id, now.Unix(), now.Unix(),
+		); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// ResolveInbox marks an item resolved (and implicitly read) with the action the
+// operator took ("approve", "silence", "ack", ...). Re-resolving overwrites the
+// action and timestamp.
+func (s *Store) ResolveInbox(id, action string, now time.Time) error {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO inbox_state (item_id, read_at, resolved_at, resolved_action, updated_at)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(item_id) DO UPDATE SET
+		   read_at = COALESCE(inbox_state.read_at, excluded.read_at),
+		   resolved_at = excluded.resolved_at,
+		   resolved_action = excluded.resolved_action,
+		   updated_at = excluded.updated_at`,
+		id, now.Unix(), now.Unix(), action, now.Unix(),
+	)
+	return err
+}
+
+// GCInboxState deletes resolved rows whose updated_at predates cutoff so the
+// table cannot grow without bound as item ids churn.
+func (s *Store) GCInboxState(cutoff time.Time) (int64, error) {
+	res, err := s.db.Exec(
+		`DELETE FROM inbox_state WHERE resolved_at IS NOT NULL AND updated_at < ?`,
+		cutoff.Unix(),
+	)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// PutAlertSilence upserts a silence window for an alert key ("rule:target").
+// While now < until, the alerts manager suppresses notifications and hides the
+// alert from the inbox feed.
+func (s *Store) PutAlertSilence(key, rule, target string, until time.Time) error {
+	_, err := s.db.Exec(
+		`INSERT INTO alert_silences (key, rule, target, until, created_at)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(key) DO UPDATE SET
+		   rule = excluded.rule,
+		   target = excluded.target,
+		   until = excluded.until`,
+		key, rule, target, until.Unix(), time.Now().Unix(),
+	)
+	return err
+}
+
+// DeleteAlertSilence removes any silence for key (un-silence).
+func (s *Store) DeleteAlertSilence(key string) error {
+	_, err := s.db.Exec(`DELETE FROM alert_silences WHERE key = ?`, key)
+	return err
+}
+
+// AlertSilencesActive returns key -> silenced-until for silences still in
+// effect at now. Expired rows are deleted opportunistically.
+func (s *Store) AlertSilencesActive(now time.Time) (map[string]time.Time, error) {
+	_, _ = s.db.Exec(`DELETE FROM alert_silences WHERE until <= ?`, now.Unix())
+	rows, err := s.db.Query(`SELECT key, until FROM alert_silences WHERE until > ?`, now.Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]time.Time{}
+	for rows.Next() {
+		var key string
+		var until int64
+		if err := rows.Scan(&key, &until); err != nil {
+			return nil, err
+		}
+		out[key] = time.Unix(until, 0)
+	}
+	return out, rows.Err()
+}
+
+// PutAlertAck records that the operator acknowledged the firing episode of an
+// alert key that started at firedAt. Acks are episode-scoped: a later re-fire
+// (different firedAt) is not covered by this ack.
+func (s *Store) PutAlertAck(key string, firedAt time.Time) error {
+	_, err := s.db.Exec(
+		`INSERT INTO alert_acks (key, fired_at, created_at)
+		 VALUES (?, ?, ?)
+		 ON CONFLICT(key) DO UPDATE SET
+		   fired_at = excluded.fired_at,
+		   created_at = excluded.created_at`,
+		key, firedAt.Unix(), time.Now().Unix(),
+	)
+	return err
+}
+
+// AlertAcks returns key -> acknowledged firing time for all recorded acks.
+func (s *Store) AlertAcks() (map[string]time.Time, error) {
+	rows, err := s.db.Query(`SELECT key, fired_at FROM alert_acks`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]time.Time{}
+	for rows.Next() {
+		var key string
+		var firedAt int64
+		if err := rows.Scan(&key, &firedAt); err != nil {
+			return nil, err
+		}
+		out[key] = time.Unix(firedAt, 0)
+	}
+	return out, rows.Err()
 }
 
 // CreateProject inserts a new project row. The ID must be unique.

@@ -121,12 +121,14 @@ func alertToItem(a alerts.ActiveAlert) Item {
 		sev = "warning"
 	}
 	return Item{
-		ID:        "alert:" + a.Key,
-		Type:      TypeAlertFired,
-		Title:     "Alert: " + a.RuleKind,
-		Body:      body,
-		Severity:  sev,
-		CreatedAt: a.FiredAt,
+		ID:         "alert:" + a.Key,
+		Type:       TypeAlertFired,
+		Title:      "Alert: " + a.RuleKind,
+		Body:       body,
+		Severity:   sev,
+		CreatedAt:  a.FiredAt,
+		Actionable: true,
+		ActionKind: "infra.alerts.ack",
 		Data: map[string]any{
 			"rule":   a.RuleKind,
 			"target": a.Target,
@@ -219,12 +221,14 @@ func BridgeAlertNotifications(hub *notifications.Hub, mgr *Manager) func() {
 		}
 		stableKey := rule + ":" + key
 		mgr.Publish(Item{
-			ID:        "alert:" + stableKey,
-			Type:      TypeAlertFired,
-			Title:     n.Title,
-			Body:      n.Body,
-			Severity:  n.Severity,
-			CreatedAt: n.CreatedAt,
+			ID:         "alert:" + stableKey,
+			Type:       TypeAlertFired,
+			Title:      n.Title,
+			Body:       n.Body,
+			Severity:   n.Severity,
+			CreatedAt:  n.CreatedAt,
+			Actionable: true,
+			ActionKind: "infra.alerts.ack",
 			Data: map[string]any{
 				"rule":   rule,
 				"target": key,

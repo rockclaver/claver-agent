@@ -81,8 +81,15 @@ type ActiveAlert struct {
 	FiredAt  time.Time
 }
 
-// ActiveAlerts returns a snapshot of all alerts currently in the fired state.
+// ActiveAlerts returns a snapshot of all alerts currently in the fired state,
+// excluding any that are silenced or whose current firing episode has been
+// acknowledged. The inbox feed is built from this, so ack/silence both stop an
+// alert from counting toward the unread badge.
 func (m *Manager) ActiveAlerts() []ActiveAlert {
+	now := m.now()
+	silenced, _ := m.store.AlertSilencesActive(now)
+	acks, _ := m.store.AlertAcks()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	out := make([]ActiveAlert, 0, len(m.active))
@@ -90,12 +97,46 @@ func (m *Manager) ActiveAlerts() []ActiveAlert {
 		if !st.active {
 			continue
 		}
+		if _, ok := silenced[key]; ok {
+			continue
+		}
+		if firedAt, ok := acks[key]; ok && firedAt.Unix() == st.firedAt.Unix() {
+			continue // this firing episode was acknowledged
+		}
 		out = append(out, ActiveAlert{
 			Key: key, RuleKind: st.ruleKind, Target: st.target,
 			Body: st.body, Severity: st.severity, FiredAt: st.firedAt,
 		})
 	}
 	return out
+}
+
+// Silence suppresses notifications and inbox surfacing for rule+target until
+// now+d. A non-positive duration is treated as a no-op clear (use Unsilence).
+// Returns the absolute expiry time.
+func (m *Manager) Silence(rule, target string, d time.Duration) (time.Time, error) {
+	if d <= 0 {
+		return time.Time{}, m.Unsilence(rule, target)
+	}
+	until := m.now().Add(d)
+	key := rule + ":" + target
+	if err := m.store.PutAlertSilence(key, rule, target, until); err != nil {
+		return time.Time{}, err
+	}
+	return until, nil
+}
+
+// Unsilence removes any active silence for rule+target.
+func (m *Manager) Unsilence(rule, target string) error {
+	return m.store.DeleteAlertSilence(rule + ":" + target)
+}
+
+// Ack acknowledges the current firing episode of an alert key. The alert stays
+// active (it can re-fire after recovery) but is hidden from the feed until the
+// next distinct firing. firedAt must match the episode the operator saw; pass
+// the FiredAt from the inbox item.
+func (m *Manager) Ack(key string, firedAt time.Time) error {
+	return m.store.PutAlertAck(key, firedAt)
 }
 
 func New(cfg Config) (*Manager, error) {
@@ -304,6 +345,14 @@ func (m *Manager) publish(ctx context.Context, rule store.InfraAlertRule, target
 	if m.sink == nil {
 		return
 	}
+	// While silenced, suppress both the firing push and its clear so a
+	// silenced alert never reaches the device. The inbox feed already hides
+	// silenced keys via ActiveAlerts.
+	if silenced, _ := m.store.AlertSilencesActive(m.now()); silenced != nil {
+		if _, ok := silenced[rule.Kind+":"+target]; ok {
+			return
+		}
+	}
 	severity := "warning"
 	title := "Infrastructure alert"
 	if clear {
@@ -317,6 +366,17 @@ func (m *Manager) publish(ctx context.Context, rule store.InfraAlertRule, target
 		"threshold":  rule.Threshold,
 		"clear":      clear,
 		"updated_at": rule.UpdatedAt.Unix(),
+		// category drives the OS notification action buttons the app renders
+		// (acknowledge / silence / open); deep_link routes a tap into the
+		// matching inbox item. Recovery ("clear") notifications carry neither
+		// since there is nothing to act on.
+		"category":  "alert",
+		"key":       rule.Kind + ":" + target,
+		"deep_link": "alert/" + rule.Kind + ":" + target,
+	}
+	if clear {
+		delete(data, "category")
+		delete(data, "deep_link")
 	}
 	if value != nil {
 		data["value"] = *value

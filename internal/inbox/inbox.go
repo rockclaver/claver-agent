@@ -16,6 +16,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/rockclaver/claver/agent/internal/store"
 )
 
 // Type enumerates the source types of inbox items.
@@ -45,6 +47,19 @@ type Item struct {
 	Actionable bool           `json:"actionable"`
 	ActionKind string         `json:"action_kind,omitempty"`
 	Data       map[string]any `json:"data,omitempty"`
+	// Read/Resolved are populated by List from the agent's persisted inbox
+	// state; they are not set by sources. Resolved items are excluded from the
+	// feed by default, so Resolved is effectively always false in List output.
+	Read     bool `json:"read"`
+	Resolved bool `json:"resolved"`
+}
+
+// StateStore persists per-item read/resolved state so every device hitting this
+// agent sees the same inbox state. Satisfied by *store.Store.
+type StateStore interface {
+	InboxStates(ids []string) (map[string]store.InboxState, error)
+	MarkInboxRead(ids []string, now time.Time) error
+	ResolveInbox(id, action string, now time.Time) error
 }
 
 // Source produces the current set of items for one signal kind. Sources are
@@ -66,11 +81,44 @@ type Manager struct {
 	sources []Source
 	subs    map[int64]chan Item
 	nextSub int64
+	state   StateStore
 }
 
 // New constructs an empty Manager. Register sources with AddSource.
 func New() *Manager {
 	return &Manager{subs: make(map[int64]chan Item)}
+}
+
+// SetStateStore wires the persistence used for read/resolved tracking. When
+// nil (e.g. in tests), List returns every item as unread and never filters
+// resolved items.
+func (m *Manager) SetStateStore(s StateStore) {
+	m.mu.Lock()
+	m.state = s
+	m.mu.Unlock()
+}
+
+// MarkRead stamps the given item ids as read. No-op when no state store is set.
+func (m *Manager) MarkRead(ids []string) error {
+	m.mu.Lock()
+	st := m.state
+	m.mu.Unlock()
+	if st == nil {
+		return nil
+	}
+	return st.MarkInboxRead(ids, time.Now())
+}
+
+// Resolve marks one item resolved with the operator action that resolved it.
+// No-op when no state store is set.
+func (m *Manager) Resolve(id, action string) error {
+	m.mu.Lock()
+	st := m.state
+	m.mu.Unlock()
+	if st == nil {
+		return nil
+	}
+	return st.ResolveInbox(id, action, time.Now())
 }
 
 // AddSource registers s. Safe to call before serving.
@@ -150,10 +198,13 @@ func decodeCursor(s string) (cursor, error) {
 	return c, nil
 }
 
-// ListResult is the wire shape returned by List.
+// ListResult is the wire shape returned by List. UnreadCount is the number of
+// unread, unresolved items across the whole feed (not just the returned page),
+// so the client can render a badge without paging through everything.
 type ListResult struct {
-	Items      []Item `json:"items"`
-	NextCursor string `json:"next_cursor,omitempty"`
+	Items       []Item `json:"items"`
+	NextCursor  string `json:"next_cursor,omitempty"`
+	UnreadCount int    `json:"unread_count"`
 }
 
 // List collects items from every source, sorts them newest-first with stable
@@ -173,6 +224,7 @@ func (m *Manager) List(ctx context.Context, after string, limit int) (ListResult
 
 	m.mu.Lock()
 	srcs := append([]Source(nil), m.sources...)
+	state := m.state
 	m.mu.Unlock()
 
 	merged := make([]Item, 0, 64)
@@ -194,6 +246,36 @@ func (m *Manager) List(ctx context.Context, after string, limit int) (ListResult
 		}
 	}
 
+	// Annotate with persisted read/resolved state, drop resolved items, and
+	// count unread across the whole (non-resolved) feed for the badge.
+	unread := 0
+	if state != nil && len(merged) > 0 {
+		ids := make([]string, len(merged))
+		for i, it := range merged {
+			ids[i] = it.ID
+		}
+		if states, err := state.InboxStates(ids); err == nil {
+			kept := merged[:0]
+			for _, it := range merged {
+				if st, ok := states[it.ID]; ok {
+					if st.ResolvedAt != nil {
+						continue // resolved items are hidden from the feed
+					}
+					it.Read = st.ReadAt != nil
+				}
+				if !it.Read {
+					unread++
+				}
+				kept = append(kept, it)
+			}
+			merged = kept
+		} else {
+			unread = len(merged)
+		}
+	} else {
+		unread = len(merged)
+	}
+
 	sort.SliceStable(merged, func(i, j int) bool {
 		ai, aj := merged[i].CreatedAt.UnixMilli(), merged[j].CreatedAt.UnixMilli()
 		if ai != aj {
@@ -213,7 +295,7 @@ func (m *Manager) List(ctx context.Context, after string, limit int) (ListResult
 		merged = merged[idx:]
 	}
 
-	out := ListResult{}
+	out := ListResult{UnreadCount: unread}
 	if len(merged) > limit {
 		page := merged[:limit]
 		last := page[len(page)-1]

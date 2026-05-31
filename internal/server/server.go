@@ -458,7 +458,10 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 		"infra.firewall.rule_remove":
 		s.dispatchFirewall(ctx, c, writeMu, f)
 	case "infra.alerts.config",
-		"infra.alerts.config_set":
+		"infra.alerts.config_set",
+		"infra.alerts.silence",
+		"infra.alerts.unsilence",
+		"infra.alerts.ack":
 		s.dispatchAlerts(ctx, c, writeMu, f)
 	case "infra.snapshot":
 		s.dispatchInfraSnapshot(ctx, c, writeMu, f)
@@ -477,7 +480,7 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 		"github.pr_list",
 		"github.revoke":
 		s.dispatchGitHub(ctx, c, writeMu, f)
-	case "inbox.list", "inbox.stream":
+	case "inbox.list", "inbox.stream", "inbox.mark_read", "inbox.resolve":
 		s.dispatchInbox(ctx, c, writeMu, f)
 	case "infra.runbook.list",
 		"infra.runbook.get":
@@ -2268,6 +2271,56 @@ func (s *Server) dispatchAlerts(ctx context.Context, c *websocket.Conn, writeMu 
 			return
 		}
 		s.writeOK(ctx, c, writeMu, f.ID, "infra.alerts.config_set", map[string]any{"rule": rule})
+	case "infra.alerts.silence":
+		var in struct {
+			Rule       string `json:"rule"`
+			Target     string `json:"target"`
+			DurationMS int64  `json:"duration_ms"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Rule == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "rule required")
+			return
+		}
+		until, err := s.cfg.Alerts.Silence(in.Rule, in.Target, time.Duration(in.DurationMS)*time.Millisecond)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "alerts_error", err.Error())
+			return
+		}
+		out := map[string]any{"silenced": true}
+		if !until.IsZero() {
+			out["until"] = until.Unix()
+		} else {
+			out["silenced"] = false
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "infra.alerts.silence", out)
+	case "infra.alerts.unsilence":
+		var in struct {
+			Rule   string `json:"rule"`
+			Target string `json:"target"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Rule == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "rule required")
+			return
+		}
+		if err := s.cfg.Alerts.Unsilence(in.Rule, in.Target); err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "alerts_error", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "infra.alerts.unsilence", map[string]any{"silenced": false})
+	case "infra.alerts.ack":
+		var in struct {
+			Key     string `json:"key"`
+			FiredAt int64  `json:"fired_at"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Key == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "key required")
+			return
+		}
+		if err := s.cfg.Alerts.Ack(in.Key, time.Unix(in.FiredAt, 0)); err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "alerts_error", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "infra.alerts.ack", map[string]any{"acked": true})
 	}
 }
 
@@ -3417,6 +3470,39 @@ func (s *Server) dispatchInbox(ctx context.Context, c *websocket.Conn, writeMu *
 			return
 		}
 		s.writeOK(ctx, c, writeMu, f.ID, "inbox.list", res)
+	case "inbox.mark_read":
+		var in struct {
+			IDs []string `json:"ids"`
+		}
+		if len(f.Payload) > 0 {
+			if err := json.Unmarshal(f.Payload, &in); err != nil {
+				s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
+				return
+			}
+		}
+		if err := mgr.MarkRead(in.IDs); err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "inbox.mark_read", map[string]any{"ok": true})
+	case "inbox.resolve":
+		var in struct {
+			ID     string `json:"id"`
+			Action string `json:"action"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
+			return
+		}
+		if in.ID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id is required")
+			return
+		}
+		if err := mgr.Resolve(in.ID, in.Action); err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "inbox.resolve", map[string]any{"ok": true})
 	case "inbox.stream":
 		ch, cleanup := mgr.Subscribe(ctx)
 		s.writeOK(ctx, c, writeMu, f.ID, "inbox.stream", map[string]any{"subscribed": true})
