@@ -2,6 +2,7 @@ package alerts
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"testing"
 	"time"
@@ -193,6 +194,22 @@ func TestAlertEngine_LoadRequiresSustainedSamplesAndClear(t *testing.T) {
 	}
 }
 
+func TestAlertEngine_LoadSamplesMustBeConsecutiveBeforeEntry(t *testing.T) {
+	m, sink, st := newTestManager(t, []infra.HostMetrics{
+		sample(1, 4.2),
+		sample(1, 3.9),
+		sample(1, 4.2),
+	}, nil)
+	defer st.Close()
+
+	for range 3 {
+		m.Evaluate(context.Background())
+	}
+	if len(sink.got) != 0 {
+		t.Fatalf("non-consecutive load samples emitted: %+v", sink.got)
+	}
+}
+
 func TestAlertEngine_UnitFailedFiresOnceAndClears(t *testing.T) {
 	m, sink, st := newTestManager(
 		t,
@@ -213,6 +230,15 @@ func TestAlertEngine_UnitFailedFiresOnceAndClears(t *testing.T) {
 	}
 	if sink.got[0].Data["target"] != "api.service" || sink.got[1].Severity != "resolved" {
 		t.Fatalf("unexpected unit notifications: %+v", sink.got)
+	}
+	if _, ok := sink.got[0].Data["value"]; ok {
+		t.Fatalf("unit alert should omit numeric value: %+v", sink.got[0].Data)
+	}
+	if _, err := json.Marshal(sink.got[0]); err != nil {
+		t.Fatalf("unit alert must be JSON-safe: %v", err)
+	}
+	if _, err := json.Marshal(sink.got[1]); err != nil {
+		t.Fatalf("unit clear must be JSON-safe: %v", err)
 	}
 }
 

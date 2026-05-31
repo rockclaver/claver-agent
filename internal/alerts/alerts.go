@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"strings"
 	"sync"
 	"time"
@@ -170,11 +169,11 @@ func (m *Manager) evalDisk(ctx context.Context, rule store.InfraAlertRule, sampl
 		}
 		key := RuleDiskUsage + ":" + d.Mountpoint
 		if d.Percent >= rule.Threshold {
-			m.enter(ctx, key, rule, d.Mountpoint, d.Percent, fmt.Sprintf("Disk %s usage %.1f%%", d.Mountpoint, d.Percent))
+			m.enter(ctx, key, rule, d.Mountpoint, floatPtr(d.Percent), fmt.Sprintf("Disk %s usage %.1f%%", d.Mountpoint, d.Percent))
 			continue
 		}
 		if d.Percent <= rule.Threshold-m.diskHysteresis {
-			m.clear(ctx, key, rule, d.Mountpoint, d.Percent, fmt.Sprintf("Disk %s recovered to %.1f%%", d.Mountpoint, d.Percent))
+			m.clear(ctx, key, rule, d.Mountpoint, floatPtr(d.Percent), fmt.Sprintf("Disk %s recovered to %.1f%%", d.Mountpoint, d.Percent))
 		}
 	}
 }
@@ -190,13 +189,18 @@ func (m *Manager) evalLoad(ctx context.Context, rule store.InfraAlertRule, sampl
 		st.hits++
 		m.setState(key, st)
 		if st.hits >= m.loadConsecutiveHits {
-			m.enter(ctx, key, rule, "host", sample.Load.One, fmt.Sprintf("Sustained load %.2f", sample.Load.One))
+			m.enter(ctx, key, rule, "host", floatPtr(sample.Load.One), fmt.Sprintf("Sustained load %.2f", sample.Load.One))
 		}
 		return
 	}
-	if sample.Load.One <= rule.Threshold-m.loadHysteresis {
-		m.clear(ctx, key, rule, "host", sample.Load.One, fmt.Sprintf("Load recovered to %.2f", sample.Load.One))
+	if st.active && sample.Load.One <= rule.Threshold-m.loadHysteresis {
+		m.clear(ctx, key, rule, "host", floatPtr(sample.Load.One), fmt.Sprintf("Load recovered to %.2f", sample.Load.One))
 		m.setState(key, alertState{})
+		return
+	}
+	if !st.active && st.hits != 0 {
+		st.hits = 0
+		m.setState(key, st)
 	}
 }
 
@@ -220,7 +224,7 @@ func (m *Manager) evalUnits(ctx context.Context, rule store.InfraAlertRule) {
 	for _, u := range units {
 		if strings.EqualFold(u.ActiveState, "failed") || strings.EqualFold(u.SubState, "failed") {
 			failed[u.Name] = true
-			m.enter(ctx, RuleUnitFailed+":"+u.Name, rule, u.Name, math.NaN(), fmt.Sprintf("%s entered failed state", u.Name))
+			m.enter(ctx, RuleUnitFailed+":"+u.Name, rule, u.Name, nil, fmt.Sprintf("%s entered failed state", u.Name))
 		}
 	}
 	m.mu.Lock()
@@ -233,11 +237,11 @@ func (m *Manager) evalUnits(ctx context.Context, rule store.InfraAlertRule) {
 	m.mu.Unlock()
 	for _, key := range keys {
 		unit := strings.TrimPrefix(key, RuleUnitFailed+":")
-		m.clear(ctx, key, rule, unit, math.NaN(), fmt.Sprintf("%s recovered", unit))
+		m.clear(ctx, key, rule, unit, nil, fmt.Sprintf("%s recovered", unit))
 	}
 }
 
-func (m *Manager) enter(ctx context.Context, key string, rule store.InfraAlertRule, target string, value float64, body string) {
+func (m *Manager) enter(ctx context.Context, key string, rule store.InfraAlertRule, target string, value *float64, body string) {
 	st := m.state(key)
 	if st.active {
 		return
@@ -247,7 +251,7 @@ func (m *Manager) enter(ctx context.Context, key string, rule store.InfraAlertRu
 	m.publish(ctx, rule, target, value, false, body)
 }
 
-func (m *Manager) clear(ctx context.Context, key string, rule store.InfraAlertRule, target string, value float64, body string) {
+func (m *Manager) clear(ctx context.Context, key string, rule store.InfraAlertRule, target string, value *float64, body string) {
 	st := m.state(key)
 	if !st.active {
 		return
@@ -258,7 +262,7 @@ func (m *Manager) clear(ctx context.Context, key string, rule store.InfraAlertRu
 	m.publish(ctx, rule, target, value, true, body)
 }
 
-func (m *Manager) publish(ctx context.Context, rule store.InfraAlertRule, target string, value float64, clear bool, body string) {
+func (m *Manager) publish(ctx context.Context, rule store.InfraAlertRule, target string, value *float64, clear bool, body string) {
 	if m.sink == nil {
 		return
 	}
@@ -268,6 +272,17 @@ func (m *Manager) publish(ctx context.Context, rule store.InfraAlertRule, target
 		severity = "resolved"
 		title = "Infrastructure alert cleared"
 	}
+	data := map[string]any{
+		"server_id":  rule.ServerID,
+		"rule":       rule.Kind,
+		"target":     target,
+		"threshold":  rule.Threshold,
+		"clear":      clear,
+		"updated_at": rule.UpdatedAt.Unix(),
+	}
+	if value != nil {
+		data["value"] = *value
+	}
 	_ = m.sink.Publish(ctx, notifications.Notification{
 		ID:        fmt.Sprintf("infra-alert-%d", m.now().UnixNano()),
 		Type:      "infra.alert",
@@ -275,16 +290,12 @@ func (m *Manager) publish(ctx context.Context, rule store.InfraAlertRule, target
 		Body:      body,
 		Severity:  severity,
 		CreatedAt: m.now(),
-		Data: map[string]any{
-			"server_id":  rule.ServerID,
-			"rule":       rule.Kind,
-			"target":     target,
-			"value":      value,
-			"threshold":  rule.Threshold,
-			"clear":      clear,
-			"updated_at": rule.UpdatedAt.Unix(),
-		},
+		Data:      data,
 	})
+}
+
+func floatPtr(v float64) *float64 {
+	return &v
 }
 
 func (m *Manager) state(key string) alertState {
