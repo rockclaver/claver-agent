@@ -340,11 +340,25 @@ func (m *Manager) Publish(ev store.SessionEvent) (store.SessionEvent, error) {
 	if err != nil {
 		return store.SessionEvent{}, err
 	}
-	if in, out, ok := parseUsage(ev.Data); ok {
-		_ = m.Store.UpdateSessionUsage(ev.SessionID, in, out)
-	}
+	m.accountUsage(ev)
 	m.fanout(ev)
 	return ev, nil
+}
+
+// accountUsage extracts token usage and tool-call counts from a freshly
+// persisted event and folds them into the session's per-project usage row.
+// Both are best-effort: usage lines and tool-call markers only appear in
+// stdout from the agent CLI, and a malformed line simply yields no update.
+func (m *Manager) accountUsage(ev store.SessionEvent) {
+	if ev.Type != "stdout" && ev.Type != "stderr" {
+		return
+	}
+	if in, out, cache, ok := parseUsage(ev.Data); ok {
+		_ = m.Store.UpdateSessionUsage(ev.SessionID, in, out, cache)
+	}
+	if n := countToolCalls(ev.Data); n > 0 {
+		_ = m.Store.IncrSessionToolCalls(ev.SessionID, n)
+	}
 }
 
 // fanout delivers ev to every live subscriber of the session. Terminal output
@@ -452,17 +466,39 @@ func (w *eventWriter) Write(p []byte) (int, error) {
 
 var usageRE = regexp.MustCompile(`(?i)(input|prompt)[^0-9]*(\d+).*?(output|completion)[^0-9]*(\d+)`)
 
+// cacheRE pulls a cache-hit token count out of the same usage line. Agent CLIs
+// report it as "cache read", "cache hit", or "cached" followed by a number; we
+// accept any of those so a cache hit is priced separately from a fresh input
+// token. It is optional — a usage line without it yields zero cache tokens.
+var cacheRE = regexp.MustCompile(`(?i)cach(?:e|ed)[^0-9]*(?:read|hit|tokens)?[^0-9]*(\d+)`)
+
+// toolCallRE matches one rendered tool invocation in the agent transcript: a
+// bullet glyph (Claude/Codex render tool steps as "⏺ Bash(…)" / "● Read(…)")
+// followed by a CapitalCased tool name and an opening paren. It is a heuristic
+// over terminal output, so it is intentionally conservative — it counts clear
+// tool steps and ignores prose.
+var toolCallRE = regexp.MustCompile(`(?:^|\n)\s*(?:⏺|●|•|\*|>)\s*([A-Z][A-Za-z0-9_]+)\(`)
+
 var ansiRE = regexp.MustCompile(`\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)`)
 
-func parseUsage(s string) (int, int, bool) {
+func parseUsage(s string) (in, out, cache int, ok bool) {
 	m := usageRE.FindStringSubmatch(s)
 	if len(m) != 5 {
-		return 0, 0, false
+		return 0, 0, 0, false
 	}
-	var in, out int
 	_, _ = fmt.Sscanf(m[2], "%d", &in)
 	_, _ = fmt.Sscanf(m[4], "%d", &out)
-	return in, out, true
+	if cm := cacheRE.FindStringSubmatch(s); len(cm) == 2 {
+		_, _ = fmt.Sscanf(cm[1], "%d", &cache)
+	}
+	return in, out, cache, true
+}
+
+// countToolCalls returns how many rendered tool invocations appear in s. The
+// terminal output is cleaned of ANSI control sequences first so a redraw does
+// not split a marker.
+func countToolCalls(s string) int {
+	return len(toolCallRE.FindAllStringIndex(cleanTerminalText(s), -1))
 }
 
 func cleanTerminalText(s string) string {

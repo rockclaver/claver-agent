@@ -19,7 +19,9 @@ import (
 
 	"github.com/rockclaver/claver/agent/internal/aiproposal"
 	"github.com/rockclaver/claver/agent/internal/alerts"
+	"github.com/rockclaver/claver/agent/internal/billing"
 	"github.com/rockclaver/claver/agent/internal/cliauth"
+	"github.com/rockclaver/claver/agent/internal/cost"
 	"github.com/rockclaver/claver/agent/internal/docker"
 	"github.com/rockclaver/claver/agent/internal/firewall"
 	gh "github.com/rockclaver/claver/agent/internal/github"
@@ -101,6 +103,12 @@ type Config struct {
 	// Memory, when non-nil, enables memory.* and journal.* kinds (Stickiness
 	// #5: per-project agent memory + project journal).
 	Memory *memory.Manager
+	// Cost, when non-nil, enables cost.* kinds (Stickiness #8: cross-fleet
+	// cost & usage rollup).
+	Cost *cost.Calculator
+	// Billing, when non-nil, enables provider.* kinds (encrypted VPS billing
+	// credentials + on-demand refresh of the daily cost fetch).
+	Billing *billing.Manager
 }
 
 // Server is the agent's control-plane server.
@@ -486,6 +494,13 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 		"journal.list",
 		"journal.export":
 		s.dispatchMemory(ctx, c, writeMu, f)
+	case "cost.rollup",
+		"cost.export",
+		"provider.list",
+		"provider.set",
+		"provider.delete",
+		"provider.refresh":
+		s.dispatchCost(ctx, c, writeMu, f)
 	default:
 		s.writeError(ctx, c, writeMu, f.ID, "unknown_kind", f.Kind)
 	}
@@ -3236,6 +3251,142 @@ func (s *Server) writeMemoryErr(ctx context.Context, c *websocket.Conn, writeMu 
 		s.writeError(ctx, c, writeMu, id, "not_found", err.Error())
 	case errors.Is(err, memory.ErrBadKind), errors.Is(err, memory.ErrEmptyTitle),
 		errors.Is(err, memory.ErrNoProject), errors.Is(err, memory.ErrBadJournal):
+		s.writeError(ctx, c, writeMu, id, "bad_payload", err.Error())
+	default:
+		s.writeError(ctx, c, writeMu, id, "internal", err.Error())
+	}
+}
+
+// ProviderCredentialDTO is the non-secret wire shape of a stored billing
+// credential. The sealed API key is never serialized.
+type ProviderCredentialDTO struct {
+	Provider  string `json:"provider"`
+	UpdatedAt int64  `json:"updated_at"`
+}
+
+// dispatchCost serves the cross-fleet cost rollup (cost.*) and the encrypted
+// VPS billing credential surface (provider.*). cost.* needs only the Cost
+// calculator; provider.* additionally needs the Billing manager.
+func (s *Server) dispatchCost(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
+	switch f.Kind {
+	case "cost.rollup":
+		if s.cfg.Cost == nil {
+			s.writeError(ctx, c, writeMu, f.ID, "unavailable", "cost subsystem not configured")
+			return
+		}
+		var in struct {
+			Month string `json:"month"`
+		}
+		_ = json.Unmarshal(f.Payload, &in)
+		r, err := s.cfg.Cost.Rollup(in.Month)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "cost.rollup", r)
+	case "cost.export":
+		if s.cfg.Cost == nil {
+			s.writeError(ctx, c, writeMu, f.ID, "unavailable", "cost subsystem not configured")
+			return
+		}
+		var in struct {
+			Month string `json:"month"`
+		}
+		_ = json.Unmarshal(f.Payload, &in)
+		csv, err := s.cfg.Cost.ExportCSV(in.Month)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "cost.export", map[string]any{"csv": csv, "month": in.Month})
+	case "provider.list", "provider.set", "provider.delete", "provider.refresh":
+		s.dispatchProvider(ctx, c, writeMu, f)
+	}
+}
+
+func (s *Server) dispatchProvider(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
+	if s.cfg.Billing == nil {
+		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "billing subsystem not configured")
+		return
+	}
+	mgr := s.cfg.Billing
+	switch f.Kind {
+	case "provider.list":
+		infos, err := mgr.ListCredentials()
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
+			return
+		}
+		out := make([]ProviderCredentialDTO, 0, len(infos))
+		for _, ci := range infos {
+			out = append(out, ProviderCredentialDTO{Provider: ci.Provider, UpdatedAt: ci.UpdatedAt.Unix()})
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "provider.list", map[string]any{
+			"credentials": out,
+			"supported":   billing.ProviderNames(),
+		})
+	case "provider.set":
+		var in struct {
+			Provider string `json:"provider"`
+			APIKey   string `json:"api_key"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
+			return
+		}
+		if err := mgr.SetCredential(in.Provider, in.APIKey); err != nil {
+			s.writeBillingErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "provider.set", map[string]any{"provider": in.Provider})
+	case "provider.delete":
+		var in struct {
+			Provider string `json:"provider"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Provider == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "provider required")
+			return
+		}
+		if err := mgr.DeleteCredential(in.Provider); err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "provider.delete", map[string]any{"provider": in.Provider})
+	case "provider.refresh":
+		rows, err := mgr.FetchAll(ctx)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
+			return
+		}
+		out := make([]ProviderCostDTO, 0, len(rows))
+		for _, r := range rows {
+			out = append(out, toProviderCostDTO(r))
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "provider.refresh", map[string]any{"infra": out})
+	}
+}
+
+// ProviderCostDTO mirrors one normalized infra-cost row for the refresh reply.
+type ProviderCostDTO struct {
+	Provider    string `json:"provider"`
+	Month       string `json:"month"`
+	AmountCents int64  `json:"amount_cents"`
+	Currency    string `json:"currency"`
+	Status      string `json:"status"`
+	Detail      string `json:"detail,omitempty"`
+	FetchedAt   int64  `json:"fetched_at"`
+}
+
+func toProviderCostDTO(r store.InfraCost) ProviderCostDTO {
+	return ProviderCostDTO{
+		Provider: r.Provider, Month: r.Month, AmountCents: r.AmountCents,
+		Currency: r.Currency, Status: r.Status, Detail: r.Detail, FetchedAt: r.FetchedAt.Unix(),
+	}
+}
+
+func (s *Server) writeBillingErr(ctx context.Context, c *websocket.Conn, writeMu *connWriter, id string, err error) {
+	switch {
+	case errors.Is(err, billing.ErrBadProvider), errors.Is(err, billing.ErrNoKey):
 		s.writeError(ctx, c, writeMu, id, "bad_payload", err.Error())
 	default:
 		s.writeError(ctx, c, writeMu, id, "internal", err.Error())

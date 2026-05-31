@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -22,6 +23,10 @@ type Project struct {
 }
 
 // Session is a persisted AI-agent pane bound to one project workspace.
+// CacheTokens counts input tokens served from the model's prompt cache (a
+// cache hit is billed at a fraction of a fresh input token, so the cost
+// rollup prices them separately). ToolCalls counts tool invocations the agent
+// made during the session — the per-tool-call usage signal keyed by project.
 type Session struct {
 	ID           string
 	ProjectID    string
@@ -30,6 +35,8 @@ type Session struct {
 	EndedAt      *time.Time
 	InputTokens  int
 	OutputTokens int
+	CacheTokens  int
+	ToolCalls    int
 }
 
 // SessionEvent is an append-only terminal or lifecycle event for a session.
@@ -177,6 +184,39 @@ type JournalEntry struct {
 	RefID      string
 }
 
+// ProviderCredential is one encrypted billing-API key for a VPS provider
+// (hetzner, digitalocean, vultr, linode) scoped to one server. Unlike the CLI
+// and GitHub vaults — which keep ciphertext in on-disk blobs and only a path
+// in SQLite — these credentials are sealed and stored inline as ciphertext +
+// nonce columns, so the encrypted key lives entirely in the State Store. The
+// AES-GCM key file is the only off-store secret.
+type ProviderCredential struct {
+	ServerID   string
+	Provider   string
+	Ciphertext []byte
+	Nonce      []byte
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+}
+
+// InfraCost is one normalized monthly infrastructure bill for a server, pulled
+// from a provider's billing API by the daily job. Month is the first day of
+// the billing month in "2006-01" form. AmountCents is the cost in the smallest
+// unit of Currency. Status is "ok" when the figure came back from the provider
+// and "unavailable" when the API could not be reached — the UI degrades to the
+// latter rather than showing a blank panel. Detail carries the failure reason
+// (or a human note) for "unavailable" rows.
+type InfraCost struct {
+	ServerID    string
+	Provider    string
+	Month       string
+	AmountCents int64
+	Currency    string
+	Status      string // "ok" | "unavailable"
+	Detail      string
+	FetchedAt   time.Time
+}
+
 // ErrNotFound is returned when a row does not exist.
 var ErrNotFound = errors.New("not found")
 
@@ -223,6 +263,8 @@ CREATE TABLE IF NOT EXISTS sessions (
 	ended_at      INTEGER,
 	input_tokens  INTEGER NOT NULL DEFAULT 0,
 	output_tokens INTEGER NOT NULL DEFAULT 0,
+	cache_tokens  INTEGER NOT NULL DEFAULT 0,
+	tool_calls    INTEGER NOT NULL DEFAULT 0,
 	FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
 );
 
@@ -350,8 +392,63 @@ CREATE TABLE IF NOT EXISTS project_journal_entry (
 );
 
 CREATE INDEX IF NOT EXISTS project_journal_occurred_idx ON project_journal_entry(project_id, occurred_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS provider_credentials (
+	server_id  TEXT NOT NULL,
+	provider   TEXT NOT NULL,
+	ciphertext BLOB NOT NULL,
+	nonce      BLOB NOT NULL,
+	created_at INTEGER NOT NULL,
+	updated_at INTEGER NOT NULL,
+	PRIMARY KEY(server_id, provider)
+);
+
+CREATE TABLE IF NOT EXISTS infra_cost (
+	server_id    TEXT NOT NULL,
+	provider     TEXT NOT NULL,
+	month        TEXT NOT NULL,
+	amount_cents INTEGER NOT NULL DEFAULT 0,
+	currency     TEXT NOT NULL DEFAULT 'USD',
+	status       TEXT NOT NULL DEFAULT 'ok',
+	detail       TEXT NOT NULL DEFAULT '',
+	fetched_at   INTEGER NOT NULL,
+	PRIMARY KEY(server_id, provider, month)
+);
+
+CREATE INDEX IF NOT EXISTS infra_cost_month_idx ON infra_cost(month);
 `)
-	return err
+	if err != nil {
+		return err
+	}
+	// Column additions for stores created before the cost/usage dashboard
+	// (issue #60). CREATE TABLE IF NOT EXISTS leaves an existing sessions
+	// table untouched, so add the new usage columns idempotently.
+	return s.addColumns("sessions",
+		columnDef{"cache_tokens", "INTEGER NOT NULL DEFAULT 0"},
+		columnDef{"tool_calls", "INTEGER NOT NULL DEFAULT 0"},
+	)
+}
+
+type columnDef struct {
+	name string
+	ddl  string
+}
+
+// addColumns adds each column to table if it is not already present. SQLite
+// has no "ADD COLUMN IF NOT EXISTS", so a duplicate-column error is treated as
+// a no-op — making migration safe to run on every boot.
+func (s *Store) addColumns(table string, cols ...columnDef) error {
+	for _, c := range cols {
+		_, err := s.db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, c.name, c.ddl))
+		if err != nil && !isDuplicateColumn(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+func isDuplicateColumn(err error) bool {
+	return strings.Contains(err.Error(), "duplicate column name")
 }
 
 // DefaultInfraAlertRule returns the shipped enabled defaults for one rule.
@@ -494,10 +591,10 @@ func (s *Store) CreateSession(sess Session) error {
 		sess.StartedAt = time.Now()
 	}
 	_, err := s.db.Exec(
-		`INSERT INTO sessions (id, project_id, agent, started_at, ended_at, input_tokens, output_tokens)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO sessions (id, project_id, agent, started_at, ended_at, input_tokens, output_tokens, cache_tokens, tool_calls)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		sess.ID, sess.ProjectID, sess.Agent, sess.StartedAt.Unix(), nullableUnix(sess.EndedAt),
-		sess.InputTokens, sess.OutputTokens,
+		sess.InputTokens, sess.OutputTokens, sess.CacheTokens, sess.ToolCalls,
 	)
 	return err
 }
@@ -505,16 +602,22 @@ func (s *Store) CreateSession(sess Session) error {
 // GetSession loads a session by ID.
 func (s *Store) GetSession(id string) (Session, error) {
 	row := s.db.QueryRow(
-		`SELECT id, project_id, agent, started_at, ended_at, input_tokens, output_tokens
+		`SELECT id, project_id, agent, started_at, ended_at, input_tokens, output_tokens, cache_tokens, tool_calls
 		 FROM sessions WHERE id = ?`, id,
 	)
+	sess, err := scanSession(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Session{}, fmt.Errorf("session %s: %w", id, ErrNotFound)
+	}
+	return sess, err
+}
+
+func scanSession(row rowScanner) (Session, error) {
 	var sess Session
 	var started int64
 	var ended sql.NullInt64
-	if err := row.Scan(&sess.ID, &sess.ProjectID, &sess.Agent, &started, &ended, &sess.InputTokens, &sess.OutputTokens); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return Session{}, fmt.Errorf("session %s: %w", id, ErrNotFound)
-		}
+	if err := row.Scan(&sess.ID, &sess.ProjectID, &sess.Agent, &started, &ended,
+		&sess.InputTokens, &sess.OutputTokens, &sess.CacheTokens, &sess.ToolCalls); err != nil {
 		return Session{}, err
 	}
 	sess.StartedAt = time.Unix(started, 0)
@@ -528,7 +631,7 @@ func (s *Store) GetSession(id string) (Session, error) {
 // ListSessions returns sessions ordered newest first.
 func (s *Store) ListSessions(projectID string) ([]Session, error) {
 	rows, err := s.db.Query(
-		`SELECT id, project_id, agent, started_at, ended_at, input_tokens, output_tokens
+		`SELECT id, project_id, agent, started_at, ended_at, input_tokens, output_tokens, cache_tokens, tool_calls
 		 FROM sessions
 		 WHERE (? = '' OR project_id = ?)
 		 ORDER BY started_at DESC, id DESC`, projectID, projectID,
@@ -539,16 +642,9 @@ func (s *Store) ListSessions(projectID string) ([]Session, error) {
 	defer rows.Close()
 	out := make([]Session, 0)
 	for rows.Next() {
-		var sess Session
-		var started int64
-		var ended sql.NullInt64
-		if err := rows.Scan(&sess.ID, &sess.ProjectID, &sess.Agent, &started, &ended, &sess.InputTokens, &sess.OutputTokens); err != nil {
+		sess, err := scanSession(rows)
+		if err != nil {
 			return nil, err
-		}
-		sess.StartedAt = time.Unix(started, 0)
-		if ended.Valid {
-			t := time.Unix(ended.Int64, 0)
-			sess.EndedAt = &t
 		}
 		out = append(out, sess)
 	}
@@ -558,7 +654,7 @@ func (s *Store) ListSessions(projectID string) ([]Session, error) {
 // ActiveSessions returns sessions that have not been stopped.
 func (s *Store) ActiveSessions() ([]Session, error) {
 	rows, err := s.db.Query(
-		`SELECT id, project_id, agent, started_at, ended_at, input_tokens, output_tokens
+		`SELECT id, project_id, agent, started_at, ended_at, input_tokens, output_tokens, cache_tokens, tool_calls
 		 FROM sessions WHERE ended_at IS NULL ORDER BY started_at ASC, id ASC`,
 	)
 	if err != nil {
@@ -567,16 +663,9 @@ func (s *Store) ActiveSessions() ([]Session, error) {
 	defer rows.Close()
 	out := make([]Session, 0)
 	for rows.Next() {
-		var sess Session
-		var started int64
-		var ended sql.NullInt64
-		if err := rows.Scan(&sess.ID, &sess.ProjectID, &sess.Agent, &started, &ended, &sess.InputTokens, &sess.OutputTokens); err != nil {
+		sess, err := scanSession(rows)
+		if err != nil {
 			return nil, err
-		}
-		sess.StartedAt = time.Unix(started, 0)
-		if ended.Valid {
-			t := time.Unix(ended.Int64, 0)
-			sess.EndedAt = &t
 		}
 		out = append(out, sess)
 	}
@@ -595,11 +684,26 @@ func (s *Store) DeleteSession(id string) error {
 	return err
 }
 
-// UpdateSessionUsage stores parsed agent token usage.
-func (s *Store) UpdateSessionUsage(id string, inputTokens, outputTokens int) error {
+// UpdateSessionUsage stores parsed agent token usage. Token figures are
+// monotonic running totals reported by the agent, so the latest parse wins.
+func (s *Store) UpdateSessionUsage(id string, inputTokens, outputTokens, cacheTokens int) error {
 	_, err := s.db.Exec(
-		`UPDATE sessions SET input_tokens = ?, output_tokens = ? WHERE id = ?`,
-		inputTokens, outputTokens, id,
+		`UPDATE sessions SET input_tokens = ?, output_tokens = ?, cache_tokens = ? WHERE id = ?`,
+		inputTokens, outputTokens, cacheTokens, id,
+	)
+	return err
+}
+
+// IncrSessionToolCalls adds delta to a session's running tool-call count. Tool
+// invocations are observed one at a time from the event stream, so the counter
+// accumulates rather than being overwritten.
+func (s *Store) IncrSessionToolCalls(id string, delta int) error {
+	if delta == 0 {
+		return nil
+	}
+	_, err := s.db.Exec(
+		`UPDATE sessions SET tool_calls = tool_calls + ? WHERE id = ?`,
+		delta, id,
 	)
 	return err
 }
@@ -1297,6 +1401,157 @@ func decodeJournalCursor(s string) (occurred, id int64, ok bool) {
 		return 0, 0, false
 	}
 	return occurred, id, true
+}
+
+// CountJournalEntries returns how many journal entries of the given kind
+// occurred in [start, end). An empty kind counts every kind; an empty
+// projectID counts across all projects. This is the PR-shipped denominator for
+// the cost-per-PR metric (kind "pr"). end is exclusive so callers can pass the
+// first instant of the next month.
+func (s *Store) CountJournalEntries(projectID, kind string, start, end time.Time) (int, error) {
+	row := s.db.QueryRow(
+		`SELECT COUNT(*) FROM project_journal_entry
+		 WHERE (? = '' OR project_id = ?)
+		   AND (? = '' OR kind = ?)
+		   AND occurred_at >= ? AND occurred_at < ?`,
+		projectID, projectID, kind, kind, start.Unix(), end.Unix(),
+	)
+	var n int
+	if err := row.Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// PutProviderCredential upserts the sealed billing-API key for one provider on
+// one server. CreatedAt is preserved across updates.
+func (s *Store) PutProviderCredential(c ProviderCredential) error {
+	now := time.Now()
+	if c.CreatedAt.IsZero() {
+		c.CreatedAt = now
+	}
+	c.UpdatedAt = now
+	_, err := s.db.Exec(
+		`INSERT INTO provider_credentials (server_id, provider, ciphertext, nonce, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(server_id, provider) DO UPDATE SET
+		   ciphertext = excluded.ciphertext,
+		   nonce = excluded.nonce,
+		   updated_at = excluded.updated_at`,
+		c.ServerID, c.Provider, c.Ciphertext, c.Nonce, c.CreatedAt.Unix(), c.UpdatedAt.Unix(),
+	)
+	return err
+}
+
+// GetProviderCredential loads the sealed key for one provider on one server.
+func (s *Store) GetProviderCredential(serverID, provider string) (ProviderCredential, error) {
+	row := s.db.QueryRow(
+		`SELECT server_id, provider, ciphertext, nonce, created_at, updated_at
+		 FROM provider_credentials WHERE server_id = ? AND provider = ?`,
+		serverID, provider,
+	)
+	return scanProviderCredential(row)
+}
+
+// ListProviderCredentials returns every stored credential for a server,
+// ordered by provider. Pass "" to list across all servers.
+func (s *Store) ListProviderCredentials(serverID string) ([]ProviderCredential, error) {
+	rows, err := s.db.Query(
+		`SELECT server_id, provider, ciphertext, nonce, created_at, updated_at
+		 FROM provider_credentials
+		 WHERE (? = '' OR server_id = ?)
+		 ORDER BY server_id ASC, provider ASC`,
+		serverID, serverID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]ProviderCredential, 0)
+	for rows.Next() {
+		c, err := scanProviderCredential(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// DeleteProviderCredential removes one stored credential. Missing rows are not
+// an error.
+func (s *Store) DeleteProviderCredential(serverID, provider string) error {
+	_, err := s.db.Exec(
+		`DELETE FROM provider_credentials WHERE server_id = ? AND provider = ?`,
+		serverID, provider,
+	)
+	return err
+}
+
+func scanProviderCredential(row rowScanner) (ProviderCredential, error) {
+	var c ProviderCredential
+	var created, updated int64
+	if err := row.Scan(&c.ServerID, &c.Provider, &c.Ciphertext, &c.Nonce, &created, &updated); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ProviderCredential{}, fmt.Errorf("provider_credential: %w", ErrNotFound)
+		}
+		return ProviderCredential{}, err
+	}
+	c.CreatedAt = time.Unix(created, 0)
+	c.UpdatedAt = time.Unix(updated, 0)
+	return c, nil
+}
+
+// PutInfraCost upserts one normalized monthly cost row.
+func (s *Store) PutInfraCost(c InfraCost) error {
+	if c.FetchedAt.IsZero() {
+		c.FetchedAt = time.Now()
+	}
+	if c.Currency == "" {
+		c.Currency = "USD"
+	}
+	if c.Status == "" {
+		c.Status = "ok"
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO infra_cost (server_id, provider, month, amount_cents, currency, status, detail, fetched_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(server_id, provider, month) DO UPDATE SET
+		   amount_cents = excluded.amount_cents,
+		   currency = excluded.currency,
+		   status = excluded.status,
+		   detail = excluded.detail,
+		   fetched_at = excluded.fetched_at`,
+		c.ServerID, c.Provider, c.Month, c.AmountCents, c.Currency, c.Status, c.Detail, c.FetchedAt.Unix(),
+	)
+	return err
+}
+
+// ListInfraCost returns the cost rows for a given month ("2006-01"), ordered by
+// provider. An empty month returns every month's rows.
+func (s *Store) ListInfraCost(month string) ([]InfraCost, error) {
+	rows, err := s.db.Query(
+		`SELECT server_id, provider, month, amount_cents, currency, status, detail, fetched_at
+		 FROM infra_cost
+		 WHERE (? = '' OR month = ?)
+		 ORDER BY month DESC, server_id ASC, provider ASC`,
+		month, month,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]InfraCost, 0)
+	for rows.Next() {
+		var c InfraCost
+		var fetched int64
+		if err := rows.Scan(&c.ServerID, &c.Provider, &c.Month, &c.AmountCents, &c.Currency, &c.Status, &c.Detail, &fetched); err != nil {
+			return nil, err
+		}
+		c.FetchedAt = time.Unix(fetched, 0)
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }
 
 func nullableUnix(t *time.Time) any {

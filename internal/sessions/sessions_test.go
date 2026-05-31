@@ -554,6 +554,61 @@ func TestUsageOutput_UpdatesSessionList(t *testing.T) {
 	}
 }
 
+// AC (#60): per-session usage accounting parses cache-hit tokens alongside
+// input/output, and counts rendered tool calls. These are pure-function tests
+// over the parsers so they stay fast (no tmux).
+func TestParseUsage_WithCacheTokens(t *testing.T) {
+	in, out, cache, ok := parseUsage("input tokens: 120  output tokens: 45  cache read: 900")
+	if !ok || in != 120 || out != 45 || cache != 900 {
+		t.Fatalf("parse = %d/%d/%d ok=%v", in, out, cache, ok)
+	}
+	// No cache term → cache is zero but the line still parses.
+	in, out, cache, ok = parseUsage("input tokens: 12 output tokens: 34")
+	if !ok || in != 12 || out != 34 || cache != 0 {
+		t.Fatalf("parse w/o cache = %d/%d/%d ok=%v", in, out, cache, ok)
+	}
+	if _, _, _, ok := parseUsage("no usage here"); ok {
+		t.Fatal("expected no match for prose")
+	}
+}
+
+func TestCountToolCalls(t *testing.T) {
+	transcript := "⏺ Bash(ls -la)\nsome output\n● Read(main.go)\n> Edit(x.go)\njust prose Foo(bar) inline\n"
+	if n := countToolCalls(transcript); n != 3 {
+		t.Fatalf("tool calls = %d, want 3", n)
+	}
+	if n := countToolCalls("plain text, no tools"); n != 0 {
+		t.Fatalf("expected 0 tool calls, got %d", n)
+	}
+}
+
+// AC (#60): folding a stdout event accumulates usage and tool calls onto the
+// session row keyed by project.
+func TestAccountUsage_PersistsViaPublish(t *testing.T) {
+	m, _ := newTestManager(t)
+	if _, err := m.Start(context.Background(), "p1", "claude", "manual"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Publish(store.SessionEvent{SessionID: "s1", Type: "stdout",
+		Data: "input tokens: 200 output tokens: 80 cache read: 1000\n⏺ Bash(go test)\n● Read(x)"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := m.List("p1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("sessions = %d", len(got))
+	}
+	s := got[0]
+	if s.InputTokens != 200 || s.OutputTokens != 80 || s.CacheTokens != 1000 {
+		t.Fatalf("usage not accounted: %+v", s)
+	}
+	if s.ToolCalls != 2 {
+		t.Fatalf("tool calls = %d, want 2", s.ToolCalls)
+	}
+}
+
 // AC: "No code path exposes an arbitrary shell command to the mobile UI."
 func TestStartSession_RejectsArbitraryAgentCommand(t *testing.T) {
 	m, _ := newTestManager(t)

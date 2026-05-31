@@ -11,7 +11,9 @@ import (
 
 	"github.com/rockclaver/claver/agent/internal/aiproposal"
 	"github.com/rockclaver/claver/agent/internal/alerts"
+	"github.com/rockclaver/claver/agent/internal/billing"
 	"github.com/rockclaver/claver/agent/internal/cliauth"
+	"github.com/rockclaver/claver/agent/internal/cost"
 	"github.com/rockclaver/claver/agent/internal/docker"
 	"github.com/rockclaver/claver/agent/internal/firewall"
 	gh "github.com/rockclaver/claver/agent/internal/github"
@@ -40,6 +42,7 @@ func main() {
 	previewExpectedIP := flag.String("preview-expected-ip", os.Getenv("CLAVER_PREVIEW_EXPECTED_IP"), "if set, DNS validation requires the wildcard to resolve to this IP")
 	fcmServiceAccount := flag.String("fcm-service-account", envOr("CLAVER_FCM_SERVICE_ACCOUNT", ""), "path to Firebase service-account JSON; enables server-side push when set")
 	runbookAgent := flag.String("runbook-agent", envOr("CLAVER_RUNBOOK_AGENT", "claude"), "AI CLI to use for runbook generation (claude|codex)")
+	serverID := flag.String("server-id", envOr("CLAVER_SERVER_ID", "local"), "stable id labelling this server's cost/usage rows in the cross-fleet dashboard")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -116,6 +119,16 @@ func main() {
 			}
 		}()
 	}
+
+	// Cross-fleet cost & usage dashboard (Stickiness #8). The cost calculator
+	// prices session token usage and folds in the per-server infra bills the
+	// billing manager pulls daily from VPS provider APIs. Provider credentials
+	// are sealed with their own AES key (separate namespace from the CLI/GitHub
+	// vault) and stored encrypted in SQLite.
+	costCalc := cost.New(st, *serverID)
+	billingVault := billing.NewVault(filepath.Join(*dataDir, "billing.key"))
+	billingMgr := billing.New(st, billingVault, *serverID)
+	billingMgr.Logf = log.Printf
 
 	previewMgr, err := previews.New(previews.Config{
 		FragmentsDir: *caddyFragmentsDir,
@@ -242,6 +255,8 @@ func main() {
 		Runbook:       runbookMgr,
 		PushDevices:   st,
 		Memory:        memoryMgr,
+		Cost:          costCalc,
+		Billing:       billingMgr,
 	})
 	ln, err := srv.Listen()
 	if err != nil {
@@ -256,6 +271,8 @@ func main() {
 	}
 	sessionMgr.StartReaper(ctx, 0)
 	alertMgr.Start(ctx)
+	billingCleanup := billingMgr.StartDaily(ctx)
+	defer billingCleanup()
 	runbookCleanup := runbookMgr.Start(ctx)
 	defer runbookCleanup()
 

@@ -115,7 +115,13 @@ func TestStore_SessionListIncludesTimestampsAndTokenUsage(t *testing.T) {
 	if err := s.CreateSession(Session{ID: "s1", ProjectID: "p1", Agent: "claude", StartedAt: start}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.UpdateSessionUsage("s1", 123, 456); err != nil {
+	if err := s.UpdateSessionUsage("s1", 123, 456, 78); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IncrSessionToolCalls("s1", 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IncrSessionToolCalls("s1", 2); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.EndSession("s1", end); err != nil {
@@ -131,8 +137,11 @@ func TestStore_SessionListIncludesTimestampsAndTokenUsage(t *testing.T) {
 	if !got[0].StartedAt.Equal(start) || got[0].EndedAt == nil || !got[0].EndedAt.Equal(end) {
 		t.Fatalf("timestamps not preserved: %+v", got[0])
 	}
-	if got[0].InputTokens != 123 || got[0].OutputTokens != 456 {
+	if got[0].InputTokens != 123 || got[0].OutputTokens != 456 || got[0].CacheTokens != 78 {
 		t.Fatalf("usage not preserved: %+v", got[0])
+	}
+	if got[0].ToolCalls != 5 {
+		t.Fatalf("tool calls not accumulated: %+v", got[0])
 	}
 }
 

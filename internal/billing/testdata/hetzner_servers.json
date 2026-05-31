@@ -1,0 +1,28 @@
+{
+  "servers": [
+    {
+      "id": 101,
+      "name": "web-1",
+      "datacenter": { "location": { "name": "fsn1" } },
+      "server_type": {
+        "name": "cx22",
+        "prices": [
+          { "location": "fsn1", "price_monthly": { "gross": "4.5100000000" } },
+          { "location": "nbg1", "price_monthly": { "gross": "4.5100000000" } }
+        ]
+      }
+    },
+    {
+      "id": 102,
+      "name": "db-1",
+      "datacenter": { "location": { "name": "nbg1" } },
+      "server_type": {
+        "name": "cx32",
+        "prices": [
+          { "location": "fsn1", "price_monthly": { "gross": "8.0900000000" } },
+          { "location": "nbg1", "price_monthly": { "gross": "8.0900000000" } }
+        ]
+      }
+    }
+  ]
+}
