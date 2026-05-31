@@ -209,6 +209,121 @@ func TestClaudeSubscriptionDoesNotInjectOAuthToken(t *testing.T) {
 	}
 }
 
+func TestLogoutClearsLocalCredentialFilesAndVaultPointers(t *testing.T) {
+	m := newTestManager(t)
+	cases := []struct {
+		kind string
+		path string
+		body string
+	}{
+		{
+			kind: KindClaude,
+			path: filepath.Join(m.cfg.HomeDir, ".claude", ".credentials.json"),
+			body: `{"oauth":{"access_token":"stale"}}`,
+		},
+		{
+			kind: KindCodex,
+			path: filepath.Join(m.cfg.HomeDir, ".codex", "auth.json"),
+			body: `{"tokens":{"access_token":"stale"}}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.kind, func(t *testing.T) {
+			if err := os.MkdirAll(filepath.Dir(tc.path), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(tc.path, []byte(tc.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			sealed, err := m.cfg.Vault.Seal(tc.kind, "stale")
+			if err != nil {
+				t.Fatalf("seal: %v", err)
+			}
+			if err := m.cfg.Store.PutCliToken(store.CliToken{
+				Kind: tc.kind, Method: MethodSubscription, CiphertextPath: sealed,
+			}); err != nil {
+				t.Fatalf("put cli token: %v", err)
+			}
+			if err := m.Logout(context.Background(), tc.kind); err != nil {
+				t.Fatalf("logout: %v", err)
+			}
+			if _, err := os.Stat(tc.path); !os.IsNotExist(err) {
+				t.Fatalf("credential file still exists: %v", err)
+			}
+			if _, err := m.cfg.Store.GetCliToken(tc.kind); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("cli token still exists: %v", err)
+			}
+		})
+	}
+}
+
+func TestStatusCodexAuthJSONMissingAfterCliLogoutClearsStalePointer(t *testing.T) {
+	m := newTestManager(t)
+	sealed, err := m.cfg.Vault.Seal(KindCodex, `{"tokens":{"access_token":"stale"}}`)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	if err := m.cfg.Store.PutCliToken(store.CliToken{
+		Kind: KindCodex, Method: MethodAuthJSON, CiphertextPath: sealed,
+	}); err != nil {
+		t.Fatalf("put cli token: %v", err)
+	}
+
+	st, err := m.Status(context.Background(), KindCodex)
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if st.LoggedIn {
+		t.Fatalf("status = %+v, want logged out when auth.json is gone", st)
+	}
+	if _, err := m.cfg.Store.GetCliToken(KindCodex); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("stale cli token still exists: %v", err)
+	}
+}
+
+func TestStatusCodexAPIKeySurvivesMissingAuthJSON(t *testing.T) {
+	m := newTestManager(t)
+	if _, err := m.SetToken(context.Background(), KindCodex, ModeAPIKey, "sk-openai-XYZ"); err != nil {
+		t.Fatalf("set_token: %v", err)
+	}
+	st, err := m.Status(context.Background(), KindCodex)
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if !st.LoggedIn || st.Method != MethodAPIKey {
+		t.Fatalf("status = %+v, want api-key login independent of auth.json", st)
+	}
+}
+
+func TestSetTokenCodexFileRejectsInvalidAuthJSON(t *testing.T) {
+	m := newTestManager(t)
+	if _, err := m.SetToken(context.Background(), KindCodex, ModeFile, "not-json"); err == nil {
+		t.Fatal("expected invalid auth.json to be rejected")
+	}
+	if _, err := os.Stat(filepath.Join(m.cfg.HomeDir, ".codex", "auth.json")); !os.IsNotExist(err) {
+		t.Fatalf("auth.json should not be written after invalid paste: %v", err)
+	}
+}
+
+func TestLogoutCancelsRunningLogin(t *testing.T) {
+	m := newTestManager(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	login := &Login{ID: "login-1", Kind: KindCodex, cancel: cancel}
+	m.mu.Lock()
+	m.running[KindCodex] = login
+	m.byID[login.ID] = login
+	m.mu.Unlock()
+
+	if err := m.Logout(context.Background(), KindCodex); err != nil {
+		t.Fatalf("logout: %v", err)
+	}
+	select {
+	case <-ctx.Done():
+	default:
+		t.Fatal("running login was not cancelled")
+	}
+}
+
 func TestSetTokenCodexAPIKey(t *testing.T) {
 	m := newTestManager(t)
 	if _, err := m.SetToken(context.Background(), KindCodex, ModeAPIKey, "sk-openai-XYZ"); err != nil {
@@ -445,10 +560,28 @@ func TestLoginCommandArgs(t *testing.T) {
 	if got := loginCommandArgs(KindClaude, "/bin/claude"); got[0] != "/bin/claude" || got[1] != "auth" || got[2] != "login" {
 		t.Errorf("claude args = %#v", got)
 	}
-	if got := loginCommandArgs(KindCodex, "/bin/codex"); got[0] != "/bin/codex" || got[1] != "login" {
+	if got := strings.Join(loginCommandArgs(KindCodex, "/bin/codex"), " "); got != "/bin/codex login --device-auth" {
 		t.Errorf("codex args = %#v", got)
 	}
 	if got := strings.Join(loginCommandArgs(KindGitHub, "/bin/gh"), " "); got != "/bin/gh auth login --hostname github.com --git-protocol https --scopes repo,read:org,workflow --web" {
 		t.Errorf("github args = %q", got)
+	}
+}
+
+func TestAuthCodeFromLineRecognizesCodexDeviceCode(t *testing.T) {
+	codeRE := regexp.MustCompile(`(?i)\bcode\s*:\s*([A-Z0-9-]{6,})\b`)
+	deviceCodeRE := regexp.MustCompile(`\b[A-Z0-9]{4}-[A-Z0-9]{4,8}\b`)
+	cases := map[string]string{
+		"Code: ABCD-1234": "ABCD-1234",
+		"   X2QN-J9SFT":   "X2QN-J9SFT",
+		"Follow these steps to sign in with ChatGPT using device code authorization:":                                               "",
+		"Follow these steps to sign in with ChatGPT using device code authorization:\n\n2. Enter this one-time code\n   X2QN-J9SFT": "X2QN-J9SFT",
+		"Enter this one-time code ABC123": "",
+		"no code here":                    "",
+	}
+	for line, want := range cases {
+		if got := authCodeFromLine(line, codeRE, deviceCodeRE); got != want {
+			t.Errorf("authCodeFromLine(%q) = %q want %q", line, got, want)
+		}
 	}
 }

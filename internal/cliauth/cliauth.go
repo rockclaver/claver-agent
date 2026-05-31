@@ -242,9 +242,16 @@ func (m *Manager) Status(ctx context.Context, kind string) (Status, error) {
 	}
 
 	if row, err := m.cfg.Store.GetCliToken(kind); err == nil {
-		out.LoggedIn = true
-		out.Method = row.Method
-		out.Account = row.Account
+		if m.fileBackedCredentialMissing(kind, row.Method) {
+			// A user can run /logout inside the CLI itself. For file-backed
+			// browser logins, the credential file is the source of truth; do
+			// not let a stale vault pointer make the app skip sign-in.
+			_ = m.cfg.Store.DeleteCliToken(kind)
+		} else {
+			out.LoggedIn = true
+			out.Method = row.Method
+			out.Account = row.Account
+		}
 	}
 
 	if !out.LoggedIn {
@@ -369,6 +376,27 @@ func (m *Manager) githubStatus(ctx context.Context) (Status, error) {
 	return out, nil
 }
 
+func (m *Manager) fileBackedCredentialMissing(kind, method string) bool {
+	switch kind {
+	case KindClaude:
+		if method != MethodSubscription {
+			return false
+		}
+	case KindCodex:
+		if method != MethodSubscription && method != MethodAuthJSON {
+			return false
+		}
+	default:
+		return false
+	}
+	p := m.credPath(kind)
+	if p == "" {
+		return true
+	}
+	_, err := os.Stat(p)
+	return err != nil
+}
+
 func activeGitHubAccount(raw []byte) string {
 	var doc struct {
 		Hosts map[string]json.RawMessage `json:"hosts"`
@@ -473,6 +501,9 @@ func (m *Manager) StartLogin(parent context.Context, kind, mode string) (*Login,
 		m.mu.Unlock()
 		return nil, fmt.Errorf("cliauth: %s not installed", kind)
 	}
+	if kind == KindClaude || kind == KindCodex {
+		m.clearCredentialState(kind)
+	}
 	id := randID()
 	ctx, cancel := context.WithTimeout(parent, m.cfg.Timeout)
 	ev := make(chan Event, 64)
@@ -555,6 +586,10 @@ func (m *Manager) SetToken(ctx context.Context, kind, mode, value string) (Statu
 		if kind != KindCodex {
 			return Status{}, errors.New("cliauth: file mode only supported for codex")
 		}
+		var doc map[string]any
+		if err := json.Unmarshal([]byte(value), &doc); err != nil || len(doc) == 0 {
+			return Status{}, errors.New("cliauth: codex auth.json must be a JSON object")
+		}
 		dir := filepath.Join(m.cfg.HomeDir, ".codex")
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return Status{}, fmt.Errorf("cliauth: mkdir codex home: %w", err)
@@ -584,6 +619,7 @@ func (m *Manager) Logout(ctx context.Context, kind string) error {
 	if kind != KindClaude && kind != KindCodex && kind != KindGitHub {
 		return ErrBadKind
 	}
+	m.cancelRunning(kind)
 	if kind == KindGitHub {
 		if bin := m.resolveBin(kind); bin != "" {
 			cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -605,11 +641,24 @@ func (m *Manager) Logout(ctx context.Context, kind string) error {
 			_ = exec.CommandContext(cctx, bin, "auth", "logout").Run()
 		}
 	}
+	m.clearCredentialState(kind)
+	return nil
+}
+
+func (m *Manager) cancelRunning(kind string) {
+	m.mu.Lock()
+	login := m.running[kind]
+	m.mu.Unlock()
+	if login != nil {
+		login.cancel()
+	}
+}
+
+func (m *Manager) clearCredentialState(kind string) {
 	if p := m.credPath(kind); p != "" {
 		_ = os.Remove(p)
 	}
 	_ = m.cfg.Store.DeleteCliToken(kind)
-	return nil
 }
 
 // Secrets returns env-var assignments to inject into a tmux session for a
@@ -708,7 +757,8 @@ func (m *Manager) driveLogin(ctx context.Context, login *Login, bin string) {
 	// markdown-style "(...)" wrapping doesn't end up baked into the URL.
 	urlRE := regexp.MustCompile(`https?://[^\s)\]>"'\x00-\x1f\x7f]+`)
 	pasteRE := regexp.MustCompile(`(?i)(paste.{0,20}code|enter the code|paste it here)`)
-	codeRE := regexp.MustCompile(`(?i)code[: ]+([A-Z0-9-]{6,})`)
+	codeRE := regexp.MustCompile(`(?i)\bcode\s*:\s*([A-Z0-9-]{6,})\b`)
+	deviceCodeRE := regexp.MustCompile(`\b[A-Z0-9]{4}-[A-Z0-9]{4,8}\b`)
 
 	poll := time.NewTicker(1 * time.Second)
 	defer poll.Stop()
@@ -758,6 +808,7 @@ func (m *Manager) driveLogin(ctx context.Context, login *Login, bin string) {
 			if clean == "" {
 				continue
 			}
+			code := authCodeFromLine(clean, codeRE, deviceCodeRE)
 			scrubbed := scrubSecrets(clean)
 			login.emit(Event{Type: EvtProgress, Stream: "stdout", Line: scrubbed})
 			if login.Kind == KindGitHub && isGitHubLoginSuccess(clean) {
@@ -783,9 +834,9 @@ func (m *Manager) driveLogin(ctx context.Context, login *Login, bin string) {
 				}
 			}
 			if login.Kind == KindGitHub && !urlSeen {
-				if m := codeRE.FindStringSubmatch(clean); len(m) > 1 {
+				if code != "" {
 					urlSeen = true
-					login.emit(Event{Type: EvtURL, URL: "https://github.com/login/device", UserCode: m[1]})
+					login.emit(Event{Type: EvtURL, URL: "https://github.com/login/device", UserCode: code})
 				}
 			}
 			if login.Kind == KindGitHub && !githubBrowserPromptAdvanced && isGitHubBrowserPrompt(clean) {
@@ -811,10 +862,6 @@ func (m *Manager) driveLogin(ctx context.Context, login *Login, bin string) {
 							Type:         EvtCallbackTarget,
 							CallbackHost: host, CallbackPort: port, CallbackPath: path,
 						})
-					}
-					code := ""
-					if m := codeRE.FindStringSubmatch(clean); len(m) > 1 {
-						code = m[1]
 					}
 					login.emit(Event{Type: EvtURL, URL: candidate, UserCode: code})
 					break
@@ -923,12 +970,22 @@ func loginCommandArgs(kind, bin string) []string {
 	case KindClaude:
 		return []string{bin, "auth", "login"}
 	case KindCodex:
-		return []string{bin, "login"}
+		return []string{bin, "login", "--device-auth"}
 	case KindGitHub:
 		return []string{bin, "auth", "login", "--hostname", "github.com", "--git-protocol", "https", "--scopes", "repo,read:org,workflow", "--web"}
 	default:
 		return []string{bin}
 	}
+}
+
+func authCodeFromLine(line string, codeRE, deviceCodeRE *regexp.Regexp) string {
+	if code := deviceCodeRE.FindString(line); code != "" {
+		return code
+	}
+	if m := codeRE.FindStringSubmatch(line); len(m) > 1 {
+		return m[1]
+	}
+	return ""
 }
 
 func (m *Manager) cleanupLogin(login *Login) {
