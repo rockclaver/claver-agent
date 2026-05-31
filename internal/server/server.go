@@ -17,6 +17,7 @@ import (
 
 	"nhooyr.io/websocket"
 
+	"github.com/rockclaver/claver/agent/internal/aiproposal"
 	"github.com/rockclaver/claver/agent/internal/alerts"
 	"github.com/rockclaver/claver/agent/internal/cliauth"
 	"github.com/rockclaver/claver/agent/internal/docker"
@@ -81,6 +82,9 @@ type Config struct {
 	Firewall *firewall.Manager
 	// Alerts, when non-nil, enables infra.alerts.* kinds.
 	Alerts *alerts.Manager
+	// AIProposals, when non-nil, enables infra.proposal.* kinds (Phase 6:
+	// AI-assisted infrastructure).
+	AIProposals *aiproposal.Manager
 	// Notifications fans background task.notification events to connected clients.
 	Notifications *notifications.Hub
 }
@@ -434,6 +438,14 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 	case "infra.alerts.config",
 		"infra.alerts.config_set":
 		s.dispatchAlerts(ctx, c, writeMu, f)
+	case "infra.snapshot":
+		s.dispatchInfraSnapshot(ctx, c, writeMu, f)
+	case "infra.proposal.create",
+		"infra.proposal.list",
+		"infra.proposal.get",
+		"infra.proposal.approve",
+		"infra.proposal.decline":
+		s.dispatchProposal(ctx, c, writeMu, f)
 	case "github.repo_list",
 		"github.repo_import",
 		"github.commit",
@@ -2487,4 +2499,393 @@ func (s *Server) writeError(ctx context.Context, c *websocket.Conn, writeMu *con
 	raw, _ := json.Marshal(map[string]string{"error": msg})
 	out, _ := json.Marshal(Frame{ID: id, Kind: "error." + kind, Payload: raw})
 	writeMu.enqueue(out)
+}
+
+// dispatchInfraSnapshot aggregates the four infra read sources (metrics,
+// services, processes, firewall) into a single payload so an AI session can
+// ground answers about host health on real data with one round-trip. Missing
+// subsystems are reported as null fields rather than failing the call.
+func (s *Server) dispatchInfraSnapshot(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
+	out := map[string]any{}
+	if s.cfg.Infra != nil {
+		out["metrics"] = s.cfg.Infra.Sample(ctx)
+	} else {
+		out["metrics"] = nil
+	}
+	if s.cfg.Systemd != nil {
+		st := s.cfg.Systemd.Status(ctx)
+		if st.Available {
+			units, err := s.cfg.Systemd.List(ctx)
+			if err == nil {
+				out["services"] = map[string]any{"available": true, "units": units}
+			} else {
+				out["services"] = map[string]any{"available": true, "error": err.Error()}
+			}
+		} else {
+			out["services"] = map[string]any{"available": false, "unavailable_reason": st.UnavailableReason}
+		}
+	} else {
+		out["services"] = nil
+	}
+	if s.cfg.Processes != nil {
+		procs, err := s.cfg.Processes.List(ctx, "cpu", 50)
+		if err == nil {
+			out["processes"] = procs
+		} else {
+			out["processes"] = map[string]any{"error": err.Error()}
+		}
+	} else {
+		out["processes"] = nil
+	}
+	if s.cfg.Firewall != nil {
+		st, err := s.cfg.Firewall.Status(ctx)
+		if err == nil {
+			out["firewall"] = st
+		} else {
+			out["firewall"] = map[string]any{"error": err.Error()}
+		}
+	} else {
+		out["firewall"] = nil
+	}
+	s.writeOK(ctx, c, writeMu, f.ID, "infra.snapshot", out)
+}
+
+// proposalTokenBinding computes the (action, project_id, files) tuple a
+// confirmation token must be bound to for the proposal to be approvable. It
+// delegates to the same binding helpers the human-initiated flows use, so the
+// AI-proposed path inherits the identical action_hash semantics — no token
+// minted for a human action can be re-used for an AI proposal and vice versa.
+func proposalTokenBinding(kind aiproposal.Kind, params map[string]any) (action, projectID string, files []string, err error) {
+	switch kind {
+	case aiproposal.KindServiceAction:
+		name, _ := params["name"].(string)
+		actStr, _ := params["action"].(string)
+		if name == "" || actStr == "" {
+			return "", "", nil, fmt.Errorf("name and action required")
+		}
+		a, p, f := serviceLifecycleTokenBinding(name, systemd.Action(actStr))
+		return a, p, f, nil
+	case aiproposal.KindProcessKill:
+		pid := intFromParams(params["pid"])
+		startTicks := uint64FromParams(params["start_time_ticks"])
+		signal, _ := params["signal"].(string)
+		if pid <= 0 || startTicks == 0 {
+			return "", "", nil, fmt.Errorf("pid and start_time_ticks required")
+		}
+		a, p, f := processKillTokenBinding(pid, startTicks, signal)
+		return a, p, f, nil
+	case aiproposal.KindFirewallAdd, aiproposal.KindFirewallRemove:
+		rule, rerr := ruleFromParams(params)
+		if rerr != nil {
+			return "", "", nil, rerr
+		}
+		verb := "rule_add"
+		if kind == aiproposal.KindFirewallRemove {
+			verb = "rule_remove"
+		}
+		a, p, f := firewallRuleTokenBinding(verb, rule)
+		return a, p, f, nil
+	}
+	return "", "", nil, fmt.Errorf("unknown kind")
+}
+
+func intFromParams(v any) int {
+	switch n := v.(type) {
+	case float64:
+		return int(n)
+	case int:
+		return n
+	case int64:
+		return int(n)
+	}
+	return 0
+}
+
+func uint64FromParams(v any) uint64 {
+	switch n := v.(type) {
+	case float64:
+		return uint64(n)
+	case int:
+		return uint64(n)
+	case int64:
+		return uint64(n)
+	case uint64:
+		return n
+	}
+	return 0
+}
+
+func ruleFromParams(params map[string]any) (firewall.Rule, error) {
+	action, _ := params["action"].(string)
+	proto, _ := params["protocol"].(string)
+	port := intFromParams(params["port"])
+	source, _ := params["source"].(string)
+	comment, _ := params["comment"].(string)
+	if port <= 0 {
+		return firewall.Rule{}, fmt.Errorf("port required")
+	}
+	if proto == "" {
+		proto = string(firewall.ProtoTCP)
+	}
+	return firewall.Rule{
+		Action:   firewall.Action(action),
+		Protocol: firewall.Protocol(proto),
+		Port:     port,
+		Source:   source,
+		Comment:  comment,
+	}, nil
+}
+
+// auditAIProposed appends an audit row for an AI-proposed action. The Actor
+// field is fixed to "ai-proposed" so the audit log distinguishes machine-
+// suggested side effects from human-initiated ones even when the underlying
+// audit Type matches what a human action would produce.
+func (s *Server) auditAIProposed(auditType, summary string, data map[string]any) store.AuditEntry {
+	if s.cfg.Review == nil {
+		return store.AuditEntry{}
+	}
+	body, _ := json.Marshal(data)
+	entry, _ := s.cfg.Review.LogAudit(store.AuditEntry{
+		Type:      auditType,
+		ProjectID: "infra",
+		Actor:     "ai-proposed",
+		Summary:   summary,
+		Data:      string(body),
+		CreatedAt: s.cfg.Now(),
+	})
+	return entry
+}
+
+func (s *Server) dispatchProposal(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
+	if s.cfg.AIProposals == nil {
+		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "AI proposal subsystem not configured")
+		return
+	}
+	switch f.Kind {
+	case "infra.proposal.create":
+		var in struct {
+			Kind      string         `json:"kind"`
+			Params    map[string]any `json:"params"`
+			Rationale string         `json:"rationale"`
+			SessionID string         `json:"session_id"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Kind == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "kind required")
+			return
+		}
+		action, projectID, files, err := proposalTokenBinding(aiproposal.Kind(in.Kind), in.Params)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
+			return
+		}
+		p, err := s.cfg.AIProposals.Create(aiproposal.Proposal{
+			Kind:           aiproposal.Kind(in.Kind),
+			Params:         in.Params,
+			Rationale:      in.Rationale,
+			SessionID:      in.SessionID,
+			TokenAction:    action,
+			TokenProjectID: projectID,
+			TokenFiles:     files,
+		})
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "infra.proposal.create", map[string]any{"proposal": p})
+	case "infra.proposal.list":
+		s.writeOK(ctx, c, writeMu, f.ID, "infra.proposal.list", map[string]any{"proposals": s.cfg.AIProposals.List()})
+	case "infra.proposal.get":
+		var in struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
+			return
+		}
+		p, err := s.cfg.AIProposals.Get(in.ID)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "not_found", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "infra.proposal.get", map[string]any{"proposal": p})
+	case "infra.proposal.decline":
+		var in struct {
+			ID      string `json:"id"`
+			Comment string `json:"comment"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
+			return
+		}
+		// Decline never mutates the host, so it does not require a
+		// confirmation token; just record the decision.
+		audit := s.auditAIProposed("infra.proposal.decline", "ai-proposed declined: "+in.ID, map[string]any{
+			"proposal_id": in.ID,
+			"comment":     in.Comment,
+		})
+		p, err := s.cfg.AIProposals.Resolve(in.ID, aiproposal.StatusDeclined, in.Comment, audit.ID)
+		if err != nil {
+			if errors.Is(err, aiproposal.ErrNotFound) {
+				s.writeError(ctx, c, writeMu, f.ID, "not_found", err.Error())
+				return
+			}
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "infra.proposal.decline", map[string]any{"proposal": p})
+	case "infra.proposal.approve":
+		s.handleProposalApprove(ctx, c, writeMu, f)
+	}
+}
+
+// handleProposalApprove implements the propose -> approve -> execute path.
+// Critical invariants:
+//
+//   - The guard checks (protected unit, protected PID) run BEFORE the
+//     confirmation token is consumed so a rejected proposal does not burn a
+//     token the operator may want to reuse.
+//   - The confirmation token is consumed BEFORE the underlying mutation is
+//     attempted, so a failure in the executor cannot be retried by replaying
+//     the same token.
+//   - Every terminal outcome (rejected / failed / executed) writes an audit
+//     row attributed to "ai-proposed" and resolves the proposal so a second
+//     approval attempt returns ErrAlreadyResolved.
+func (s *Server) handleProposalApprove(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
+	var in struct {
+		ID                string `json:"id"`
+		ConfirmationToken string `json:"confirmation_token"`
+	}
+	if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
+		s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
+		return
+	}
+	if s.cfg.Review == nil {
+		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "confirmation subsystem not configured")
+		return
+	}
+	p, err := s.cfg.AIProposals.Get(in.ID)
+	if err != nil {
+		s.writeError(ctx, c, writeMu, f.ID, "not_found", err.Error())
+		return
+	}
+	if p.Status != aiproposal.StatusPending {
+		s.writeError(ctx, c, writeMu, f.ID, "already_resolved", "proposal is not pending")
+		return
+	}
+
+	auditType := "infra.proposal." + string(p.Kind)
+
+	// Guard checks BEFORE consuming the token.
+	switch p.Kind {
+	case aiproposal.KindServiceAction:
+		if s.cfg.Systemd == nil {
+			s.writeError(ctx, c, writeMu, f.ID, "unavailable", "systemd subsystem not configured")
+			return
+		}
+		name, _ := p.Params["name"].(string)
+		actStr, _ := p.Params["action"].(string)
+		act := systemd.Action(actStr)
+		if s.cfg.Systemd.IsProtected(name) && (act == systemd.ActionStop || act == systemd.ActionDisable) {
+			audit := s.auditAIProposed(auditType, fmt.Sprintf("ai-proposed %s rejected: protected unit %s", actStr, name), map[string]any{
+				"proposal_id": p.ID, "kind": p.Kind, "params": p.Params, "reason": "protected_unit",
+			})
+			_, _ = s.cfg.AIProposals.Resolve(p.ID, aiproposal.StatusRejected, "protected_unit", audit.ID)
+			s.writeError(ctx, c, writeMu, f.ID, "protected_unit", fmt.Sprintf("refused %s on protected unit %s", actStr, name))
+			return
+		}
+	case aiproposal.KindProcessKill:
+		if s.cfg.Processes == nil {
+			s.writeError(ctx, c, writeMu, f.ID, "unavailable", "process subsystem not configured")
+			return
+		}
+		pid := intFromParams(p.Params["pid"])
+		if reason, ok := s.cfg.Processes.IsProtected(ctx, pid); ok {
+			audit := s.auditAIProposed(auditType, fmt.Sprintf("ai-proposed kill rejected: protected pid %d", pid), map[string]any{
+				"proposal_id": p.ID, "kind": p.Kind, "params": p.Params, "reason": "protected_pid", "detail": reason,
+			})
+			_, _ = s.cfg.AIProposals.Resolve(p.ID, aiproposal.StatusRejected, "protected_pid", audit.ID)
+			s.writeError(ctx, c, writeMu, f.ID, "protected_pid", fmt.Sprintf("refused kill on protected pid %d: %s", pid, reason))
+			return
+		}
+	case aiproposal.KindFirewallAdd, aiproposal.KindFirewallRemove:
+		if s.cfg.Firewall == nil {
+			s.writeError(ctx, c, writeMu, f.ID, "unavailable", "firewall subsystem not configured")
+			return
+		}
+		// anti-lockout is enforced inside Firewall.RuleRemove (post-token)
+	}
+
+	// Consume the confirmation token. A token failure here is recoverable:
+	// the operator can retry the approval with a freshly-minted token, so we
+	// leave the proposal in StatusPending rather than resolving it.
+	if err := s.cfg.Review.ConsumeToken(in.ConfirmationToken, p.TokenAction, p.TokenProjectID, p.TokenFiles, ""); err != nil {
+		s.auditAIProposed(auditType, "ai-proposed token rejected: "+err.Error(), map[string]any{
+			"proposal_id": p.ID, "kind": p.Kind, "params": p.Params, "reason": "token_invalid",
+		})
+		s.writeReviewErr(ctx, c, writeMu, f.ID, err)
+		return
+	}
+
+	// Execute via the same managers human-initiated calls use.
+	execErr := s.executeProposal(ctx, p)
+	if execErr != nil {
+		audit := s.auditAIProposed(auditType, "ai-proposed execution failed: "+execErr.Error(), map[string]any{
+			"proposal_id": p.ID, "kind": p.Kind, "params": p.Params, "ok": false, "error": execErr.Error(),
+		})
+		_, _ = s.cfg.AIProposals.Resolve(p.ID, aiproposal.StatusFailed, execErr.Error(), audit.ID)
+		// Map known error classes to the same wire kinds the human path uses.
+		var pue *systemd.ProtectedUnitError
+		var ppe *agentprocess.ProtectedPIDError
+		var ale *firewall.AntiLockoutError
+		switch {
+		case errors.As(execErr, &pue):
+			s.writeError(ctx, c, writeMu, f.ID, "protected_unit", execErr.Error())
+		case errors.As(execErr, &ppe):
+			s.writeError(ctx, c, writeMu, f.ID, "protected_pid", execErr.Error())
+		case errors.As(execErr, &ale):
+			s.writeError(ctx, c, writeMu, f.ID, "anti_lockout", execErr.Error())
+		case errors.Is(execErr, agentprocess.ErrIdentityMismatch):
+			s.writeError(ctx, c, writeMu, f.ID, "process_identity_mismatch", execErr.Error())
+		case errors.Is(execErr, firewall.ErrReadOnly):
+			s.writeError(ctx, c, writeMu, f.ID, "firewall_read_only", execErr.Error())
+		default:
+			s.writeError(ctx, c, writeMu, f.ID, "exec_error", execErr.Error())
+		}
+		return
+	}
+	audit := s.auditAIProposed(auditType, "ai-proposed executed: "+p.ID, map[string]any{
+		"proposal_id": p.ID, "kind": p.Kind, "params": p.Params, "ok": true,
+	})
+	resolved, _ := s.cfg.AIProposals.Resolve(p.ID, aiproposal.StatusExecuted, "ok", audit.ID)
+	s.writeOK(ctx, c, writeMu, f.ID, "infra.proposal.approve", map[string]any{
+		"proposal": resolved,
+		"audit_id": audit.ID,
+	})
+}
+
+func (s *Server) executeProposal(ctx context.Context, p aiproposal.Proposal) error {
+	switch p.Kind {
+	case aiproposal.KindServiceAction:
+		name, _ := p.Params["name"].(string)
+		actStr, _ := p.Params["action"].(string)
+		return s.cfg.Systemd.Action(ctx, name, systemd.Action(actStr))
+	case aiproposal.KindProcessKill:
+		pid := intFromParams(p.Params["pid"])
+		startTicks := uint64FromParams(p.Params["start_time_ticks"])
+		signal, _ := p.Params["signal"].(string)
+		return s.cfg.Processes.Kill(ctx, pid, startTicks, signal)
+	case aiproposal.KindFirewallAdd:
+		rule, err := ruleFromParams(p.Params)
+		if err != nil {
+			return err
+		}
+		return s.cfg.Firewall.RuleAdd(ctx, rule)
+	case aiproposal.KindFirewallRemove:
+		rule, err := ruleFromParams(p.Params)
+		if err != nil {
+			return err
+		}
+		return s.cfg.Firewall.RuleRemove(ctx, rule)
+	}
+	return fmt.Errorf("unknown proposal kind %q", p.Kind)
 }

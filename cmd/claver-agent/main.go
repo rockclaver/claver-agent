@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"github.com/rockclaver/claver/agent/internal/aiproposal"
 	"github.com/rockclaver/claver/agent/internal/alerts"
 	"github.com/rockclaver/claver/agent/internal/cliauth"
 	"github.com/rockclaver/claver/agent/internal/docker"
@@ -153,6 +154,7 @@ func main() {
 		Processes:     processMgr,
 		Firewall:      firewallMgr,
 		Alerts:        alertMgr,
+		AIProposals:   aiproposal.New(),
 		Notifications: notificationHub,
 	})
 	ln, err := srv.Listen()
