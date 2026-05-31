@@ -34,39 +34,40 @@ const (
 type Status string
 
 const (
-	StatusPending  Status = "pending"
-	StatusExecuted Status = "executed"
-	StatusDeclined Status = "declined"
-	StatusRejected Status = "rejected" // guard or runtime rejected after approve attempt
-	StatusFailed   Status = "failed"   // execution error after token consumed
+	StatusPending   Status = "pending"
+	StatusExecuting Status = "executing" // transient: a single approver has claimed the proposal
+	StatusExecuted  Status = "executed"
+	StatusDeclined  Status = "declined"
+	StatusRejected  Status = "rejected" // guard or runtime rejected after approve attempt
+	StatusFailed    Status = "failed"   // execution error after token consumed
 )
 
 // Errors returned by the Manager.
 var (
-	ErrNotFound       = errors.New("proposal not found")
+	ErrNotFound        = errors.New("proposal not found")
 	ErrAlreadyResolved = errors.New("proposal already resolved")
-	ErrUnknownKind    = errors.New("unknown proposal kind")
+	ErrUnknownKind     = errors.New("unknown proposal kind")
 )
 
 // Proposal is one entry in the queue.
 type Proposal struct {
-	ID         string         `json:"id"`
-	Kind       Kind           `json:"kind"`
-	Params     map[string]any `json:"params"`
-	Rationale  string         `json:"rationale"`
-	SessionID  string         `json:"session_id,omitempty"`
+	ID        string         `json:"id"`
+	Kind      Kind           `json:"kind"`
+	Params    map[string]any `json:"params"`
+	Rationale string         `json:"rationale"`
+	SessionID string         `json:"session_id,omitempty"`
 	// TokenAction is the action string the confirmation token must bind to.
 	// The operator uses (TokenAction, TokenProjectID, TokenFiles) to mint a
 	// token whose action_hash matches what the server will check at approve
 	// time. This is exposed so the mobile client can compute the same hash.
-	TokenAction    string    `json:"token_action"`
-	TokenProjectID string    `json:"token_project_id"`
-	TokenFiles     []string  `json:"token_files"`
-	Status         Status    `json:"status"`
-	CreatedAt      time.Time `json:"-"`
+	TokenAction    string     `json:"token_action"`
+	TokenProjectID string     `json:"token_project_id"`
+	TokenFiles     []string   `json:"token_files"`
+	Status         Status     `json:"status"`
+	CreatedAt      time.Time  `json:"-"`
 	ResolvedAt     *time.Time `json:"-"`
-	ResolutionMsg  string    `json:"resolution_msg,omitempty"`
-	AuditID        int64     `json:"audit_id,omitempty"`
+	ResolutionMsg  string     `json:"resolution_msg,omitempty"`
+	AuditID        int64      `json:"audit_id,omitempty"`
 }
 
 // Manager owns the in-memory queue of pending and resolved proposals. It is
@@ -141,11 +142,13 @@ func (m *Manager) List() []Proposal {
 	return out
 }
 
-// Resolve marks a pending proposal as having reached terminal status. It
-// returns ErrAlreadyResolved if the proposal has already been resolved, so
-// concurrent approval attempts cannot drive a single proposal to execute
-// twice.
-func (m *Manager) Resolve(id string, status Status, msg string, auditID int64) (Proposal, error) {
+// Claim atomically moves a pending proposal into StatusExecuting so only one
+// concurrent approver can proceed to token consumption + execution. A second
+// approver racing against the first sees ErrAlreadyResolved. Use Release to
+// return the proposal to pending if the claimer's token check or guard fails
+// in a way the operator may retry; use Resolve to transition into a terminal
+// state once execution has been attempted.
+func (m *Manager) Claim(id string) (Proposal, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	p, ok := m.proposals[id]
@@ -153,6 +156,38 @@ func (m *Manager) Resolve(id string, status Status, msg string, auditID int64) (
 		return Proposal{}, ErrNotFound
 	}
 	if p.Status != StatusPending {
+		return Proposal{}, ErrAlreadyResolved
+	}
+	p.Status = StatusExecuting
+	return *p, nil
+}
+
+// Release returns a claimed proposal to pending. It is a no-op if the
+// proposal is no longer in StatusExecuting (e.g. another path already
+// resolved it), so a deferred Release is safe to call unconditionally.
+func (m *Manager) Release(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.proposals[id]
+	if !ok {
+		return
+	}
+	if p.Status == StatusExecuting {
+		p.Status = StatusPending
+	}
+}
+
+// Resolve marks a proposal as having reached terminal status. It returns
+// ErrAlreadyResolved if the proposal is already in a terminal state; both
+// StatusPending and StatusExecuting can transition to a terminal state.
+func (m *Manager) Resolve(id string, status Status, msg string, auditID int64) (Proposal, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.proposals[id]
+	if !ok {
+		return Proposal{}, ErrNotFound
+	}
+	if p.Status != StatusPending && p.Status != StatusExecuting {
 		return Proposal{}, ErrAlreadyResolved
 	}
 	now := m.Now()

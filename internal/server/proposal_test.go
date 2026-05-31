@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 
@@ -318,6 +319,118 @@ func TestProposal_ProtectedPIDRejected(t *testing.T) {
 	if signalled {
 		t.Fatal("protected pid was signalled via AI proposal")
 	}
+}
+
+// Review #3329556102 (P1): two concurrent approve calls for the same pending
+// proposal — each holding a separately-minted valid confirmation token — must
+// not both reach the executor. The proposal is atomically claimed before the
+// token is consumed, so only one approver runs the side effect; the other
+// sees already_resolved.
+func TestProposal_ConcurrentApprovesExecuteAtMostOnce(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	rm := review.New(nil, st, review.HeuristicSummarizer{})
+
+	// Gate the executor so both goroutines line up at the claim before
+	// either is allowed to actually invoke the systemd manager. This makes
+	// the race deterministic without sleeps.
+	release := make(chan struct{})
+	fc := &gatedSystemdClient{release: release}
+	sysMgr, err := systemd.New(systemd.Config{Client: fc})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pmgr := aiproposal.New()
+	cfg := Config{Addr: "127.0.0.1:0", AIProposals: pmgr, Systemd: sysMgr, Review: rm}
+
+	createPayload, _ := json.Marshal(map[string]any{
+		"kind": "infra.service.action",
+		"params": map[string]any{
+			"name": "nginx.service", "action": "restart",
+		},
+	})
+	p := proposalFromResp(t, systemdRoundTrip(t, cfg, "infra.proposal.create", createPayload))
+
+	// Two distinct confirmation tokens, both validly bound to this proposal.
+	tokA, err := rm.MintConfirmationToken(p.TokenAction, p.TokenProjectID, p.TokenFiles, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokB, err := rm.MintConfirmationToken(p.TokenAction, p.TokenProjectID, p.TokenFiles, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloadA, _ := json.Marshal(map[string]any{"id": p.ID, "confirmation_token": tokA.Token})
+	payloadB, _ := json.Marshal(map[string]any{"id": p.ID, "confirmation_token": tokB.Token})
+
+	var wg sync.WaitGroup
+	respC := make(chan Frame, 2)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		respC <- systemdRoundTrip(t, cfg, "infra.proposal.approve", payloadA)
+	}()
+	go func() {
+		defer wg.Done()
+		respC <- systemdRoundTrip(t, cfg, "infra.proposal.approve", payloadB)
+	}()
+	// Allow the executor to proceed once both goroutines are likely past
+	// the claim. The gate is buffered enough that both goroutines complete
+	// (one with success, one with already_resolved) regardless of arrival
+	// order.
+	close(release)
+	wg.Wait()
+	close(respC)
+
+	var okCount, racedCount int
+	for resp := range respC {
+		switch resp.Kind {
+		case "infra.proposal.approve":
+			okCount++
+		case "error.already_resolved":
+			racedCount++
+		default:
+			t.Fatalf("unexpected kind %q payload=%s", resp.Kind, resp.Payload)
+		}
+	}
+	if okCount != 1 || racedCount != 1 {
+		t.Fatalf("expected exactly one success + one already_resolved, got ok=%d raced=%d", okCount, racedCount)
+	}
+	if got := fc.calls(); got != 1 {
+		t.Fatalf("executor invoked %d times, want exactly 1", got)
+	}
+}
+
+// gatedSystemdClient blocks Action() until release is closed so the test can
+// stage two approval goroutines past the claim before either executes.
+type gatedSystemdClient struct {
+	release chan struct{}
+	mu      sync.Mutex
+	count   int
+}
+
+func (g *gatedSystemdClient) Available(_ context.Context) error { return nil }
+func (g *gatedSystemdClient) List(_ context.Context) ([]systemd.Unit, error) {
+	return nil, nil
+}
+func (g *gatedSystemdClient) Get(_ context.Context, _ string) (systemd.UnitDetail, error) {
+	return systemd.UnitDetail{}, nil
+}
+func (g *gatedSystemdClient) Action(_ context.Context, _ string, _ systemd.Action) error {
+	<-g.release
+	g.mu.Lock()
+	g.count++
+	g.mu.Unlock()
+	return nil
+}
+func (g *gatedSystemdClient) calls() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.count
 }
 
 // AC #46.4: AI-proposed firewall edit covering the active SSH port is

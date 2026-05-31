@@ -2774,6 +2774,25 @@ func (s *Server) handleProposalApprove(ctx context.Context, c *websocket.Conn, w
 	}
 
 	auditType := "infra.proposal." + string(p.Kind)
+	// Pre-emptively claim the proposal so a second concurrent approve cannot
+	// also consume a (different) confirmation token and double-execute the
+	// underlying action. The claim is released on any recoverable failure
+	// path (token rejected) so the operator can retry; terminal outcomes
+	// transition straight from StatusExecuting to a resolved status.
+	claimed, claimErr := s.cfg.AIProposals.Claim(p.ID)
+	if claimErr != nil {
+		s.writeError(ctx, c, writeMu, f.ID, "already_resolved", claimErr.Error())
+		return
+	}
+	p = claimed
+	released := false
+	releaseOnce := func() {
+		if !released {
+			s.cfg.AIProposals.Release(p.ID)
+			released = true
+		}
+	}
+	defer releaseOnce()
 
 	// Guard checks BEFORE consuming the token.
 	switch p.Kind {
