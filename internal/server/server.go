@@ -30,6 +30,7 @@ import (
 	agentprocess "github.com/rockclaver/claver/agent/internal/process"
 	"github.com/rockclaver/claver/agent/internal/projects"
 	"github.com/rockclaver/claver/agent/internal/review"
+	"github.com/rockclaver/claver/agent/internal/runbook"
 	"github.com/rockclaver/claver/agent/internal/sessions"
 	"github.com/rockclaver/claver/agent/internal/store"
 	"github.com/rockclaver/claver/agent/internal/systemd"
@@ -90,6 +91,12 @@ type Config struct {
 	Notifications *notifications.Hub
 	// Inbox, when non-nil, enables inbox.* kinds (unified triage feed).
 	Inbox *inbox.Manager
+	// Runbook, when non-nil, enables infra.runbook.* kinds and surfaces
+	// the AI-proposed remediation queue (Stickiness #4).
+	Runbook *runbook.Manager
+	// PushDevices, when non-nil, enables push.register / push.unregister
+	// for FCM device-token management.
+	PushDevices *store.Store
 }
 
 // Server is the agent's control-plane server.
@@ -460,6 +467,11 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 		s.dispatchGitHub(ctx, c, writeMu, f)
 	case "inbox.list", "inbox.stream":
 		s.dispatchInbox(ctx, c, writeMu, f)
+	case "infra.runbook.list",
+		"infra.runbook.get":
+		s.dispatchRunbook(ctx, c, writeMu, f)
+	case "push.register", "push.unregister", "push.list":
+		s.dispatchPush(ctx, c, writeMu, f)
 	default:
 		s.writeError(ctx, c, writeMu, f.ID, "unknown_kind", f.Kind)
 	}
@@ -2912,6 +2924,88 @@ func (s *Server) executeProposal(ctx context.Context, p aiproposal.Proposal) err
 		return s.cfg.Firewall.RuleRemove(ctx, rule)
 	}
 	return fmt.Errorf("unknown proposal kind %q", p.Kind)
+}
+
+// dispatchRunbook surfaces the runbook.Manager's queue. Mutations are NOT
+// exposed: a runbook is created server-side from an alert, and its steps are
+// approved via the existing infra.proposal.approve path (which already routes
+// through biometric + confirmation token).
+func (s *Server) dispatchRunbook(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
+	if s.cfg.Runbook == nil {
+		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "runbook subsystem not configured")
+		return
+	}
+	switch f.Kind {
+	case "infra.runbook.list":
+		s.writeOK(ctx, c, writeMu, f.ID, "infra.runbook.list", map[string]any{
+			"runbooks": s.cfg.Runbook.List(),
+		})
+	case "infra.runbook.get":
+		var in struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
+			return
+		}
+		rb, ok := s.cfg.Runbook.Get(in.ID)
+		if !ok {
+			s.writeError(ctx, c, writeMu, f.ID, "not_found", "runbook "+in.ID)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "infra.runbook.get", map[string]any{
+			"runbook": rb,
+		})
+	}
+}
+
+// dispatchPush owns FCM device-token registration. Tokens are stored on the
+// host so the agent can fan push messages to every device that has connected
+// to this server — no external device-registry service is required.
+func (s *Server) dispatchPush(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
+	if s.cfg.PushDevices == nil {
+		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "push subsystem not configured")
+		return
+	}
+	switch f.Kind {
+	case "push.register":
+		var in struct {
+			Token    string `json:"token"`
+			Platform string `json:"platform"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Token == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "token required")
+			return
+		}
+		err := s.cfg.PushDevices.PutPushDevice(store.PushDevice{
+			Token: in.Token, Platform: in.Platform, LastSeenAt: s.cfg.Now(),
+		})
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "push.register", map[string]any{"ok": true})
+	case "push.unregister":
+		var in struct {
+			Token string `json:"token"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Token == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "token required")
+			return
+		}
+		if err := s.cfg.PushDevices.DeletePushDevice(in.Token); err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "push.unregister", map[string]any{"ok": true})
+	case "push.list":
+		devices, err := s.cfg.PushDevices.ListPushDevices()
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "push.list", map[string]any{"devices": devices})
+	}
 }
 
 func (s *Server) dispatchInbox(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {

@@ -8,8 +8,61 @@ import (
 	"github.com/rockclaver/claver/agent/internal/aiproposal"
 	"github.com/rockclaver/claver/agent/internal/alerts"
 	"github.com/rockclaver/claver/agent/internal/notifications"
+	"github.com/rockclaver/claver/agent/internal/runbook"
 	"github.com/rockclaver/claver/agent/internal/store"
 )
+
+// RunbookSource yields one inbox item per AI-proposed runbook. We surface
+// runbooks (rather than just their individual fanned-out aiproposals) so the
+// operator sees the cohesive remediation plan at the top of the feed and can
+// deep-link into the multi-step approval card with one tap.
+type RunbookSource struct{ Mgr *runbook.Manager }
+
+func (s *RunbookSource) Items(_ context.Context) ([]Item, error) {
+	if s == nil || s.Mgr == nil {
+		return nil, nil
+	}
+	books := s.Mgr.List()
+	out := make([]Item, 0, len(books))
+	for _, rb := range books {
+		// "no automated fix" runbooks: surface so the operator sees the
+		// AI considered the alert, but mark non-actionable.
+		actionable := !rb.Skipped && len(rb.ProposalIDs) > 0
+		severity := "info"
+		switch rb.Risk {
+		case runbook.RiskHigh:
+			severity = "critical"
+		case runbook.RiskMedium:
+			severity = "warning"
+		}
+		body := rb.Summary
+		if rb.Skipped && rb.SkippedMsg != "" {
+			body = rb.SkippedMsg
+		}
+		out = append(out, Item{
+			ID:         "ai_runbook:" + rb.ID,
+			Type:       TypeAIRunbook,
+			Title:      "AI runbook: " + rb.Rule,
+			Body:       body,
+			Severity:   severity,
+			CreatedAt:  rb.CreatedAt,
+			Actionable: actionable,
+			ActionKind: "infra.runbook.open",
+			Data: map[string]any{
+				"runbook_id":   rb.ID,
+				"server_id":    rb.ServerID,
+				"rule":         rb.Rule,
+				"target":       rb.Target,
+				"step_count":   len(rb.Steps),
+				"proposal_ids": rb.ProposalIDs,
+				"risk":         string(rb.Risk),
+				"deep_link":    "runbook/" + rb.ID,
+				"skipped":      rb.Skipped,
+			},
+		})
+	}
+	return out, nil
+}
 
 // ProposalSource yields one inbox item per pending AI proposal.
 type ProposalSource struct{ Mgr *aiproposal.Manager }

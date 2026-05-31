@@ -21,7 +21,9 @@ import (
 	"github.com/rockclaver/claver/agent/internal/previews"
 	agentprocess "github.com/rockclaver/claver/agent/internal/process"
 	"github.com/rockclaver/claver/agent/internal/projects"
+	"github.com/rockclaver/claver/agent/internal/push"
 	"github.com/rockclaver/claver/agent/internal/review"
+	"github.com/rockclaver/claver/agent/internal/runbook"
 	"github.com/rockclaver/claver/agent/internal/server"
 	"github.com/rockclaver/claver/agent/internal/sessions"
 	"github.com/rockclaver/claver/agent/internal/store"
@@ -35,6 +37,8 @@ func main() {
 	dataDir := flag.String("data-dir", defaultDataDir(), "directory for state.db and project workspaces")
 	caddyFragmentsDir := flag.String("caddy-fragments-dir", envOr("CLAVER_CADDY_FRAGMENTS_DIR", "/etc/caddy/claver"), "directory for per-preview Caddy site blocks")
 	previewExpectedIP := flag.String("preview-expected-ip", os.Getenv("CLAVER_PREVIEW_EXPECTED_IP"), "if set, DNS validation requires the wildcard to resolve to this IP")
+	fcmServiceAccount := flag.String("fcm-service-account", envOr("CLAVER_FCM_SERVICE_ACCOUNT", ""), "path to Firebase service-account JSON; enables server-side push when set")
+	runbookAgent := flag.String("runbook-agent", envOr("CLAVER_RUNBOOK_AGENT", "claude"), "AI CLI to use for runbook generation (claude|codex)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -142,10 +146,48 @@ func main() {
 
 	aiProposalMgr := aiproposal.New()
 
+	// Runbook turns fired alerts into AI-proposed remediations that fan out
+	// through the existing aiproposal queue. The proposer shells out to the
+	// host-installed claude/codex CLI (already authenticated via cliauth),
+	// so we add no second auth surface.
+	runbookMgr, err := runbook.New(runbook.Config{
+		AIProposals: aiProposalMgr,
+		Proposer: runbook.CLIProposer{
+			Agent:   *runbookAgent,
+			BinDir:  toolingMgr.BinDir(),
+			HomeDir: homeDirOr(*dataDir),
+			Secrets: authMgr.Secrets,
+		},
+		Snapshotter: runbook.SnapshotFunc(func(ctx context.Context) runbook.Grounding {
+			g := runbook.Grounding{Metrics: infraMgr.Sample(ctx)}
+			if systemdMgr != nil {
+				if units, err := systemdMgr.List(ctx); err == nil {
+					g.Services = units
+				}
+			}
+			if processMgr != nil {
+				if procs, err := processMgr.List(ctx, "cpu", 50); err == nil {
+					g.Processes = procs
+				}
+			}
+			if firewallMgr != nil {
+				if st, err := firewallMgr.Status(ctx); err == nil {
+					g.Firewall = st
+				}
+			}
+			return g
+		}),
+		Notifications: notificationHub,
+	})
+	if err != nil {
+		log.Fatalf("claver-agent: init runbook: %v", err)
+	}
+
 	inboxMgr := inbox.New()
 	inboxMgr.AddSource(&inbox.ProposalSource{Mgr: aiProposalMgr})
 	inboxMgr.AddSource(&inbox.AlertSource{Mgr: alertMgr})
 	inboxMgr.AddSource(&inbox.SessionSource{Store: st})
+	inboxMgr.AddSource(&inbox.RunbookSource{Mgr: runbookMgr})
 	githubSource := &inbox.GitHubSource{
 		GitHub:  githubMgr,
 		Store:   st,
@@ -173,6 +215,8 @@ func main() {
 		AIProposals:   aiProposalMgr,
 		Notifications: notificationHub,
 		Inbox:         inboxMgr,
+		Runbook:       runbookMgr,
+		PushDevices:   st,
 	})
 	ln, err := srv.Listen()
 	if err != nil {
@@ -187,6 +231,31 @@ func main() {
 	}
 	sessionMgr.StartReaper(ctx, 0)
 	alertMgr.Start(ctx)
+	runbookCleanup := runbookMgr.Start(ctx)
+	defer runbookCleanup()
+
+	// FCM push: optional. The agent stays fully functional without it (the
+	// notification hub + inbox keep delivering to connected sockets). With
+	// a service-account JSON, we additionally fan high-signal events out
+	// as system-level push so a backgrounded device still wakes the user.
+	if *fcmServiceAccount != "" {
+		sa, err := push.LoadServiceAccount(*fcmServiceAccount)
+		if err != nil {
+			log.Printf("claver-agent: FCM disabled: %v", err)
+		} else {
+			pushClient := push.NewClient(sa, nil)
+			pushHub := &push.Hub{
+				Sender: pushClient,
+				Store:  st,
+				Types:  map[string]bool{"infra.alert": true, "infra.runbook": true},
+				Logf:   log.Printf,
+			}
+			pushCleanup := pushHub.Subscribe(ctx, notificationHub)
+			defer pushCleanup()
+			log.Printf("claver-agent: FCM push enabled (project %s)", sa.ProjectID)
+		}
+	}
+
 	githubSource.Start(ctx)
 	if err := srv.Serve(ctx, ln); err != nil {
 		log.Fatalf("claver-agent serve: %v", err)

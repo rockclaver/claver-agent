@@ -124,6 +124,18 @@ type GitHubToken struct {
 	UpdatedAt      time.Time
 }
 
+// PushDevice is one registered mobile device that can receive FCM-delivered
+// push notifications from this agent. We keep the registry on-host (rather
+// than in a separate cloud service) so the agent has no external dependency
+// for the device list — the FCM service-account JSON is the only off-host
+// credential it needs.
+type PushDevice struct {
+	Token        string
+	Platform     string // "ios" | "android"
+	RegisteredAt time.Time
+	LastSeenAt   time.Time
+}
+
 // CliToken stores the encrypted credential material for one CLI (claude or
 // codex). Method records how the credential was obtained so callers can
 // reconstruct the right env vars / on-disk file when launching sessions.
@@ -275,6 +287,13 @@ CREATE TABLE IF NOT EXISTS cli_tokens (
 	ciphertext_path TEXT NOT NULL,
 	created_at      INTEGER NOT NULL,
 	updated_at      INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS push_devices (
+	token         TEXT PRIMARY KEY,
+	platform      TEXT NOT NULL DEFAULT '',
+	registered_at INTEGER NOT NULL,
+	last_seen_at  INTEGER NOT NULL
 );
 `)
 	return err
@@ -983,6 +1002,62 @@ func (s *Store) PutAgentSetting(key, value string) error {
 		key, value,
 	)
 	return err
+}
+
+// PutPushDevice upserts a device token. RegisteredAt is preserved on update;
+// LastSeenAt is always bumped to now (or to the value supplied by the caller
+// if non-zero), so the agent can later prune stale tokens that FCM has
+// rejected as unregistered.
+func (s *Store) PutPushDevice(d PushDevice) error {
+	if d.Token == "" {
+		return errors.New("push device token required")
+	}
+	now := d.LastSeenAt
+	if now.IsZero() {
+		now = time.Now()
+	}
+	reg := d.RegisteredAt
+	if reg.IsZero() {
+		reg = now
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO push_devices (token, platform, registered_at, last_seen_at)
+		 VALUES (?, ?, ?, ?)
+		 ON CONFLICT(token) DO UPDATE SET
+		   platform = excluded.platform,
+		   last_seen_at = excluded.last_seen_at`,
+		d.Token, d.Platform, reg.Unix(), now.Unix(),
+	)
+	return err
+}
+
+// DeletePushDevice removes a device token. No-op if the token was already
+// gone, so a client unregister + server-side prune of an unregistered token
+// can race without an error.
+func (s *Store) DeletePushDevice(token string) error {
+	_, err := s.db.Exec(`DELETE FROM push_devices WHERE token = ?`, token)
+	return err
+}
+
+// ListPushDevices returns every registered device.
+func (s *Store) ListPushDevices() ([]PushDevice, error) {
+	rows, err := s.db.Query(`SELECT token, platform, registered_at, last_seen_at FROM push_devices ORDER BY registered_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PushDevice
+	for rows.Next() {
+		var d PushDevice
+		var reg, seen int64
+		if err := rows.Scan(&d.Token, &d.Platform, &reg, &seen); err != nil {
+			return nil, err
+		}
+		d.RegisteredAt = time.Unix(reg, 0)
+		d.LastSeenAt = time.Unix(seen, 0)
+		out = append(out, d)
+	}
+	return out, rows.Err()
 }
 
 func nullableUnix(t *time.Time) any {

@@ -27,6 +27,7 @@ const (
 	TypeSessionFinished Type = "session_finished"
 	TypeCIFailed        Type = "ci_failed"
 	TypePRReview        Type = "pr_review"
+	TypeAIRunbook       Type = "ai_runbook"
 )
 
 // Item is one entry in the unified feed.
