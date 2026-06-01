@@ -1,3 +1,5 @@
+.DS_Store
+
 dist/
 e2e-smoke
 claver-agent
