@@ -14,19 +14,19 @@ import (
 
 	"nhooyr.io/websocket"
 
-	"github.com/rockclaver/claver/agent/internal/alerts"
-	"github.com/rockclaver/claver/agent/internal/cliauth"
-	"github.com/rockclaver/claver/agent/internal/docker"
-	"github.com/rockclaver/claver/agent/internal/firewall"
-	gh "github.com/rockclaver/claver/agent/internal/github"
-	"github.com/rockclaver/claver/agent/internal/infra"
-	agentprocess "github.com/rockclaver/claver/agent/internal/process"
-	"github.com/rockclaver/claver/agent/internal/projects"
-	"github.com/rockclaver/claver/agent/internal/review"
-	"github.com/rockclaver/claver/agent/internal/sessions"
-	"github.com/rockclaver/claver/agent/internal/store"
-	"github.com/rockclaver/claver/agent/internal/systemd"
-	"github.com/rockclaver/claver/agent/internal/version"
+	"github.com/rockclaver/claver-agent/internal/alerts"
+	"github.com/rockclaver/claver-agent/internal/cliauth"
+	"github.com/rockclaver/claver-agent/internal/docker"
+	"github.com/rockclaver/claver-agent/internal/firewall"
+	gh "github.com/rockclaver/claver-agent/internal/github"
+	"github.com/rockclaver/claver-agent/internal/infra"
+	agentprocess "github.com/rockclaver/claver-agent/internal/process"
+	"github.com/rockclaver/claver-agent/internal/projects"
+	"github.com/rockclaver/claver-agent/internal/review"
+	"github.com/rockclaver/claver-agent/internal/sessions"
+	"github.com/rockclaver/claver-agent/internal/store"
+	"github.com/rockclaver/claver-agent/internal/systemd"
+	"github.com/rockclaver/claver-agent/internal/version"
 )
 
 type fakeSessionRuntime struct{}

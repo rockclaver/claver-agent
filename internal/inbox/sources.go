@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/rockclaver/claver/agent/internal/aiproposal"
-	"github.com/rockclaver/claver/agent/internal/alerts"
-	"github.com/rockclaver/claver/agent/internal/notifications"
-	"github.com/rockclaver/claver/agent/internal/runbook"
-	"github.com/rockclaver/claver/agent/internal/store"
+	"github.com/rockclaver/claver-agent/internal/aiproposal"
+	"github.com/rockclaver/claver-agent/internal/alerts"
+	"github.com/rockclaver/claver-agent/internal/notifications"
+	"github.com/rockclaver/claver-agent/internal/runbook"
+	"github.com/rockclaver/claver-agent/internal/store"
 )
 
 // RunbookSource yields one inbox item per AI-proposed runbook. We surface

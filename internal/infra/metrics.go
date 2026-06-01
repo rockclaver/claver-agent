@@ -432,6 +432,9 @@ func parseMounts(b []byte, err error) ([]mount, error) {
 			continue
 		}
 		path := unescapeMount(fields[1])
+		if isPseudoMountPath(path) {
+			continue
+		}
 		if _, ok := seen[path]; ok {
 			continue
 		}
@@ -446,6 +449,20 @@ func parseMounts(b []byte, err error) ([]mount, error) {
 
 func unescapeMount(s string) string {
 	return strings.ReplaceAll(s, `\040`, " ")
+}
+
+// isPseudoMountPath reports whether a mount lives under a kernel/runtime
+// pseudo-filesystem tree (/proc, /sys, /dev, /run). Nothing mounted there is a
+// real disk; in particular Docker's internal mounts (/run/docker/netns/*,
+// container shim mounts) reject statfs with EACCES and would otherwise surface
+// in the Disks overview as permission-denied entries.
+func isPseudoMountPath(path string) bool {
+	for _, root := range []string{"/proc", "/sys", "/dev", "/run"} {
+		if path == root || strings.HasPrefix(path, root+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Manager) collectDisks(mounts []mount) []DiskMetric {

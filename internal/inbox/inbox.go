@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rockclaver/claver/agent/internal/store"
+	"github.com/rockclaver/claver-agent/internal/store"
 )
 
 // Type enumerates the source types of inbox items.

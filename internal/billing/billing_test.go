@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rockclaver/claver/agent/internal/store"
+	"github.com/rockclaver/claver-agent/internal/store"
 )
 
 func newVault(t *testing.T) *Vault {

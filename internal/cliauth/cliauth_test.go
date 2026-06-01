@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/rockclaver/claver/agent/internal/github"
-	"github.com/rockclaver/claver/agent/internal/store"
+	"github.com/rockclaver/claver-agent/internal/github"
+	"github.com/rockclaver/claver-agent/internal/store"
 )
 
 func newTestManager(t *testing.T) *Manager {

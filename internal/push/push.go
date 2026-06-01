@@ -36,8 +36,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rockclaver/claver/agent/internal/notifications"
-	"github.com/rockclaver/claver/agent/internal/store"
+	"github.com/rockclaver/claver-agent/internal/notifications"
+	"github.com/rockclaver/claver-agent/internal/store"
 )
 
 // fcmAPIURL is the FCM HTTP v1 send endpoint template. The {project} segment

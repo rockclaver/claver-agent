@@ -22,7 +22,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rockclaver/claver/agent/internal/store"
+	"github.com/rockclaver/claver-agent/internal/store"
 )
 
 // Memory kinds. The set is closed so the UI can render a fixed filter list and

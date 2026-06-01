@@ -11,8 +11,8 @@ import (
 
 	"nhooyr.io/websocket"
 
-	"github.com/rockclaver/claver/agent/internal/memory"
-	"github.com/rockclaver/claver/agent/internal/store"
+	"github.com/rockclaver/claver-agent/internal/memory"
+	"github.com/rockclaver/claver-agent/internal/store"
 )
 
 var rtSeq atomic.Int64

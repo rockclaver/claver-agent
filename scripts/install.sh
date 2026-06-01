@@ -16,8 +16,8 @@
 set -euo pipefail
 
 VERSION="${VERSION:-latest}"
-RELEASE_BASE="${RELEASE_BASE:-https://github.com/rockclaver/claver/releases/download}"
-RELEASES_LATEST_URL="${RELEASES_LATEST_URL:-https://github.com/rockclaver/claver/releases/latest}"
+RELEASE_BASE="${RELEASE_BASE:-https://github.com/rockclaver/claver-agent/releases/download}"
+RELEASES_LATEST_URL="${RELEASES_LATEST_URL:-https://github.com/rockclaver/claver-agent/releases/latest}"
 BIN_DST="/usr/local/bin/claver-agent"
 UNIT_DST="/etc/systemd/system/claver-agent.service"
 STATE_DIR="/var/lib/claver"

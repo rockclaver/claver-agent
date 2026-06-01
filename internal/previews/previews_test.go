@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rockclaver/claver/agent/internal/projects"
-	"github.com/rockclaver/claver/agent/internal/store"
+	"github.com/rockclaver/claver-agent/internal/projects"
+	"github.com/rockclaver/claver-agent/internal/store"
 )
 
 // --- fakes -----------------------------------------------------------------

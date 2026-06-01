@@ -10,30 +10,31 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/rockclaver/claver/agent/internal/aiproposal"
-	"github.com/rockclaver/claver/agent/internal/alerts"
-	"github.com/rockclaver/claver/agent/internal/billing"
-	"github.com/rockclaver/claver/agent/internal/cliauth"
-	"github.com/rockclaver/claver/agent/internal/cost"
-	"github.com/rockclaver/claver/agent/internal/docker"
-	"github.com/rockclaver/claver/agent/internal/firewall"
-	gh "github.com/rockclaver/claver/agent/internal/github"
-	"github.com/rockclaver/claver/agent/internal/inbox"
-	"github.com/rockclaver/claver/agent/internal/infra"
-	"github.com/rockclaver/claver/agent/internal/memory"
-	"github.com/rockclaver/claver/agent/internal/notifications"
-	"github.com/rockclaver/claver/agent/internal/previews"
-	agentprocess "github.com/rockclaver/claver/agent/internal/process"
-	"github.com/rockclaver/claver/agent/internal/projects"
-	"github.com/rockclaver/claver/agent/internal/push"
-	"github.com/rockclaver/claver/agent/internal/review"
-	"github.com/rockclaver/claver/agent/internal/runbook"
-	"github.com/rockclaver/claver/agent/internal/server"
-	"github.com/rockclaver/claver/agent/internal/sessions"
-	"github.com/rockclaver/claver/agent/internal/store"
-	"github.com/rockclaver/claver/agent/internal/systemd"
-	"github.com/rockclaver/claver/agent/internal/tooling"
-	"github.com/rockclaver/claver/agent/internal/version"
+	"github.com/rockclaver/claver-agent/internal/aiproposal"
+	"github.com/rockclaver/claver-agent/internal/alerts"
+	"github.com/rockclaver/claver-agent/internal/billing"
+	"github.com/rockclaver/claver-agent/internal/cliauth"
+	"github.com/rockclaver/claver-agent/internal/cost"
+	"github.com/rockclaver/claver-agent/internal/docker"
+	"github.com/rockclaver/claver-agent/internal/firewall"
+	gh "github.com/rockclaver/claver-agent/internal/github"
+	"github.com/rockclaver/claver-agent/internal/inbox"
+	"github.com/rockclaver/claver-agent/internal/infra"
+	"github.com/rockclaver/claver-agent/internal/memory"
+	"github.com/rockclaver/claver-agent/internal/notifications"
+	"github.com/rockclaver/claver-agent/internal/previews"
+	agentprocess "github.com/rockclaver/claver-agent/internal/process"
+	"github.com/rockclaver/claver-agent/internal/projects"
+	"github.com/rockclaver/claver-agent/internal/push"
+	"github.com/rockclaver/claver-agent/internal/review"
+	"github.com/rockclaver/claver-agent/internal/runbook"
+	"github.com/rockclaver/claver-agent/internal/server"
+	"github.com/rockclaver/claver-agent/internal/sessions"
+	"github.com/rockclaver/claver-agent/internal/skills"
+	"github.com/rockclaver/claver-agent/internal/store"
+	"github.com/rockclaver/claver-agent/internal/systemd"
+	"github.com/rockclaver/claver-agent/internal/tooling"
+	"github.com/rockclaver/claver-agent/internal/version"
 )
 
 func main() {
@@ -240,6 +241,7 @@ func main() {
 		Addr:          *addr,
 		Projects:      mgr,
 		Sessions:      sessionMgr,
+		Skills:        skills.New(homeDirOr(*dataDir)),
 		Review:        reviewMgr,
 		GitHub:        githubMgr,
 		Previews:      previewMgr,

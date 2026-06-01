@@ -25,8 +25,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/rockclaver/claver/agent/internal/projects"
-	"github.com/rockclaver/claver/agent/internal/store"
+	"github.com/rockclaver/claver-agent/internal/projects"
+	"github.com/rockclaver/claver-agent/internal/store"
 )
 
 // SettingBaseDomain is the agent_settings key holding the user's wildcard

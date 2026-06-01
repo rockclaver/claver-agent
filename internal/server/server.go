@@ -17,28 +17,29 @@ import (
 
 	"nhooyr.io/websocket"
 
-	"github.com/rockclaver/claver/agent/internal/aiproposal"
-	"github.com/rockclaver/claver/agent/internal/alerts"
-	"github.com/rockclaver/claver/agent/internal/billing"
-	"github.com/rockclaver/claver/agent/internal/cliauth"
-	"github.com/rockclaver/claver/agent/internal/cost"
-	"github.com/rockclaver/claver/agent/internal/docker"
-	"github.com/rockclaver/claver/agent/internal/firewall"
-	gh "github.com/rockclaver/claver/agent/internal/github"
-	"github.com/rockclaver/claver/agent/internal/inbox"
-	"github.com/rockclaver/claver/agent/internal/infra"
-	"github.com/rockclaver/claver/agent/internal/memory"
-	"github.com/rockclaver/claver/agent/internal/notifications"
-	"github.com/rockclaver/claver/agent/internal/previews"
-	agentprocess "github.com/rockclaver/claver/agent/internal/process"
-	"github.com/rockclaver/claver/agent/internal/projects"
-	"github.com/rockclaver/claver/agent/internal/review"
-	"github.com/rockclaver/claver/agent/internal/runbook"
-	"github.com/rockclaver/claver/agent/internal/sessions"
-	"github.com/rockclaver/claver/agent/internal/store"
-	"github.com/rockclaver/claver/agent/internal/systemd"
-	"github.com/rockclaver/claver/agent/internal/tooling"
-	"github.com/rockclaver/claver/agent/internal/version"
+	"github.com/rockclaver/claver-agent/internal/aiproposal"
+	"github.com/rockclaver/claver-agent/internal/alerts"
+	"github.com/rockclaver/claver-agent/internal/billing"
+	"github.com/rockclaver/claver-agent/internal/cliauth"
+	"github.com/rockclaver/claver-agent/internal/cost"
+	"github.com/rockclaver/claver-agent/internal/docker"
+	"github.com/rockclaver/claver-agent/internal/firewall"
+	gh "github.com/rockclaver/claver-agent/internal/github"
+	"github.com/rockclaver/claver-agent/internal/inbox"
+	"github.com/rockclaver/claver-agent/internal/infra"
+	"github.com/rockclaver/claver-agent/internal/memory"
+	"github.com/rockclaver/claver-agent/internal/notifications"
+	"github.com/rockclaver/claver-agent/internal/previews"
+	agentprocess "github.com/rockclaver/claver-agent/internal/process"
+	"github.com/rockclaver/claver-agent/internal/projects"
+	"github.com/rockclaver/claver-agent/internal/review"
+	"github.com/rockclaver/claver-agent/internal/runbook"
+	"github.com/rockclaver/claver-agent/internal/sessions"
+	"github.com/rockclaver/claver-agent/internal/skills"
+	"github.com/rockclaver/claver-agent/internal/store"
+	"github.com/rockclaver/claver-agent/internal/systemd"
+	"github.com/rockclaver/claver-agent/internal/tooling"
+	"github.com/rockclaver/claver-agent/internal/version"
 )
 
 // Frame is the JSON envelope used on the wire.
@@ -64,6 +65,9 @@ type Config struct {
 	Projects *projects.Manager
 	// Sessions, when non-nil, enables the session.* kinds.
 	Sessions *sessions.Manager
+	// Skills, when non-nil, enables the skills.list kind (prompt-composer
+	// autocomplete for installed skills + built-in commands).
+	Skills *skills.Manager
 	// Review, when non-nil, enables the diff.*, review.*, auth.confirm,
 	// and audit.list kinds.
 	Review *review.Manager
@@ -396,6 +400,8 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 		"session.subscribe",
 		"session.download":
 		s.dispatchSession(ctx, c, writeMu, f)
+	case "skills.list":
+		s.dispatchSkills(ctx, c, writeMu, f)
 	case "diff.status",
 		"diff.file",
 		"diff.summarize",
@@ -836,6 +842,44 @@ func (s *Server) dispatchSession(ctx context.Context, c *websocket.Conn, writeMu
 			}
 		}()
 	}
+}
+
+// SkillItemDTO is the wire shape of one pickable skill or command.
+type SkillItemDTO struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+func (s *Server) dispatchSkills(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
+	if s.cfg.Skills == nil {
+		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "skills subsystem not configured")
+		return
+	}
+	var in struct {
+		Agent string `json:"agent"`
+	}
+	if err := json.Unmarshal(f.Payload, &in); err != nil || in.Agent == "" {
+		s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "agent required")
+		return
+	}
+	cat, err := s.cfg.Skills.List(in.Agent)
+	if err != nil {
+		s.writeError(ctx, c, writeMu, f.ID, "bad_agent", err.Error())
+		return
+	}
+	s.writeOK(ctx, c, writeMu, f.ID, "skills.list", map[string]any{
+		"agent":    cat.Agent,
+		"skills":   toSkillItemDTOs(cat.Skills),
+		"commands": toSkillItemDTOs(cat.Commands),
+	})
+}
+
+func toSkillItemDTOs(items []skills.Item) []SkillItemDTO {
+	out := make([]SkillItemDTO, 0, len(items))
+	for _, it := range items {
+		out = append(out, SkillItemDTO{Name: it.Name, Description: it.Description})
+	}
+	return out
 }
 
 // ChangedFileDTO is the wire shape of one row in diff.status.

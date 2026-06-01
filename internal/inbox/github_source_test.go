@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	gh "github.com/rockclaver/claver/agent/internal/github"
-	"github.com/rockclaver/claver/agent/internal/store"
+	gh "github.com/rockclaver/claver-agent/internal/github"
+	"github.com/rockclaver/claver-agent/internal/store"
 )
 
 func TestGitHubRepoFromURL(t *testing.T) {

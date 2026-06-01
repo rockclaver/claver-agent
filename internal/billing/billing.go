@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rockclaver/claver/agent/internal/store"
+	"github.com/rockclaver/claver-agent/internal/store"
 )
 
 // Errors surfaced to the server layer.

@@ -9,10 +9,10 @@ import (
 
 	"nhooyr.io/websocket"
 
-	"github.com/rockclaver/claver/agent/internal/aiproposal"
-	"github.com/rockclaver/claver/agent/internal/notifications"
-	"github.com/rockclaver/claver/agent/internal/runbook"
-	"github.com/rockclaver/claver/agent/internal/store"
+	"github.com/rockclaver/claver-agent/internal/aiproposal"
+	"github.com/rockclaver/claver-agent/internal/notifications"
+	"github.com/rockclaver/claver-agent/internal/runbook"
+	"github.com/rockclaver/claver-agent/internal/store"
 )
 
 type stubRunbookProposer struct{ p runbook.Proposal }

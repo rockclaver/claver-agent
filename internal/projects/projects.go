@@ -14,7 +14,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/rockclaver/claver/agent/internal/store"
+	"github.com/rockclaver/claver-agent/internal/store"
 )
 
 // ErrDirtyTree signals that a branch operation refused to act on a workspace

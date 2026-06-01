@@ -21,8 +21,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rockclaver/claver/agent/internal/aiproposal"
-	"github.com/rockclaver/claver/agent/internal/notifications"
+	"github.com/rockclaver/claver-agent/internal/aiproposal"
+	"github.com/rockclaver/claver-agent/internal/notifications"
 )
 
 // DefaultThrottle is the minimum gap between two auto-proposals for the same

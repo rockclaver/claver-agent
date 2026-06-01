@@ -7,10 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rockclaver/claver/agent/internal/infra"
-	"github.com/rockclaver/claver/agent/internal/notifications"
-	"github.com/rockclaver/claver/agent/internal/store"
-	"github.com/rockclaver/claver/agent/internal/systemd"
+	"github.com/rockclaver/claver-agent/internal/infra"
+	"github.com/rockclaver/claver-agent/internal/notifications"
+	"github.com/rockclaver/claver-agent/internal/store"
+	"github.com/rockclaver/claver-agent/internal/systemd"
 )
 
 type fakeMetrics struct {

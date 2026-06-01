@@ -11,7 +11,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/rockclaver/claver/agent/internal/store"
+	"github.com/rockclaver/claver-agent/internal/store"
 )
 
 // journalKindPR is the project-journal entry kind that counts as a shipped PR.

@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rockclaver/claver/agent/internal/billing"
-	"github.com/rockclaver/claver/agent/internal/cost"
-	"github.com/rockclaver/claver/agent/internal/store"
+	"github.com/rockclaver/claver-agent/internal/billing"
+	"github.com/rockclaver/claver-agent/internal/cost"
+	"github.com/rockclaver/claver-agent/internal/store"
 )
 
 func newCostTestServer(t *testing.T) (string, *store.Store, func()) {

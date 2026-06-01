@@ -1,6 +1,6 @@
 # claver-agent
 
-The VPS-side companion for [Claver](../). A single Go binary, supervised by
+The VPS-side companion for [Claver](https://github.com/rockclaver/claver). A single Go binary, supervised by
 `systemd`, that binds only to `127.0.0.1` and speaks a JSON-over-WebSocket
 protocol to the mobile app over an SSH-forwarded port.
 
@@ -12,7 +12,6 @@ projects, git, and preview are stubs that will land in later phases.
 ## Build
 
 ```sh
-cd agent
 go build ./...
 ```
 
@@ -84,14 +83,13 @@ token with `gh auth token --hostname github.com`.
 ## Test
 
 ```sh
-cd agent
 go test ./...
 ```
 
 ## Install on a VPS
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/rockclaver/claver/main/agent/scripts/install.sh \
+curl -fsSL https://raw.githubusercontent.com/rockclaver/claver-agent/main/scripts/install.sh \
   | sudo bash
 ```
 
@@ -99,7 +97,7 @@ By default the installer resolves the latest GitHub release. To pin a specific
 version, pass `--version`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/rockclaver/claver/main/agent/scripts/install.sh \
+curl -fsSL https://raw.githubusercontent.com/rockclaver/claver-agent/main/scripts/install.sh \
   | sudo bash -s -- --version 0.1.2
 ```
 
@@ -110,5 +108,5 @@ OS-level Bubblewrap package so Codex CLI can find `bwrap` on PATH.
 
 The requested version must already exist as a GitHub release. Push a tag such
 as `v0.1.0` to publish the `claver-agent-linux-amd64`,
-`claver-agent-linux-arm64`, and `claver-agent.service` assets consumed by the
-installer.
+`claver-agent-linux-arm64`, `claver-agent.service`, and
+`claver-agent-firewall.sudoers` assets consumed by the installer.

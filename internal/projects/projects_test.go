@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/rockclaver/claver/agent/internal/store"
+	"github.com/rockclaver/claver-agent/internal/store"
 )
 
 func newManager(t *testing.T) *Manager {

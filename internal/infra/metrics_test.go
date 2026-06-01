@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -112,6 +113,41 @@ func TestIssue41MetricsCollector_UnavailableMetricHasTypedReason(t *testing.T) {
 	}
 	if got.Disks[0].Available || got.Disks[0].Reason == "" {
 		t.Fatalf("disk reason missing: %+v", got.Disks[0])
+	}
+}
+
+func TestMetricsCollector_SkipsDockerAndPseudoMounts(t *testing.T) {
+	reader := fakeReader{files: map[string][]byte{
+		"stat":    []byte("cpu  1 0 1 8 0 0 0 0\n"),
+		"loadavg": []byte("0.1 0.2 0.3 1/1 1\n"),
+		"meminfo": []byte("MemTotal: 1 kB\nMemAvailable: 1 kB\n"),
+		"dev":     []byte(" eth0: 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0\n"),
+		"mounts": []byte(strings.Join([]string{
+			"/dev/vda1 / ext4 rw 0 0",
+			"nsfs /run/docker/netns/default nsfs rw 0 0",
+			"/dev/vda1 /run/docker/containers/abc/shm ext4 rw 0 0",
+			"udev /dev/null devtmpfs rw 0 0",
+			"",
+		}, "\n")),
+	}}
+	mgr, err := New(Config{
+		Reader: reader,
+		StatFS: func(path string) (syscall.Statfs_t, error) {
+			if strings.HasPrefix(path, "/run/") {
+				return syscall.Statfs_t{}, errors.New("permission denied")
+			}
+			return syscall.Statfs_t{Blocks: 100, Bavail: 25, Bsize: 4096}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := mgr.Sample(context.Background())
+	if len(got.Disks) != 1 {
+		t.Fatalf("disks = %+v, want only /", got.Disks)
+	}
+	if got.Disks[0].Mountpoint != "/" {
+		t.Fatalf("disk mountpoint = %q, want /", got.Disks[0].Mountpoint)
 	}
 }
 

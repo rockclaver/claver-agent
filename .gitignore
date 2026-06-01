@@ -1,0 +1,10 @@
+dist/
+e2e-smoke
+claver-agent
+
+# Runtime secrets.
+server/*.json
+server/**/*firebase-adminsdk*.json
+
+# Skills are materialized from skills-lock.json by the installer.
+.agents/skills/

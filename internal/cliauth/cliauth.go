@@ -30,8 +30,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/rockclaver/claver/agent/internal/github"
-	"github.com/rockclaver/claver/agent/internal/store"
+	"github.com/rockclaver/claver-agent/internal/github"
+	"github.com/rockclaver/claver-agent/internal/store"
 )
 
 // Kinds.

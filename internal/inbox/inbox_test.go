@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rockclaver/claver/agent/internal/notifications"
-	"github.com/rockclaver/claver/agent/internal/store"
+	"github.com/rockclaver/claver-agent/internal/notifications"
+	"github.com/rockclaver/claver-agent/internal/store"
 )
 
 func staticSource(items ...Item) Source {

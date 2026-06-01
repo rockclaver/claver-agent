@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish agent assets
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref_name, 'v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Build Linux binaries
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${VERSION#v}"
+          mkdir -p dist
+
+          for arch in amd64 arm64; do
+            GOOS=linux GOARCH="$arch" CGO_ENABLED=0 go build \
+              -trimpath \
+              -ldflags "-s -w -X github.com/rockclaver/claver-agent/internal/version.Version=${version}" \
+              -o "dist/claver-agent-linux-${arch}" \
+              ./cmd/claver-agent
+          done
+
+          cp systemd/claver-agent.service dist/claver-agent.service
+          cp systemd/claver-agent-firewall.sudoers dist/claver-agent-firewall.sudoers
+          (cd dist && sha256sum claver-agent-linux-* claver-agent.service claver-agent-firewall.sudoers > SHA256SUMS)
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/claver-agent-linux-amd64
+            dist/claver-agent-linux-arm64
+            dist/claver-agent.service
+            dist/claver-agent-firewall.sudoers
+            dist/SHA256SUMS

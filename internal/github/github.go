@@ -17,9 +17,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rockclaver/claver/agent/internal/projects"
-	"github.com/rockclaver/claver/agent/internal/review"
-	"github.com/rockclaver/claver/agent/internal/store"
+	"github.com/rockclaver/claver-agent/internal/projects"
+	"github.com/rockclaver/claver-agent/internal/review"
+	"github.com/rockclaver/claver-agent/internal/store"
 )
 
 var (
