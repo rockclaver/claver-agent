@@ -106,13 +106,98 @@ func TestAction_SubmitListGetOverWS(t *testing.T) {
 	}
 }
 
+func TestAction_CancelOverWSStopsDeferredPlanning(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	var deferred func()
+	plannerCalls := 0
+	am, err := actions.New(actions.Config{
+		Store:    st,
+		Dispatch: func(f func()) { deferred = f },
+		Planner: actions.PlannerFunc(func(context.Context, actions.Request) (actions.Result, error) {
+			plannerCalls++
+			return actions.Result{Status: actions.StatusObserved, Summary: "should not run"}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatalf("new actions: %v", err)
+	}
+
+	wsURL, stop := startTestServerWith(t, Config{Addr: "127.0.0.1:0", Actions: am})
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close(websocket.StatusNormalClosure, "")
+
+	subReq, _ := json.Marshal(Frame{
+		ID: "1", Kind: "action.submit",
+		Payload: json.RawMessage(`{"text":"cancel this","worker":"codex"}`),
+	})
+	_ = c.Write(ctx, websocket.MessageText, subReq)
+	resp := readFrame(t, ctx, c, "1")
+	var subResp struct {
+		Job actions.Job `json:"job"`
+	}
+	_ = json.Unmarshal(resp.Payload, &subResp)
+	if subResp.Job.Status != actions.StatusSubmitted {
+		t.Fatalf("submit status = %q, want submitted", subResp.Job.Status)
+	}
+	if deferred == nil {
+		t.Fatal("expected deferred planner")
+	}
+
+	cancelPayload := json.RawMessage(`{"id":"` + subResp.Job.ID + `"}`)
+	cancelReq, _ := json.Marshal(Frame{ID: "2", Kind: "action.cancel", Payload: cancelPayload})
+	_ = c.Write(ctx, websocket.MessageText, cancelReq)
+	resp = readFrame(t, ctx, c, "2")
+	if resp.Kind != "action.cancel" {
+		t.Fatalf("cancel kind = %s payload=%s", resp.Kind, resp.Payload)
+	}
+	var cancelResp struct {
+		Job actions.Job `json:"job"`
+	}
+	_ = json.Unmarshal(resp.Payload, &cancelResp)
+	if cancelResp.Job.Status != actions.StatusCancelled {
+		t.Fatalf("cancel status = %q, want cancelled", cancelResp.Job.Status)
+	}
+
+	deferred()
+	if plannerCalls != 0 {
+		t.Fatalf("planner ran after cancel: %d calls", plannerCalls)
+	}
+
+	getReq, _ := json.Marshal(Frame{ID: "3", Kind: "action.get", Payload: cancelPayload})
+	_ = c.Write(ctx, websocket.MessageText, getReq)
+	resp = readFrame(t, ctx, c, "3")
+	var getResp struct {
+		Job actions.Job `json:"job"`
+	}
+	_ = json.Unmarshal(resp.Payload, &getResp)
+	if getResp.Job.Status != actions.StatusCancelled {
+		t.Fatalf("get status = %q, want cancelled", getResp.Job.Status)
+	}
+	if !hasActionEvent(getResp.Job.Events, "cancelled") {
+		t.Fatalf("missing cancelled event: %+v", getResp.Job.Events)
+	}
+}
+
 func TestAction_SubmitRequiresText(t *testing.T) {
 	st, _ := store.Open(":memory:")
 	t.Cleanup(func() { st.Close() })
 	am, _ := actions.New(actions.Config{
 		Store:    st,
 		Dispatch: func(f func()) { f() },
-		Planner:  actions.PlannerFunc(func(context.Context, actions.Request) (actions.Result, error) { return actions.Result{Status: actions.StatusObserved}, nil }),
+		Planner: actions.PlannerFunc(func(context.Context, actions.Request) (actions.Result, error) {
+			return actions.Result{Status: actions.StatusObserved}, nil
+		}),
 	})
 	wsURL, stop := startTestServerWith(t, Config{Addr: "127.0.0.1:0", Actions: am})
 	defer stop()
@@ -128,6 +213,15 @@ func TestAction_SubmitRequiresText(t *testing.T) {
 	if resp.Kind != "error.bad_payload" {
 		t.Fatalf("expected error.bad_payload, got %s", resp.Kind)
 	}
+}
+
+func hasActionEvent(events []actions.Event, typ string) bool {
+	for _, ev := range events {
+		if ev.Type == typ {
+			return true
+		}
+	}
+	return false
 }
 
 func TestAction_UnavailableWhenNotWired(t *testing.T) {
