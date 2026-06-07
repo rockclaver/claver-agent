@@ -95,6 +95,9 @@ func main() {
 		HomeDir:   homeDirOr(*dataDir),
 		Secrets:   authMgr.Secrets,
 	})
+	// Real token usage is read from the claude CLI transcript root, which lives
+	// under the same HOME the runtime gives the CLI.
+	sessionMgr.ClaudeProjectsDir = filepath.Join(homeDirOr(*dataDir), ".claude", "projects")
 	sessionMgr.AuthOK = func(ctx context.Context, agent string) bool {
 		st, err := authMgr.Status(ctx, agent)
 		return err == nil && st.LoggedIn

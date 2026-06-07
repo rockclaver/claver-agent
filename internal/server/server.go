@@ -396,6 +396,7 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 	case "session.start",
 		"session.prompt",
 		"session.input",
+		"session.question_decision",
 		"session.interrupt",
 		"session.resize",
 		"session.stop",
@@ -738,6 +739,23 @@ func (s *Server) dispatchSession(ctx context.Context, c *websocket.Conn, writeMu
 			return
 		}
 		s.writeOK(ctx, c, writeMu, f.ID, "session.input", map[string]any{"session_id": in.SessionID})
+	case "session.question_decision":
+		var in struct {
+			SessionID       string `json:"session_id"`
+			GroupIndex      int    `json:"group_index"`
+			SelectedIndices []int  `json:"selected_indices"`
+			FreeText        string `json:"free_text"`
+			Action          string `json:"action"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.SessionID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "invalid_payload", "session_id required")
+			return
+		}
+		if err := mgr.SendQuestionDecision(ctx, in.SessionID, in.GroupIndex, in.SelectedIndices, in.FreeText, in.Action); err != nil {
+			s.writeSessionErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "session.question_decision", map[string]any{"session_id": in.SessionID})
 	case "session.interrupt":
 		var in struct {
 			SessionID string `json:"session_id"`
@@ -1185,12 +1203,13 @@ func (s *Server) dispatchGitHub(ctx context.Context, c *websocket.Conn, writeMu 
 		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, map[string]string{"title": title, "body": body})
 	case "github.pr_create":
 		var in struct {
-			Account string `json:"account"`
-			Repo    string `json:"repo"`
-			Head    string `json:"head"`
-			Base    string `json:"base"`
-			Title   string `json:"title"`
-			Body    string `json:"body"`
+			Account   string `json:"account"`
+			ProjectID string `json:"project_id"`
+			Repo      string `json:"repo"`
+			Head      string `json:"head"`
+			Base      string `json:"base"`
+			Title     string `json:"title"`
+			Body      string `json:"body"`
 		}
 		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Repo == "" || in.Head == "" || in.Base == "" || in.Title == "" {
 			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "repo, head, base and title required")
@@ -1200,6 +1219,15 @@ func (s *Server) dispatchGitHub(ctx context.Context, c *websocket.Conn, writeMu 
 		if err != nil {
 			s.writeGitHubErr(ctx, c, writeMu, f.ID, err)
 			return
+		}
+		if s.cfg.Memory != nil && in.ProjectID != "" {
+			_, _ = s.cfg.Memory.AppendJournal(
+				in.ProjectID,
+				memory.JournalPR,
+				fmt.Sprintf("Opened PR #%d: %s", pr.Number, pr.Title),
+				pr.URL,
+				s.cfg.Now(),
+			)
 		}
 		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, pr)
 	case "github.pr_list":

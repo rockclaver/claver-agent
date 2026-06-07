@@ -22,6 +22,12 @@ go run ./cmd/claver-agent --addr 127.0.0.1:7676
 ```
 
 The agent refuses to start if `--addr` is anything other than a loopback IP.
+Interactive Claude and Codex sessions run with a stable agent HOME. On the
+systemd install that HOME is `/var/lib/claver`, so CLI auth, transcripts, and
+skills installed by the agents live under `/var/lib/claver/.claude` and
+`/var/lib/claver/.codex` instead of the project workspace. The agent also adds
+the relevant `skills` directory to each CLI's writable roots, so skill installs
+persist across sessions, logins, and binary upgrades.
 
 ### Startup options
 
@@ -104,7 +110,8 @@ curl -fsSL https://raw.githubusercontent.com/rockclaver/claver-agent/main/script
 The installer creates a `claver` system user, drops the binary at
 `/usr/local/bin/claver-agent`, installs the systemd unit, enables and starts
 the service, and prints the installed version on stdout. It also installs the
-OS-level Bubblewrap package so Codex CLI can find `bwrap` on PATH.
+OS-level Bubblewrap package so Codex CLI can find `bwrap` on PATH, and creates
+the persistent Claude/Codex skill roots under `/var/lib/claver`.
 
 The requested version must already exist as a GitHub release. Push a tag such
 as `v0.1.0` to publish the `claver-agent-linux-amd64`,

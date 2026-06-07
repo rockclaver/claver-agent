@@ -63,6 +63,11 @@ if ! id claver >/dev/null 2>&1; then
   useradd --system --home-dir "$STATE_DIR" --create-home --shell /usr/sbin/nologin claver
 fi
 install -d -o claver -g claver -m 0750 "$STATE_DIR"
+install -d -o claver -g claver -m 0700 \
+  "$STATE_DIR/.claude" \
+  "$STATE_DIR/.claude/skills" \
+  "$STATE_DIR/.codex" \
+  "$STATE_DIR/.codex/skills"
 
 if ! command -v bwrap >/dev/null 2>&1; then
   echo "installing bubblewrap" >&2

@@ -1,13 +1,20 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/rockclaver/claver-agent/internal/billing"
 	"github.com/rockclaver/claver-agent/internal/cost"
+	gh "github.com/rockclaver/claver-agent/internal/github"
+	"github.com/rockclaver/claver-agent/internal/memory"
+	"github.com/rockclaver/claver-agent/internal/projects"
+	"github.com/rockclaver/claver-agent/internal/review"
 	"github.com/rockclaver/claver-agent/internal/store"
 )
 
@@ -57,6 +64,73 @@ func TestCostRollupRPC(t *testing.T) {
 	}
 	if r.PRsShipped != 1 || r.CostPerPRCents != 1500 {
 		t.Fatalf("cost-per-PR wrong: %d PRs, %d cents", r.PRsShipped, r.CostPerPRCents)
+	}
+}
+
+func TestGitHubPRCreateRecordsCostDenominator(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer st.Close()
+	if err := st.CreateProject(store.Project{ID: "p1", Name: "Alpha"}); err != nil {
+		t.Fatalf("project: %v", err)
+	}
+	if err := st.CreateSession(store.Session{
+		ID: "s1", ProjectID: "p1", Agent: "claude",
+		StartedAt:   time.Date(2026, 5, 10, 0, 0, 0, 0, time.UTC),
+		InputTokens: 1_000_000,
+	}); err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	now := func() time.Time { return time.Date(2026, 5, 15, 0, 0, 0, 0, time.UTC) }
+	calc := cost.New(st, "srv-1")
+	calc.Now = now
+	pm, err := projects.New(filepath.Join(dir, "projects"), st)
+	if err != nil {
+		t.Fatalf("projects: %v", err)
+	}
+	rm := review.New(pm, st, review.HeuristicSummarizer{})
+	gm := gh.New(st, pm, rm, gh.NewTokenVault(filepath.Join(dir, "github.key"), filepath.Join(dir, "tokens")))
+	gm.Now = now
+	gm.RunCommand = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		return []byte("token\n"), nil
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/repos/octo/src/pulls" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"number":7,"title":"Ship cost metric","state":"open","html_url":"https://github.com/octo/src/pull/7","head":{"ref":"feature"}}`))
+	}))
+	defer ts.Close()
+	gm.APIBase = ts.URL
+
+	wsURL, stop := startTestServerWith(t, Config{
+		Addr:   "127.0.0.1:0",
+		Now:    now,
+		GitHub: gm,
+		Memory: memory.New(st),
+		Cost:   calc,
+	})
+	defer stop()
+
+	resp := roundTrip(t, wsURL, "github.pr_create", map[string]any{
+		"account": "octo", "project_id": "p1", "repo": "octo/src",
+		"head": "feature", "base": "main", "title": "Ship cost metric",
+	})
+	if resp.Kind != "github.pr_create" {
+		t.Fatalf("PR create resp: %s %s", resp.Kind, resp.Payload)
+	}
+	resp = roundTrip(t, wsURL, "cost.rollup", map[string]any{"month": "2026-05"})
+	var r cost.Rollup
+	if err := json.Unmarshal(resp.Payload, &r); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if r.PRsShipped != 1 || r.CostPerPRCents != 1500 {
+		t.Fatalf("cost denominator not recorded: %d PRs, %d cents", r.PRsShipped, r.CostPerPRCents)
 	}
 }
 

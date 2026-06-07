@@ -230,6 +230,10 @@ func (m *Manager) claudeConfigDir() string {
 	return filepath.Join(m.cfg.HomeDir, ".claude")
 }
 
+func (m *Manager) codexHomeDir() string {
+	return filepath.Join(m.cfg.HomeDir, ".codex")
+}
+
 // Status reports whether the named CLI is logged in. It checks the vault
 // first (explicit token/api_key) and falls back to the CLI's credential file.
 func (m *Manager) Status(ctx context.Context, kind string) (Status, error) {
@@ -1036,6 +1040,7 @@ func (m *Manager) envForCaptive() []string {
 		"PATH="+newPath,
 		"HOME="+m.cfg.HomeDir,
 		"CLAUDE_CONFIG_DIR="+m.claudeConfigDir(),
+		"CODEX_HOME="+m.codexHomeDir(),
 	)
 }
 
@@ -1044,6 +1049,7 @@ func (m *Manager) tmuxEnvFlags() []string {
 	if m.cfg.HomeDir != "" {
 		flags = append(flags, "-e", "HOME="+m.cfg.HomeDir)
 		flags = append(flags, "-e", "CLAUDE_CONFIG_DIR="+m.claudeConfigDir())
+		flags = append(flags, "-e", "CODEX_HOME="+m.codexHomeDir())
 	}
 	if path := pathWithPrefix(m.cfg.BinDir); path != "" {
 		flags = append(flags, "-e", "PATH="+path)
@@ -1056,6 +1062,7 @@ func shouldReplaceEnv(kv string) bool {
 		"PATH=",
 		"HOME=",
 		"CLAUDE_CONFIG_DIR=",
+		"CODEX_HOME=",
 		"ANTHROPIC_API_KEY=",
 		"ANTHROPIC_AUTH_TOKEN=",
 		"CLAUDE_CODE_OAUTH_TOKEN=",

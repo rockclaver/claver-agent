@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -57,6 +58,9 @@ func (f *fakeRuntime) Stop(context.Context, string) error {
 	return nil
 }
 func (f *fakeRuntime) Capture(context.Context, string) (string, error) {
+	return f.captureText, nil
+}
+func (f *fakeRuntime) CaptureVisible(context.Context, string) (string, error) {
 	return f.captureText, nil
 }
 func (f *fakeRuntime) Alive(context.Context, string) bool {
@@ -652,11 +656,23 @@ func TestAgentCommandArgs_MapRunModesToCliFlags(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := agentCommandArgs(tc.agent, tc.mode)
+			got := agentCommandArgs(tc.agent, tc.mode, "/var/lib/claver")
 			if !contains(got, tc.wantArg) {
 				t.Fatalf("args = %#v want %q", got, tc.wantArg)
 			}
 		})
+	}
+}
+
+func TestAgentCommandArgs_AddPersistentSkillDirs(t *testing.T) {
+	home := "/var/lib/claver"
+	codexArgs := agentCommandArgs("codex", "manual", home)
+	if !contains(codexArgs, "--add-dir") || !contains(codexArgs, filepath.Join(home, ".codex", "skills")) {
+		t.Fatalf("codex args missing persistent skills dir: %#v", codexArgs)
+	}
+	claudeArgs := agentCommandArgs("claude", "manual", home)
+	if !contains(claudeArgs, "--add-dir") || !contains(claudeArgs, filepath.Join(home, ".claude", "skills")) {
+		t.Fatalf("claude args missing persistent skills dir: %#v", claudeArgs)
 	}
 }
 
@@ -668,6 +684,9 @@ func TestTmuxRuntimeEnvUsesConfiguredHome(t *testing.T) {
 	}
 	if !contains(env, "CLAUDE_CONFIG_DIR=/var/lib/claver/.claude") {
 		t.Fatalf("env missing configured CLAUDE_CONFIG_DIR: %#v", env)
+	}
+	if !contains(env, "CODEX_HOME=/var/lib/claver/.codex") {
+		t.Fatalf("env missing configured CODEX_HOME: %#v", env)
 	}
 	foundPath := false
 	for _, kv := range env {
@@ -686,8 +705,27 @@ func TestTmuxRuntimeEnvUsesConfiguredHome(t *testing.T) {
 	if !strings.Contains(flags, "CLAUDE_CONFIG_DIR=/var/lib/claver/.claude") {
 		t.Fatalf("tmux flags missing CLAUDE_CONFIG_DIR: %q", flags)
 	}
+	if !strings.Contains(flags, "CODEX_HOME=/var/lib/claver/.codex") {
+		t.Fatalf("tmux flags missing CODEX_HOME: %q", flags)
+	}
 	if !strings.Contains(flags, "PATH=/opt/claver/bin") {
 		t.Fatalf("tmux flags missing PATH prefix: %q", flags)
+	}
+}
+
+func TestTmuxRuntimeCreatesPersistentSkillDirs(t *testing.T) {
+	home := t.TempDir()
+	rt := TmuxRuntime{HomeDir: home}
+	if err := rt.ensurePersistentAgentDirs(); err != nil {
+		t.Fatalf("ensurePersistentAgentDirs: %v", err)
+	}
+	for _, dir := range []string{
+		filepath.Join(home, ".codex", "skills"),
+		filepath.Join(home, ".claude", "skills"),
+	} {
+		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+			t.Fatalf("expected persistent skills dir %s, stat=%v info=%+v", dir, err, fi)
+		}
 	}
 }
 
@@ -695,12 +733,14 @@ func TestTmuxRuntimeEnvStripsAmbientAnthropicCredentials(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "bad")
 	t.Setenv("ANTHROPIC_AUTH_TOKEN", "bad")
 	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "bad")
+	t.Setenv("CODEX_HOME", "/tmp/wrong-codex-home")
 	rt := TmuxRuntime{ExtraPath: "/opt/claver/bin", HomeDir: "/var/lib/claver"}
 	env := strings.Join(rt.envWithPath(), "\n")
 	for _, forbidden := range []string{
 		"ANTHROPIC_API_KEY=bad",
 		"ANTHROPIC_AUTH_TOKEN=bad",
 		"CLAUDE_CODE_OAUTH_TOKEN=bad",
+		"CODEX_HOME=/tmp/wrong-codex-home",
 	} {
 		if strings.Contains(env, forbidden) {
 			t.Fatalf("env leaked %s: %q", forbidden, env)

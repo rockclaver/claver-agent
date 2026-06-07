@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/rockclaver/claver-agent/internal/projects"
 	"github.com/rockclaver/claver-agent/internal/store"
 )
@@ -39,6 +41,10 @@ type Runtime interface {
 	Resize(ctx context.Context, sessionID string, cols, rows int) error
 	Stop(ctx context.Context, sessionID string) error
 	Capture(ctx context.Context, sessionID string) (string, error)
+	// CaptureVisible returns only the on-screen pane (no scrollback), used to
+	// parse the live state of an interactive selector without picking up stale
+	// earlier menus from history.
+	CaptureVisible(ctx context.Context, sessionID string) (string, error)
 	Alive(ctx context.Context, sessionID string) bool
 }
 
@@ -48,6 +54,10 @@ type RuntimeSpec struct {
 	RunMode   string
 	WorkDir   string
 	Output    io.Writer
+	// ClaudeSessionID, when set, is passed to the claude CLI via --session-id so
+	// its transcript file is named deterministically and we can read real token
+	// usage from it. Empty for non-claude agents.
+	ClaudeSessionID string
 }
 
 type Manager struct {
@@ -65,9 +75,30 @@ type Manager struct {
 	// Stop or the reaper). Wired to the project-journal summarizer. It must
 	// not block the caller for long; production wraps it in a goroutine.
 	OnEnd func(ctx context.Context, sess store.Session)
+	// ClaudeProjectsDir is the absolute path to the claude CLI's transcript
+	// root (<home>/.claude/projects). When set, claude sessions get a
+	// --session-id and a background poller reads real token usage from the
+	// matching transcript. Empty disables usage polling.
+	ClaudeProjectsDir string
 
-	mu   sync.Mutex
-	subs map[string]map[*subscriber]struct{}
+	mu         sync.Mutex
+	subs       map[string]map[*subscriber]struct{}
+	usageStops map[string]chan struct{}
+
+	// questionMu guards the interactive-menu detection state below. Detection
+	// runs off the output pipeline (a debounce timer per session) so a slow
+	// capture never stalls streaming.
+	questionMu     sync.Mutex
+	questionState  map[string]*questionTrack
+	questionTimers map[string]*time.Timer
+}
+
+// questionTrack is per-session bookkeeping for the interactive-menu detector.
+// hash dedups re-emission across redraws of the same screen; groupIndex tracks
+// which question of a multi-question menu the user is currently answering.
+type questionTrack struct {
+	hash       string
+	groupIndex int
 }
 
 // subscriber is one live consumer of a session's event stream. ch is never
@@ -81,7 +112,10 @@ type subscriber struct {
 func New(st *store.Store, projectMgr *projects.Manager, runtime Runtime) *Manager {
 	return &Manager{
 		Store: st, Projects: projectMgr, Runtime: runtime, Now: time.Now, IDGen: randomID,
-		subs: make(map[string]map[*subscriber]struct{}),
+		subs:           make(map[string]map[*subscriber]struct{}),
+		usageStops:     make(map[string]chan struct{}),
+		questionState:  make(map[string]*questionTrack),
+		questionTimers: make(map[string]*time.Timer),
 	}
 }
 
@@ -110,18 +144,28 @@ func (m *Manager) Start(ctx context.Context, projectID, agent, runMode string) (
 	if err := m.Store.CreateSession(sess); err != nil {
 		return store.Session{}, err
 	}
+	// Claude transcripts are keyed by session UUID; minting one and passing it
+	// to the CLI lets the usage poller find this session's transcript precisely.
+	var claudeSessionID string
+	if agent == "claude" && m.ClaudeProjectsDir != "" {
+		claudeSessionID = uuid.NewString()
+	}
 	w := &eventWriter{manager: m, sessionID: id, eventType: "stdout"}
 	if err := m.Runtime.Start(ctx, RuntimeSpec{
-		SessionID: id,
-		Agent:     agent,
-		RunMode:   runMode,
-		WorkDir:   m.Projects.WorkspaceDir(projectID),
-		Output:    w,
+		SessionID:       id,
+		Agent:           agent,
+		RunMode:         runMode,
+		WorkDir:         m.Projects.WorkspaceDir(projectID),
+		Output:          w,
+		ClaudeSessionID: claudeSessionID,
 	}); err != nil {
 		_ = m.Store.EndSession(id, m.Now())
 		return store.Session{}, err
 	}
 	_, _ = m.Publish(store.SessionEvent{SessionID: id, Type: "lifecycle", Data: "started"})
+	if claudeSessionID != "" {
+		m.startUsagePoll(id, claudeSessionID)
+	}
 	m.injectMemory(ctx, id, projectID)
 	return sess, nil
 }
@@ -157,6 +201,8 @@ func (m *Manager) SendPrompt(ctx context.Context, sessionID, prompt string) erro
 	if _, err := m.Store.GetSession(sessionID); err != nil {
 		return err
 	}
+	// A fresh prompt invalidates any pending interactive menu state.
+	m.clearQuestion(sessionID)
 	_, _ = m.Publish(store.SessionEvent{SessionID: sessionID, Type: "prompt", Data: prompt})
 	return m.Runtime.SendPrompt(ctx, sessionID, prompt)
 }
@@ -173,6 +219,276 @@ func (m *Manager) SendInput(ctx context.Context, sessionID, data string) error {
 		return err
 	}
 	return m.Runtime.SendInput(ctx, sessionID, data)
+}
+
+// settleDelay is how long we wait for the TUI to repaint after a keystroke
+// before re-reading the pane to verify the effect.
+const settleDelay = 90 * time.Millisecond
+
+// SendQuestionDecision drives the live interactive selector for one question
+// group to match the user's choices made in the native sheet. Each step is
+// closed-loop: send a key, re-capture the resolved pane, verify the change.
+// These menus are numbered, so the primary strategy is to press the option's
+// number key; arrow-navigation + Space/Enter is the fallback when a number key
+// has no effect. action is one of "submit", "next" (advance to the next
+// question of a multi-question menu), or "cancel".
+//
+// When a step can't be verified, a diagnostic is written to the session's
+// output stream (visible in the terminal) instead of failing silently, so the
+// real key semantics / capture format can be inspected.
+func (m *Manager) SendQuestionDecision(ctx context.Context, sessionID string, groupIndex int, selectedIndices []int, freeText, action string) error {
+	if _, err := m.Store.GetSession(sessionID); err != nil {
+		return err
+	}
+	if action == "cancel" {
+		m.clearQuestion(sessionID)
+		return m.Runtime.SendInput(ctx, sessionID, keyEsc)
+	}
+
+	snap, rows := m.captureSettled(ctx, sessionID)
+	multi := false
+	for _, r := range rows {
+		if r.hasBox {
+			multi = true
+			break
+		}
+	}
+	want := make(map[int]bool, len(selectedIndices))
+	for _, i := range selectedIndices {
+		want[i] = true
+	}
+
+	var problems []string
+	if multi {
+		for _, r := range rows {
+			if !r.hasBox {
+				continue
+			}
+			desired := want[r.index]
+			if r.checked == desired {
+				continue
+			}
+			if !m.toggleRow(ctx, sessionID, r.index, desired) {
+				problems = append(problems, fmt.Sprintf("could not set option %d=%v", r.index, desired))
+			}
+		}
+	} else if len(selectedIndices) > 0 {
+		if !m.chooseRow(ctx, sessionID, selectedIndices[0]) {
+			problems = append(problems, fmt.Sprintf("could not select option %d", selectedIndices[0]))
+		}
+	}
+
+	if strings.TrimSpace(freeText) != "" {
+		if idx, ok := m.findRow(ctx, sessionID, func(r parsedRow) bool { return isFreeTextLabel(r.label) }); ok {
+			_ = m.navigateTo(ctx, sessionID, idx)
+			_ = m.Runtime.SendInput(ctx, sessionID, keyEnter)
+			time.Sleep(settleDelay)
+			_ = m.Runtime.SendInput(ctx, sessionID, freeText)
+			_ = m.Runtime.SendInput(ctx, sessionID, keyEnter)
+		}
+	}
+
+	if len(problems) > 0 {
+		m.publishQuestionDiag(sessionID, snap, problems)
+	}
+
+	switch action {
+	case "next":
+		m.questionMu.Lock()
+		if st := m.questionState[sessionID]; st != nil {
+			st.groupIndex++
+			st.hash = "" // allow the next group's screen to re-emit
+		}
+		m.questionMu.Unlock()
+		return m.Runtime.SendInput(ctx, sessionID, keyTab)
+	default: // submit
+		m.clearQuestion(sessionID)
+		// Multi-select needs an explicit confirm; single-select is confirmed by
+		// the selection itself in chooseRow.
+		if multi {
+			return m.Runtime.SendInput(ctx, sessionID, keyEnter)
+		}
+		return nil
+	}
+}
+
+// captureRows reads the live pane and parses its selector rows.
+func (m *Manager) captureRows(ctx context.Context, sessionID string) ([]parsedRow, error) {
+	capture, err := m.Runtime.CaptureVisible(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	return parseRows(capture), nil
+}
+
+// captureSettled retries the capture a few times until it yields selector rows,
+// returning both the raw snapshot (for diagnostics) and the parsed rows.
+func (m *Manager) captureSettled(ctx context.Context, sessionID string) (string, []parsedRow) {
+	var snap string
+	for i := 0; i < 3; i++ {
+		s, err := m.Runtime.CaptureVisible(ctx, sessionID)
+		if err == nil {
+			snap = s
+			if rows := parseRows(s); len(rows) > 0 {
+				return s, rows
+			}
+		}
+		time.Sleep(settleDelay)
+	}
+	return snap, parseRows(snap)
+}
+
+// findRow returns the index of the first row matching pred.
+func (m *Manager) findRow(ctx context.Context, sessionID string, pred func(parsedRow) bool) (int, bool) {
+	rows, err := m.captureRows(ctx, sessionID)
+	if err != nil {
+		return 0, false
+	}
+	for _, r := range rows {
+		if pred(r) {
+			return r.index, true
+		}
+	}
+	return 0, false
+}
+
+// rowChecked reports the current checked state of the option with the given
+// index, and whether that option is still on screen.
+func (m *Manager) rowChecked(ctx context.Context, sessionID string, target int) (checked bool, exists bool) {
+	rows, err := m.captureRows(ctx, sessionID)
+	if err != nil {
+		return false, false
+	}
+	for _, r := range rows {
+		if r.index == target {
+			return r.checked, true
+		}
+	}
+	return false, false
+}
+
+// toggleRow sets the checkbox at target to desired, trying the number key first
+// (these menus are numbered) and falling back to arrow-navigation + Space/Enter.
+// Every attempt is verified against a fresh capture.
+func (m *Manager) toggleRow(ctx context.Context, sessionID string, target int, desired bool) bool {
+	if cur, ok := m.rowChecked(ctx, sessionID, target); ok && cur == desired {
+		return true
+	}
+	// Strategy 1: press the option's number.
+	if m.tryToggleKey(ctx, sessionID, strconv.Itoa(target), target, desired) {
+		return true
+	}
+	// Strategy 2: navigate the caret onto the row, then Space, then Enter.
+	if err := m.navigateTo(ctx, sessionID, target); err == nil {
+		if m.tryToggleKey(ctx, sessionID, keySpace, target, desired) {
+			return true
+		}
+		if m.tryToggleKey(ctx, sessionID, keyEnter, target, desired) {
+			return true
+		}
+	}
+	return false
+}
+
+// tryToggleKey sends key, waits for the repaint, and reports whether target
+// reached the desired checked state.
+func (m *Manager) tryToggleKey(ctx context.Context, sessionID string, key string, target int, desired bool) bool {
+	if err := m.Runtime.SendInput(ctx, sessionID, key); err != nil {
+		return false
+	}
+	time.Sleep(settleDelay)
+	cur, ok := m.rowChecked(ctx, sessionID, target)
+	return ok && cur == desired
+}
+
+// chooseRow picks a single-select option, pressing its number first (which on
+// most numbered selectors selects and dismisses the menu) and falling back to
+// arrow-navigation + Enter. Success is inferred from the menu closing.
+func (m *Manager) chooseRow(ctx context.Context, sessionID string, target int) bool {
+	if err := m.Runtime.SendInput(ctx, sessionID, strconv.Itoa(target)); err != nil {
+		return false
+	}
+	time.Sleep(settleDelay)
+	if !m.menuPresent(ctx, sessionID) {
+		return true
+	}
+	if err := m.navigateTo(ctx, sessionID, target); err != nil {
+		return false
+	}
+	if err := m.Runtime.SendInput(ctx, sessionID, keyEnter); err != nil {
+		return false
+	}
+	time.Sleep(settleDelay)
+	return true
+}
+
+// menuPresent reports whether a selector is still on screen.
+func (m *Manager) menuPresent(ctx context.Context, sessionID string) bool {
+	s, err := m.Runtime.CaptureVisible(ctx, sessionID)
+	if err != nil {
+		return false
+	}
+	return questionFooterRE.MatchString(s)
+}
+
+// navigateTo moves the selector caret onto the row with the given index,
+// verifying after every keystroke. It aborts if the caret can't be located
+// (e.g. the TUI marks selection by colour only) so the caller can fall back to
+// another strategy instead of looping blindly.
+func (m *Manager) navigateTo(ctx context.Context, sessionID string, target int) error {
+	const maxSteps = 32
+	caretMisses := 0
+	for step := 0; step < maxSteps; step++ {
+		rows, err := m.captureRows(ctx, sessionID)
+		if err != nil {
+			return err
+		}
+		cursorIdx := -1
+		targetExists := false
+		for _, r := range rows {
+			if r.cursor {
+				cursorIdx = r.index
+			}
+			if r.index == target {
+				targetExists = true
+			}
+		}
+		if !targetExists {
+			return fmt.Errorf("option %d not on screen", target)
+		}
+		if cursorIdx == target {
+			return nil
+		}
+		if cursorIdx == -1 {
+			if caretMisses++; caretMisses > 3 {
+				return fmt.Errorf("caret not detectable")
+			}
+		}
+		key := keyDown
+		if cursorIdx != -1 && target < cursorIdx {
+			key = keyUp
+		}
+		if err := m.Runtime.SendInput(ctx, sessionID, key); err != nil {
+			return err
+		}
+		time.Sleep(settleDelay)
+	}
+	return fmt.Errorf("could not reach option %d", target)
+}
+
+// publishQuestionDiag surfaces a driving failure in the session's output stream
+// so it is visible in the terminal and the raw selector rendering can be
+// inspected, rather than failing silently after the sheet has closed.
+func (m *Manager) publishQuestionDiag(sessionID, snapshot string, problems []string) {
+	var b strings.Builder
+	b.WriteString("\r\n[devdeck] could not drive the menu selection:\r\n")
+	for _, p := range problems {
+		b.WriteString("  - " + p + "\r\n")
+	}
+	b.WriteString("[devdeck] captured screen was:\r\n")
+	b.WriteString(snapshot)
+	b.WriteString("\r\n")
+	_, _ = m.Publish(store.SessionEvent{SessionID: sessionID, Type: "stderr", Data: b.String()})
 }
 
 // Resize sets the session's pty grid so the agent TUI redraws for the client's
@@ -209,6 +525,7 @@ func (m *Manager) Stop(ctx context.Context, sessionID string) error {
 	if err := m.Store.EndSession(sessionID, m.Now()); err != nil {
 		return err
 	}
+	m.stopUsagePoll(sessionID)
 	_, _ = m.Publish(store.SessionEvent{SessionID: sessionID, Type: "lifecycle", Data: "stopped"})
 	m.notifyEnded(ctx, sessionID)
 	return nil
@@ -236,6 +553,7 @@ func (m *Manager) Delete(ctx context.Context, sessionID string) error {
 	// Best-effort stop — ignore errors so a wedged tmux session can still
 	// be cleared from the UI.
 	_ = m.Runtime.Stop(ctx, sessionID)
+	m.stopUsagePoll(sessionID)
 	if err := m.Store.DeleteSession(sessionID); err != nil {
 		return err
 	}
@@ -280,6 +598,7 @@ func (m *Manager) reapOnce(ctx context.Context) {
 			continue
 		}
 		if err := m.Store.EndSession(sess.ID, m.Now()); err == nil {
+			m.stopUsagePoll(sess.ID)
 			_, _ = m.Publish(store.SessionEvent{SessionID: sess.ID, Type: "lifecycle", Data: "dead"})
 			m.notifyEnded(ctx, sess.ID)
 		}
@@ -341,6 +660,7 @@ func (m *Manager) Publish(ev store.SessionEvent) (store.SessionEvent, error) {
 		return store.SessionEvent{}, err
 	}
 	m.accountUsage(ev)
+	m.detectQuestion(ev)
 	m.fanout(ev)
 	return ev, nil
 }
@@ -359,6 +679,80 @@ func (m *Manager) accountUsage(ev store.SessionEvent) {
 	if n := countToolCalls(ev.Data); n > 0 {
 		_ = m.Store.IncrSessionToolCalls(ev.SessionID, n)
 	}
+}
+
+// detectQuestion notices when an interactive selector (AskUserQuestion /
+// ExitPlanMode) is on screen and schedules a debounced capture+parse so the
+// client can render a native sheet. The full-screen TUI is drawn with
+// cursor-addressed redraws across many coalesced chunks, so a single stdout
+// chunk never contains an intact menu — we trigger on the content-independent
+// footer signature, then read the *resolved* pane via capture-pane.
+func (m *Manager) detectQuestion(ev store.SessionEvent) {
+	if ev.Type != "stdout" {
+		return
+	}
+	if !questionFooterRE.MatchString(cleanTerminalText(ev.Data)) {
+		return
+	}
+	sid := ev.SessionID
+	m.questionMu.Lock()
+	if t := m.questionTimers[sid]; t != nil {
+		t.Stop()
+	}
+	// Debounce so we capture once the screen has settled, off the output path.
+	m.questionTimers[sid] = time.AfterFunc(150*time.Millisecond, func() {
+		m.captureAndEmitQuestion(sid)
+	})
+	m.questionMu.Unlock()
+}
+
+// captureAndEmitQuestion reads the resolved pane, parses the visible question
+// group, and emits an "ask_question" event unless it duplicates the last screen
+// already sent for this session.
+func (m *Manager) captureAndEmitQuestion(sessionID string) {
+	capture, err := m.Runtime.CaptureVisible(context.Background(), sessionID)
+	if err != nil {
+		return
+	}
+	q, ok := parseAskQuestion(capture)
+	if !ok {
+		return
+	}
+
+	m.questionMu.Lock()
+	st := m.questionState[sessionID]
+	if st == nil {
+		st = &questionTrack{}
+		m.questionState[sessionID] = st
+	}
+	if st.hash == q.ID {
+		m.questionMu.Unlock()
+		return
+	}
+	st.hash = q.ID
+	q.GroupIndex = st.groupIndex
+	m.questionMu.Unlock()
+
+	payload, _ := json.Marshal(q)
+	// Type is "ask_question", so the detectQuestion guard above (stdout-only)
+	// prevents this Publish from recursing.
+	_, _ = m.Publish(store.SessionEvent{
+		SessionID: sessionID,
+		Type:      "ask_question",
+		Data:      string(payload),
+	})
+}
+
+// clearQuestion resets a session's interactive-menu tracking so the next menu
+// (a brand-new question, or one after a prompt/submit/cancel) starts fresh.
+func (m *Manager) clearQuestion(sessionID string) {
+	m.questionMu.Lock()
+	if t := m.questionTimers[sessionID]; t != nil {
+		t.Stop()
+		delete(m.questionTimers, sessionID)
+	}
+	delete(m.questionState, sessionID)
+	m.questionMu.Unlock()
 }
 
 // fanout delivers ev to every live subscriber of the session. Terminal output
@@ -555,6 +949,9 @@ func (r TmuxRuntime) Start(ctx context.Context, spec RuntimeSpec) error {
 	if err := os.MkdirAll(spec.WorkDir, 0o700); err != nil {
 		return err
 	}
+	if err := r.ensurePersistentAgentDirs(); err != nil {
+		return err
+	}
 	name := tmuxName(spec.SessionID)
 	args := []string{"new-session", "-d", "-s", name, "-n", spec.SessionID, "-c", spec.WorkDir}
 	args = append(args, r.tmuxEnvFlags()...)
@@ -563,7 +960,10 @@ func (r TmuxRuntime) Start(ctx context.Context, spec RuntimeSpec) error {
 			args = append(args, "-e", k+"="+v)
 		}
 	}
-	args = append(args, agentCommandArgs(spec.Agent, spec.RunMode)...)
+	args = append(args, agentCommandArgs(spec.Agent, spec.RunMode, r.HomeDir)...)
+	if spec.Agent == "claude" && spec.ClaudeSessionID != "" {
+		args = append(args, "--session-id", spec.ClaudeSessionID)
+	}
 	cmd := exec.CommandContext(ctx, "tmux", args...)
 	cmd.Env = r.envWithPath()
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -573,19 +973,29 @@ func (r TmuxRuntime) Start(ctx context.Context, spec RuntimeSpec) error {
 	return r.Attach(ctx, spec)
 }
 
-func agentCommandArgs(agent, runMode string) []string {
+func agentCommandArgs(agent, runMode, homeDir string) []string {
 	mode := normalizeRunMode(runMode)
 	switch agent {
 	case "claude":
+		args := []string{"claude"}
 		if mode == "yolo" {
-			return []string{"claude", "--dangerously-skip-permissions"}
+			args = append(args, "--dangerously-skip-permissions")
+		} else {
+			args = append(args, "--permission-mode", "default")
 		}
-		return []string{"claude", "--permission-mode", "default"}
+		if dir := claudeSkillsDir(homeDir); dir != "" {
+			args = append(args, "--add-dir", dir)
+		}
+		return args
 	case "codex":
 		if mode == "yolo" {
 			return []string{"codex", "--dangerously-bypass-approvals-and-sandbox"}
 		}
-		return []string{"codex", "--ask-for-approval", "untrusted", "--sandbox", "workspace-write"}
+		args := []string{"codex", "--ask-for-approval", "untrusted", "--sandbox", "workspace-write"}
+		if dir := codexSkillsDir(homeDir); dir != "" {
+			args = append(args, "--add-dir", dir)
+		}
+		return args
 	default:
 		return []string{agent}
 	}
@@ -616,6 +1026,7 @@ func (r TmuxRuntime) envWithPath() []string {
 	if r.HomeDir != "" {
 		out = append(out, "HOME="+r.HomeDir)
 		out = append(out, "CLAUDE_CONFIG_DIR="+r.claudeConfigDir())
+		out = append(out, "CODEX_HOME="+r.codexHomeDir())
 	}
 	return out
 }
@@ -625,6 +1036,7 @@ func (r TmuxRuntime) tmuxEnvFlags() []string {
 	if r.HomeDir != "" {
 		flags = append(flags, "-e", "HOME="+r.HomeDir)
 		flags = append(flags, "-e", "CLAUDE_CONFIG_DIR="+r.claudeConfigDir())
+		flags = append(flags, "-e", "CODEX_HOME="+r.codexHomeDir())
 	}
 	if path := pathWithPrefix(r.ExtraPath); path != "" {
 		flags = append(flags, "-e", "PATH="+path)
@@ -636,11 +1048,47 @@ func (r TmuxRuntime) claudeConfigDir() string {
 	return filepath.Join(r.HomeDir, ".claude")
 }
 
+func (r TmuxRuntime) codexHomeDir() string {
+	return filepath.Join(r.HomeDir, ".codex")
+}
+
+func (r TmuxRuntime) ensurePersistentAgentDirs() error {
+	if r.HomeDir == "" {
+		return nil
+	}
+	for _, dir := range []string{
+		r.claudeConfigDir(),
+		r.codexHomeDir(),
+		claudeSkillsDir(r.HomeDir),
+		codexSkillsDir(r.HomeDir),
+	} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("create agent home dir %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+func claudeSkillsDir(homeDir string) string {
+	if homeDir == "" {
+		return ""
+	}
+	return filepath.Join(homeDir, ".claude", "skills")
+}
+
+func codexSkillsDir(homeDir string) string {
+	if homeDir == "" {
+		return ""
+	}
+	return filepath.Join(homeDir, ".codex", "skills")
+}
+
 func shouldReplaceEnv(kv string) bool {
 	for _, prefix := range []string{
 		"PATH=",
 		"HOME=",
 		"CLAUDE_CONFIG_DIR=",
+		"CODEX_HOME=",
 		"ANTHROPIC_API_KEY=",
 		"ANTHROPIC_AUTH_TOKEN=",
 		"CLAUDE_CODE_OAUTH_TOKEN=",
@@ -966,6 +1414,16 @@ func (TmuxRuntime) Capture(ctx context.Context, sessionID string) (string, error
 	out, err := exec.CommandContext(ctx, "tmux", "capture-pane", "-p", "-S", "-", "-t", tmuxName(sessionID)+":0.0").CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("tmux capture: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return string(out), nil
+}
+
+// CaptureVisible snapshots only the on-screen pane (no scrollback), so selector
+// parsing reflects the current frame and never picks up a stale earlier menu.
+func (TmuxRuntime) CaptureVisible(ctx context.Context, sessionID string) (string, error) {
+	out, err := exec.CommandContext(ctx, "tmux", "capture-pane", "-p", "-t", tmuxName(sessionID)+":0.0").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("tmux capture visible: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return string(out), nil
 }

@@ -94,6 +94,9 @@ func TestTmuxEnvFlagsCarryConfiguredHomeAndPath(t *testing.T) {
 	if !strings.Contains(flags, "CLAUDE_CONFIG_DIR="+filepath.Join(m.cfg.HomeDir, ".claude")) {
 		t.Fatalf("flags missing CLAUDE_CONFIG_DIR: %q", flags)
 	}
+	if !strings.Contains(flags, "CODEX_HOME="+filepath.Join(m.cfg.HomeDir, ".codex")) {
+		t.Fatalf("flags missing CODEX_HOME: %q", flags)
+	}
 	if !strings.Contains(flags, "PATH="+m.cfg.BinDir) {
 		t.Fatalf("flags missing BinDir PATH prefix: %q", flags)
 	}
@@ -103,12 +106,14 @@ func TestEnvForCaptiveStripsAmbientAnthropicCredentials(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "bad")
 	t.Setenv("ANTHROPIC_AUTH_TOKEN", "bad")
 	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "bad")
+	t.Setenv("CODEX_HOME", "/tmp/wrong-codex-home")
 	m := newTestManager(t)
 	env := strings.Join(m.envForCaptive(), "\n")
 	for _, forbidden := range []string{
 		"ANTHROPIC_API_KEY=bad",
 		"ANTHROPIC_AUTH_TOKEN=bad",
 		"CLAUDE_CODE_OAUTH_TOKEN=bad",
+		"CODEX_HOME=/tmp/wrong-codex-home",
 	} {
 		if strings.Contains(env, forbidden) {
 			t.Fatalf("env leaked %s: %q", forbidden, env)
@@ -116,6 +121,9 @@ func TestEnvForCaptiveStripsAmbientAnthropicCredentials(t *testing.T) {
 	}
 	if !strings.Contains(env, "CLAUDE_CONFIG_DIR="+filepath.Join(m.cfg.HomeDir, ".claude")) {
 		t.Fatalf("env missing CLAUDE_CONFIG_DIR: %q", env)
+	}
+	if !strings.Contains(env, "CODEX_HOME="+filepath.Join(m.cfg.HomeDir, ".codex")) {
+		t.Fatalf("env missing CODEX_HOME: %q", env)
 	}
 }
 
