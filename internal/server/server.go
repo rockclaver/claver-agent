@@ -29,6 +29,7 @@ import (
 	gh "github.com/rockclaver/claver-agent/internal/github"
 	"github.com/rockclaver/claver-agent/internal/inbox"
 	"github.com/rockclaver/claver-agent/internal/infra"
+	"github.com/rockclaver/claver-agent/internal/inventory"
 	"github.com/rockclaver/claver-agent/internal/memory"
 	"github.com/rockclaver/claver-agent/internal/notifications"
 	"github.com/rockclaver/claver-agent/internal/previews"
@@ -109,6 +110,9 @@ type Config struct {
 	// Actions, when non-nil, enables action.* kinds (AI Action Plane:
 	// top-level command jobs). Phase 1 is read-only — no mutation.
 	Actions *actions.Manager
+	// Inventory, when non-nil, enables inventory.* kinds (AI Action Plane:
+	// fleet capability snapshots for target resolution).
+	Inventory *inventory.Manager
 	// PushDevices, when non-nil, enables push.register / push.unregister
 	// for FCM device-token management.
 	PushDevices *store.Store
@@ -510,6 +514,8 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 		"action.get",
 		"action.cancel":
 		s.dispatchAction(ctx, c, writeMu, f)
+	case "inventory.capabilities":
+		s.dispatchInventory(ctx, c, writeMu, f)
 	case "push.register", "push.unregister", "push.list":
 		s.dispatchPush(ctx, c, writeMu, f)
 	case "memory.list",
@@ -3352,6 +3358,18 @@ func (s *Server) dispatchAction(ctx context.Context, c *websocket.Conn, writeMu 
 			return
 		}
 		s.writeOK(ctx, c, writeMu, f.ID, "action.cancel", map[string]any{"job": job})
+	}
+}
+
+func (s *Server) dispatchInventory(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
+	if s.cfg.Inventory == nil {
+		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "inventory subsystem not configured")
+		return
+	}
+	switch f.Kind {
+	case "inventory.capabilities":
+		snap := s.cfg.Inventory.SnapshotCapabilities(ctx)
+		s.writeOK(ctx, c, writeMu, f.ID, "inventory.capabilities", map[string]any{"snapshot": snap})
 	}
 }
 

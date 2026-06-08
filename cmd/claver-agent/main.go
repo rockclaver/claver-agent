@@ -21,6 +21,7 @@ import (
 	gh "github.com/rockclaver/claver-agent/internal/github"
 	"github.com/rockclaver/claver-agent/internal/inbox"
 	"github.com/rockclaver/claver-agent/internal/infra"
+	"github.com/rockclaver/claver-agent/internal/inventory"
 	"github.com/rockclaver/claver-agent/internal/memory"
 	"github.com/rockclaver/claver-agent/internal/notifications"
 	"github.com/rockclaver/claver-agent/internal/previews"
@@ -232,9 +233,9 @@ func main() {
 	}
 
 	// AI Action Plane orchestrator (Phase 1, read-only tracer). Until the
-	// Fleet Inventory + Target Resolver land (Phase 2), the planner cannot
-	// resolve a server/project/resource from free text, so it honestly returns
-	// "needs target" rather than guessing. No mutation happens in this phase.
+	// Target Resolver lands, the planner cannot resolve a server/project/resource
+	// from free text, so it honestly returns "needs target" rather than
+	// guessing. No mutation happens in this phase.
 	actionsMgr, err := actions.New(actions.Config{
 		Store: st,
 		Planner: actions.PlannerFunc(func(ctx context.Context, req actions.Request) (actions.Result, error) {
@@ -242,7 +243,7 @@ func main() {
 				Status:  actions.StatusNeedsTarget,
 				Summary: "target resolution is not available yet; specify the server/project explicitly",
 				Events: []actions.PlannerEvent{
-					{Type: "observation", Message: "read-only planner: no fleet inventory wired"},
+					{Type: "observation", Message: "read-only planner: target resolver is not wired"},
 				},
 			}, nil
 		}),
@@ -251,6 +252,16 @@ func main() {
 	if err != nil {
 		log.Fatalf("claver-agent: init actions: %v", err)
 	}
+	pushDeliveryConfigured := false
+	inventoryMgr := inventory.New(inventory.Config{
+		Docker:         dockerMgr,
+		Systemd:        systemdMgr,
+		Processes:      processMgr,
+		Previews:       previewMgr,
+		PushDevices:    st,
+		PushConfigured: func() bool { return pushDeliveryConfigured },
+		Auth:           authMgr,
+	})
 
 	inboxMgr := inbox.New()
 	inboxMgr.SetStateStore(st)
@@ -289,6 +300,7 @@ func main() {
 		Inbox:         inboxMgr,
 		Runbook:       runbookMgr,
 		Actions:       actionsMgr,
+		Inventory:     inventoryMgr,
 		PushDevices:   st,
 		Memory:        memoryMgr,
 		Cost:          costCalc,
@@ -330,6 +342,7 @@ func main() {
 			}
 			pushCleanup := pushHub.Subscribe(ctx, notificationHub)
 			defer pushCleanup()
+			pushDeliveryConfigured = true
 			log.Printf("claver-agent: FCM push enabled (project %s)", sa.ProjectID)
 		}
 	}
