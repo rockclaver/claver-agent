@@ -232,21 +232,19 @@ func main() {
 		log.Fatalf("claver-agent: init runbook: %v", err)
 	}
 
-	// AI Action Plane orchestrator (Phase 1, read-only tracer). Until the
-	// Target Resolver lands, the planner cannot resolve a server/project/resource
-	// from free text, so it honestly returns "needs target" rather than
-	// guessing. No mutation happens in this phase.
+	// AI Action Plane orchestrator (Phase 1, read-only tracer). The host-query
+	// planner answers server-scoped resource questions (memory, swap, disk, CPU,
+	// load) from live host metrics — the agent is itself the host, so these need
+	// no target resolution. Requests outside that scope still return "needs
+	// target" honestly, until the full target resolver is wired on the agent. No
+	// mutation happens in this phase.
+	hostname, _ := os.Hostname()
 	actionsMgr, err := actions.New(actions.Config{
 		Store: st,
-		Planner: actions.PlannerFunc(func(ctx context.Context, req actions.Request) (actions.Result, error) {
-			return actions.Result{
-				Status:  actions.StatusNeedsTarget,
-				Summary: "target resolution is not available yet; specify the server/project explicitly",
-				Events: []actions.PlannerEvent{
-					{Type: "observation", Message: "read-only planner: target resolver is not wired"},
-				},
-			}, nil
-		}),
+		Planner: actions.HostQueryPlanner{
+			Metrics:  infraMgr,
+			Hostname: hostname,
+		},
 		Notifications: notificationHub,
 	})
 	if err != nil {
