@@ -61,6 +61,11 @@ type RuntimeSpec struct {
 	Transport string
 	WorkDir   string
 	Output    io.Writer
+	// Emit publishes a persisted normalized event; EmitEphemeral publishes a
+	// live-only one. Set by Manager.Start for the structured transport; the
+	// terminal runtime ignores them and writes raw bytes to Output instead.
+	Emit          func(store.SessionEvent)
+	EmitEphemeral func(store.SessionEvent)
 	// ClaudeSessionID, when set, is passed to the claude CLI via --session-id so
 	// its transcript file is named deterministically and we can read real token
 	// usage from it. Empty for non-claude agents.
@@ -157,7 +162,7 @@ func (m *Manager) Start(ctx context.Context, projectID, agent, runMode, transpor
 	// Claude transcripts are keyed by session UUID; minting one and passing it
 	// to the CLI lets the usage poller find this session's transcript precisely.
 	var claudeSessionID string
-	if agent == "claude" && m.ClaudeProjectsDir != "" {
+	if agent == "claude" && m.ClaudeProjectsDir != "" && transport != TransportStructured {
 		claudeSessionID = uuid.NewString()
 	}
 	w := &eventWriter{manager: m, sessionID: id, eventType: "stdout"}
@@ -169,6 +174,8 @@ func (m *Manager) Start(ctx context.Context, projectID, agent, runMode, transpor
 		WorkDir:         m.Projects.WorkspaceDir(projectID),
 		Output:          w,
 		ClaudeSessionID: claudeSessionID,
+		Emit:            func(ev store.SessionEvent) { _, _ = m.Publish(ev) },
+		EmitEphemeral:   m.publishEphemeral,
 	}); err != nil {
 		_ = m.Store.EndSession(id, m.Now())
 		return store.Session{}, err
@@ -671,6 +678,7 @@ func (m *Manager) Rehydrate(ctx context.Context) error {
 		if err := m.Runtime.Attach(ctx, RuntimeSpec{
 			SessionID: sess.ID,
 			Agent:     sess.Agent,
+			Transport: sess.Transport,
 			WorkDir:   m.Projects.WorkspaceDir(sess.ProjectID),
 			Output:    &eventWriter{manager: m, sessionID: sess.ID, eventType: "stdout"},
 		}); err != nil {
@@ -1086,16 +1094,24 @@ func agentCommandArgs(agent, runMode, homeDir string) []string {
 }
 
 func (r TmuxRuntime) envWithPath() []string {
+	return agentEnv(r.ExtraPath, r.HomeDir)
+}
+
+// agentEnv builds the environment for a launched agent CLI: ExtraPath prepended
+// to PATH, HOME/CLAUDE_CONFIG_DIR/CODEX_HOME pointed at the agent's stable home,
+// and ambient Anthropic credentials stripped so only the provisioned
+// subscription auth is used. Shared by the tmux and structured runtimes.
+func agentEnv(extraPath, homeDir string) []string {
 	env := os.Environ()
-	if r.ExtraPath == "" && r.HomeDir == "" {
+	if extraPath == "" && homeDir == "" {
 		return env
 	}
 	cur := os.Getenv("PATH")
 	newPath := cur
-	if r.ExtraPath != "" && cur != "" {
-		newPath = r.ExtraPath + ":" + cur
-	} else if r.ExtraPath != "" {
-		newPath = r.ExtraPath
+	if extraPath != "" && cur != "" {
+		newPath = extraPath + ":" + cur
+	} else if extraPath != "" {
+		newPath = extraPath
 	}
 	out := make([]string, 0, len(env))
 	for _, kv := range env {
@@ -1107,10 +1123,10 @@ func (r TmuxRuntime) envWithPath() []string {
 	if newPath != "" {
 		out = append(out, "PATH="+newPath)
 	}
-	if r.HomeDir != "" {
-		out = append(out, "HOME="+r.HomeDir)
-		out = append(out, "CLAUDE_CONFIG_DIR="+r.claudeConfigDir())
-		out = append(out, "CODEX_HOME="+r.codexHomeDir())
+	if homeDir != "" {
+		out = append(out, "HOME="+homeDir)
+		out = append(out, "CLAUDE_CONFIG_DIR="+filepath.Join(homeDir, ".claude"))
+		out = append(out, "CODEX_HOME="+filepath.Join(homeDir, ".codex"))
 	}
 	return out
 }
@@ -1137,14 +1153,20 @@ func (r TmuxRuntime) codexHomeDir() string {
 }
 
 func (r TmuxRuntime) ensurePersistentAgentDirs() error {
-	if r.HomeDir == "" {
+	return ensureAgentHomeDirs(r.HomeDir)
+}
+
+// ensureAgentHomeDirs creates the persistent config + skill directories the
+// agent CLIs read and write under homeDir. A no-op when homeDir is empty.
+func ensureAgentHomeDirs(homeDir string) error {
+	if homeDir == "" {
 		return nil
 	}
 	for _, dir := range []string{
-		r.claudeConfigDir(),
-		r.codexHomeDir(),
-		claudeSkillsDir(r.HomeDir),
-		codexSkillsDir(r.HomeDir),
+		filepath.Join(homeDir, ".claude"),
+		filepath.Join(homeDir, ".codex"),
+		claudeSkillsDir(homeDir),
+		codexSkillsDir(homeDir),
 	} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return fmt.Errorf("create agent home dir %s: %w", dir, err)

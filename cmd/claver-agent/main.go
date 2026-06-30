@@ -92,11 +92,24 @@ func main() {
 	if err != nil {
 		log.Fatalf("claver-agent: init cliauth: %v", err)
 	}
-	sessionMgr := sessions.New(st, mgr, sessions.TmuxRuntime{
+	terminalRuntime := sessions.TmuxRuntime{
 		ExtraPath: toolingMgr.BinDir(),
 		HomeDir:   homeDirOr(*dataDir),
 		Secrets:   authMgr.Secrets,
-	})
+	}
+	claudeRuntime := sessions.NewClaudeStructuredRuntime(toolingMgr.BinDir(), homeDirOr(*dataDir), authMgr.Secrets)
+	sessionRuntime := sessions.NewRoutingRuntime(
+		terminalRuntime,
+		map[string]sessions.Runtime{"claude": claudeRuntime},
+		func(sessionID string) (string, string) {
+			s, err := st.GetSession(sessionID)
+			if err != nil {
+				return "", ""
+			}
+			return s.Agent, s.Transport
+		},
+	)
+	sessionMgr := sessions.New(st, mgr, sessionRuntime)
 	// Real token usage is read from the claude CLI transcript root, which lives
 	// under the same HOME the runtime gives the CLI.
 	sessionMgr.ClaudeProjectsDir = filepath.Join(homeDirOr(*dataDir), ".claude", "projects")
