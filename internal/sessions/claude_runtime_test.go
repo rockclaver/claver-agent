@@ -240,6 +240,61 @@ func TestClaudeConn_ApprovalDeny(t *testing.T) {
 	}
 }
 
+func TestClaudeConn_AllowAlwaysSuppressesReprompt(t *testing.T) {
+	h := newConnHarness(t)
+	// First Bash approval prompts the user.
+	h.feed(t, `{"type":"control_request","request_id":"req-1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}`)
+	h.coll.waitForType(t, EvApprovalRequest, time.Second)
+	if err := h.conn.approve("req-1", DecisionAllowAlways, ""); err != nil {
+		t.Fatal(err)
+	}
+	h.out.read(t) // consume the allow response for req-1
+
+	// A second Bash call is auto-allowed by the standing rule: a control_response
+	// is written immediately and no new approval prompt is emitted.
+	h.feed(t, `{"type":"control_request","request_id":"req-2","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"pwd"}}}`)
+	resp := h.out.read(t)
+	inner, _ := resp["response"].(map[string]any)
+	if inner["request_id"] != "req-2" {
+		t.Fatalf("auto-allow request_id = %v", inner["request_id"])
+	}
+	rd, _ := inner["response"].(map[string]any)
+	if rd["behavior"] != "allow" {
+		t.Fatalf("auto-allow behavior = %v", rd)
+	}
+	if got := h.coll.byType(EvApprovalRequest); len(got) != 1 {
+		t.Fatalf("approval_request count = %d, want 1 (second auto-allowed)", len(got))
+	}
+}
+
+func TestClaudeConn_AllowAlwaysScopedToTool(t *testing.T) {
+	h := newConnHarness(t)
+	h.feed(t, `{"type":"control_request","request_id":"req-1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}`)
+	h.coll.waitForType(t, EvApprovalRequest, time.Second)
+	if err := h.conn.approve("req-1", DecisionAllowAlways, ""); err != nil {
+		t.Fatal(err)
+	}
+	h.out.read(t)
+
+	// A different tool is not covered by the Bash rule and still prompts.
+	h.feed(t, `{"type":"control_request","request_id":"req-2","request":{"subtype":"can_use_tool","tool_name":"Edit","input":{"file_path":"/x"}}}`)
+	deadline := time.Now().Add(time.Second)
+	var prompts []collectedEvent
+	for time.Now().Before(deadline) {
+		if prompts = h.coll.byType(EvApprovalRequest); len(prompts) >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(prompts) != 2 {
+		t.Fatalf("approval_request count = %d, want 2 (Edit not covered)", len(prompts))
+	}
+	var req ApprovalRequest
+	if err := json.Unmarshal([]byte(prompts[1].ev.Data), &req); err != nil || req.RequestID != "req-2" {
+		t.Fatalf("second prompt = %v %q", err, prompts[1].ev.Data)
+	}
+}
+
 func TestClaudeConn_InterruptAndSetMode(t *testing.T) {
 	h := newConnHarness(t)
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"strconv"
+	"strings"
 )
 
 // claude_translate.go converts the `claude` CLI's stream-json output (one NDJSON
@@ -244,7 +245,14 @@ func translateClaudeControlRequest(line []byte) ([]translated, error) {
 	if detail == "" {
 		detail = string(cr.Request.Input)
 	}
-	return []translated{{
+	var out []translated
+	if cr.Request.ToolName == "ExitPlanMode" {
+		out = append(out, translated{
+			Type:    EvPlan,
+			Payload: Plan{Items: parsePlanItems(cr.Request.Input), Gating: true},
+		})
+	}
+	out = append(out, translated{
 		Type: EvApprovalRequest,
 		Payload: ApprovalRequest{
 			RequestID: cr.RequestID,
@@ -253,7 +261,8 @@ func translateClaudeControlRequest(line []byte) ([]translated, error) {
 			Detail:    detail,
 			Options:   []string{DecisionAllow, DecisionAllowAlways, DecisionDeny},
 		},
-	}}, nil
+	})
+	return out, nil
 }
 
 // approvalKindForTool maps a Claude tool name to a normalized approval kind.
@@ -266,6 +275,57 @@ func approvalKindForTool(tool string) string {
 	default:
 		return ApprovalCommand
 	}
+}
+
+// parsePlanItems normalizes an ExitPlanMode tool input ({"plan": "..."}) into
+// display plan items: one per non-empty markdown line with leading list/heading
+// markers stripped. Falls back to a single item carrying the whole text.
+func parsePlanItems(input json.RawMessage) []PlanItem {
+	var in struct {
+		Plan string `json:"plan"`
+	}
+	_ = json.Unmarshal(input, &in)
+	text := strings.TrimSpace(in.Plan)
+	if text == "" {
+		return nil
+	}
+	var items []PlanItem
+	for _, raw := range strings.Split(text, "\n") {
+		line := stripListMarker(strings.TrimSpace(raw))
+		if line == "" {
+			continue
+		}
+		items = append(items, PlanItem{Title: line, Status: "pending"})
+	}
+	if len(items) == 0 {
+		return []PlanItem{{Title: text, Status: "pending"}}
+	}
+	return items
+}
+
+// stripListMarker removes a leading markdown heading, bullet, or ordered-list
+// marker from one line.
+func stripListMarker(line string) string {
+	h := 0
+	for h < len(line) && line[h] == '#' {
+		h++
+	}
+	if h > 0 && h < len(line) && line[h] == ' ' {
+		return strings.TrimSpace(line[h+1:])
+	}
+	for _, p := range []string{"- ", "* ", "+ "} {
+		if strings.HasPrefix(line, p) {
+			return strings.TrimSpace(line[len(p):])
+		}
+	}
+	i := 0
+	for i < len(line) && line[i] >= '0' && line[i] <= '9' {
+		i++
+	}
+	if i > 0 && i < len(line) && line[i] == '.' {
+		return strings.TrimSpace(line[i+1:])
+	}
+	return line
 }
 
 // decodeContentBlocks parses a message's content field, which is either a JSON

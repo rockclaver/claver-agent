@@ -2693,3 +2693,85 @@ func TestSession_ApprovalAndSetModeOverWS(t *testing.T) {
 		t.Fatalf("set_mode kind = %q want session.set_mode", resp.Kind)
 	}
 }
+
+// AC (Phase 3): allowing a structured approval requires a valid, action-bound
+// confirmation_token; deny needs none.
+func TestSession_ApprovalConsumesConfirmationToken(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	pm, err := projects.New(filepath.Join(dir, "p"), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pm.IDGen = func() string { return "p1" }
+	if _, err := pm.CreateEmpty("demo"); err != nil {
+		t.Fatal(err)
+	}
+	rm := review.New(pm, st, review.HeuristicSummarizer{})
+	sm := sessions.New(st, pm, fakeSessionRuntime{})
+	sm.IDGen = func() string { return "s1" }
+	if _, err := sm.Start(context.Background(), "p1", "claude", "manual", "structured"); err != nil {
+		t.Fatal(err)
+	}
+
+	wsURL, stop := startTestServerWith(t, Config{Addr: "127.0.0.1:0", Projects: pm, Sessions: sm, Review: rm})
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close(websocket.StatusNormalClosure, "")
+
+	send := func(id, kind string, payload map[string]any) Frame {
+		b, _ := json.Marshal(payload)
+		req, _ := json.Marshal(Frame{ID: id, Kind: kind, Payload: b})
+		if err := c.Write(ctx, websocket.MessageText, req); err != nil {
+			t.Fatalf("write %s: %v", kind, err)
+		}
+		_, data, err := c.Read(ctx)
+		if err != nil {
+			t.Fatalf("read %s: %v", kind, err)
+		}
+		var resp Frame
+		if err := json.Unmarshal(data, &resp); err != nil {
+			t.Fatalf("unmarshal %s: %v", kind, err)
+		}
+		return resp
+	}
+
+	// allow without a token is rejected.
+	resp := send("a", "session.approval", map[string]any{
+		"session_id": "s1", "request_id": "req_1", "decision": "allow",
+	})
+	if resp.Kind != "error.token_invalid" {
+		t.Fatalf("untokened allow kind = %q want error.token_invalid", resp.Kind)
+	}
+
+	// allow with a token bound to (session.approve, p1, [], req_1) succeeds.
+	tok, err := rm.MintConfirmationToken("session.approve", "p1", nil, "req_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp = send("b", "session.approval", map[string]any{
+		"session_id": "s1", "request_id": "req_1", "decision": "allow",
+		"confirmation_token": tok.Token,
+	})
+	if resp.Kind != "session.approval" {
+		t.Fatalf("tokened allow kind = %q want session.approval", resp.Kind)
+	}
+
+	// deny needs no token.
+	resp = send("d", "session.approval", map[string]any{
+		"session_id": "s1", "request_id": "req_2", "decision": "deny",
+	})
+	if resp.Kind != "session.approval" {
+		t.Fatalf("deny kind = %q want session.approval", resp.Kind)
+	}
+}

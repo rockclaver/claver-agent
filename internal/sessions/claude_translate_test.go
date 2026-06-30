@@ -120,6 +120,31 @@ func TestTranslateClaude_Permission(t *testing.T) {
 	}
 }
 
+func TestTranslateClaude_ExitPlanMode(t *testing.T) {
+	evs := translateFixture(t, "plan.ndjson")
+	want := []string{EvPlan, EvApprovalRequest}
+	if !eqStrings(types(evs), want) {
+		t.Fatalf("types = %v want %v", types(evs), want)
+	}
+	plan := evs[0].Payload.(Plan)
+	if !plan.Gating {
+		t.Fatalf("ExitPlanMode plan must gate: %+v", plan)
+	}
+	wantItems := []string{"Steps", "Read the code", "Write the fix", "Run tests"}
+	if len(plan.Items) != len(wantItems) {
+		t.Fatalf("items = %+v want %v", plan.Items, wantItems)
+	}
+	for i, it := range plan.Items {
+		if it.Title != wantItems[i] || it.Status != "pending" {
+			t.Fatalf("item %d = %+v", i, it)
+		}
+	}
+	ap := evs[1].Payload.(ApprovalRequest)
+	if ap.Kind != ApprovalPlan || ap.RequestID != "req-plan-1" {
+		t.Fatalf("approval = %+v", ap)
+	}
+}
+
 func TestTranslateClaude_Partial(t *testing.T) {
 	evs := translateFixture(t, "partial.ndjson")
 	want := []string{EvMessageDelta, EvMessageDelta}

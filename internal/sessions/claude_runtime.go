@@ -74,6 +74,8 @@ type claudeConn struct {
 	reqN      int
 	pending   map[string]chan json.RawMessage // parent->CLI request_id -> response
 	approvals map[string]json.RawMessage      // CLI can_use_tool request_id -> original input
+	tools     map[string]string               // can_use_tool request_id -> tool name
+	always    map[string]bool                 // tool name -> standing allow for this session
 }
 
 func newClaudeConn(sink claudeSink, stdin io.Writer) *claudeConn {
@@ -82,6 +84,8 @@ func newClaudeConn(sink claudeSink, stdin io.Writer) *claudeConn {
 		stdin:     stdin,
 		pending:   make(map[string]chan json.RawMessage),
 		approvals: make(map[string]json.RawMessage),
+		tools:     make(map[string]string),
+		always:    make(map[string]bool),
 	}
 }
 
@@ -117,6 +121,9 @@ func (c *claudeConn) handleLine(line []byte) {
 	case "control_request":
 		// Record the tool input so SendApproval can echo it back as updatedInput.
 		c.recordApproval(line)
+		if c.maybeAutoAllow(line) {
+			return // a standing allow_always rule answered it; no prompt emitted.
+		}
 	}
 	evs, err := translateClaudeLine(line)
 	if err != nil {
@@ -131,8 +138,9 @@ func (c *claudeConn) recordApproval(line []byte) {
 	var cr struct {
 		RequestID string `json:"request_id"`
 		Request   struct {
-			Subtype string          `json:"subtype"`
-			Input   json.RawMessage `json:"input"`
+			Subtype  string          `json:"subtype"`
+			ToolName string          `json:"tool_name"`
+			Input    json.RawMessage `json:"input"`
 		} `json:"request"`
 	}
 	if json.Unmarshal(line, &cr) != nil || cr.Request.Subtype != "can_use_tool" {
@@ -140,6 +148,7 @@ func (c *claudeConn) recordApproval(line []byte) {
 	}
 	c.reqMu.Lock()
 	c.approvals[cr.RequestID] = cr.Request.Input
+	c.tools[cr.RequestID] = cr.Request.ToolName
 	c.reqMu.Unlock()
 }
 
@@ -152,7 +161,32 @@ func (c *claudeConn) dropApproval(line []byte) {
 	}
 	c.reqMu.Lock()
 	delete(c.approvals, m.RequestID)
+	delete(c.tools, m.RequestID)
 	c.reqMu.Unlock()
+}
+
+// maybeAutoAllow answers a can_use_tool control_request immediately when a
+// prior allow_always created a standing rule for its tool, so the user is not
+// re-prompted for the same tool. Returns true if it consumed the request.
+func (c *claudeConn) maybeAutoAllow(line []byte) bool {
+	var cr struct {
+		RequestID string `json:"request_id"`
+		Request   struct {
+			Subtype  string `json:"subtype"`
+			ToolName string `json:"tool_name"`
+		} `json:"request"`
+	}
+	if json.Unmarshal(line, &cr) != nil || cr.Request.Subtype != "can_use_tool" {
+		return false
+	}
+	c.reqMu.Lock()
+	allowed := c.always[cr.Request.ToolName]
+	c.reqMu.Unlock()
+	if !allowed {
+		return false
+	}
+	_ = c.approve(cr.RequestID, DecisionAllow, "")
+	return true
 }
 
 func (c *claudeConn) routeControlResponse(line []byte) {
@@ -264,6 +298,11 @@ func (c *claudeConn) approve(requestID, decision, note string) error {
 	c.reqMu.Lock()
 	input := c.approvals[requestID]
 	delete(c.approvals, requestID)
+	tool := c.tools[requestID]
+	delete(c.tools, requestID)
+	if decision == DecisionAllowAlways && tool != "" {
+		c.always[tool] = true
+	}
 	c.reqMu.Unlock()
 
 	var respData map[string]any
@@ -277,8 +316,8 @@ func (c *claudeConn) approve(requestID, decision, note string) error {
 		if len(input) == 0 {
 			input = json.RawMessage("{}")
 		}
-		// allow_always behaves as allow here; persisting a standing rule
-		// (updatedPermissions) is deferred to Phase 3.
+		// allow and allow_always both allow the call; allow_always additionally
+		// recorded a session-scoped standing rule above (see c.always).
 		respData = map[string]any{"behavior": "allow", "updatedInput": input}
 	}
 	return c.writeJSON(map[string]any{

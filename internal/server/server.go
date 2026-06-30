@@ -777,14 +777,31 @@ func (s *Server) dispatchSession(ctx context.Context, c *websocket.Conn, writeMu
 		s.writeOK(ctx, c, writeMu, f.ID, "session.question_decision", map[string]any{"session_id": in.SessionID})
 	case "session.approval":
 		var in struct {
-			SessionID string `json:"session_id"`
-			RequestID string `json:"request_id"`
-			Decision  string `json:"decision"`
-			Note      string `json:"note"`
+			SessionID         string `json:"session_id"`
+			RequestID         string `json:"request_id"`
+			Decision          string `json:"decision"`
+			Note              string `json:"note"`
+			ConfirmationToken string `json:"confirmation_token"`
 		}
 		if err := json.Unmarshal(f.Payload, &in); err != nil || in.SessionID == "" {
 			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "session_id required")
 			return
+		}
+		// Allowing an action is biometric-gated on the client; the agent
+		// re-verifies by consuming the single-use confirmation_token bound to
+		// (session.approve, project_id, [], request_id). Deny is always safe and
+		// carries no token. Skipped when the review subsystem is not configured.
+		if s.cfg.Review != nil &&
+			(in.Decision == sessions.DecisionAllow || in.Decision == sessions.DecisionAllowAlways) {
+			sess, err := mgr.Store.GetSession(in.SessionID)
+			if err != nil {
+				s.writeSessionErr(ctx, c, writeMu, f.ID, err)
+				return
+			}
+			if err := s.cfg.Review.ConsumeToken(in.ConfirmationToken, "session.approve", sess.ProjectID, nil, in.RequestID); err != nil {
+				s.writeReviewErr(ctx, c, writeMu, f.ID, err)
+				return
+			}
 		}
 		if err := mgr.SendApproval(ctx, in.SessionID, in.RequestID, in.Decision, in.Note); err != nil {
 			s.writeSessionErr(ctx, c, writeMu, f.ID, err)
