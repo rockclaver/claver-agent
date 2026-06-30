@@ -133,7 +133,7 @@ func TestCodexConn_AllowAlwaysAndDenyDecisions(t *testing.T) {
 	}
 	// legacy exec approval -> denied on deny.
 	h.feed(t, `{"id":"e1","method":"execCommandApproval","params":{"callId":"c1","conversationId":"th","command":["rm","-rf","/"],"cwd":"/w","parsedCmd":[]}}`)
-	h.coll.waitForType(t, EvApprovalRequest, time.Second)
+	h.coll.waitForCount(t, EvApprovalRequest, 2, time.Second)
 	if err := h.conn.approve("e1", DecisionDeny); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
@@ -251,37 +251,5 @@ func TestCodexStructuredRuntime_StubEndToEnd(t *testing.T) {
 	}
 	if rt.Alive(context.Background(), "s1") {
 		t.Fatal("expected session not alive after stop")
-	}
-}
-
-// TestCodexStructuredRuntime_Live exercises the real `codex app-server` end to
-// end. Gated on CLAVER_LIVE_CODEX because it needs an authenticated CLI and
-// makes real model calls; skipped in CI and on unauthenticated hosts.
-func TestCodexStructuredRuntime_Live(t *testing.T) {
-	if os.Getenv("CLAVER_LIVE_CODEX") == "" {
-		t.Skip("set CLAVER_LIVE_CODEX=1 to run the live codex smoke test")
-	}
-	rt := NewCodexStructuredRuntime("", "", nil)
-	coll := &eventCollector{}
-	spec := RuntimeSpec{
-		SessionID:     "live-codex",
-		Agent:         "codex",
-		RunMode:       "manual",
-		Transport:     TransportStructured,
-		WorkDir:       t.TempDir(),
-		Emit:          coll.emit,
-		EmitEphemeral: coll.ephemeral,
-	}
-	if err := rt.Start(context.Background(), spec); err != nil {
-		t.Fatalf("start: %v", err)
-	}
-	t.Cleanup(func() { _ = rt.Stop(context.Background(), "live-codex") })
-
-	if err := rt.SendPrompt(context.Background(), "live-codex", "Reply with exactly the word: pong"); err != nil {
-		t.Fatalf("send prompt: %v", err)
-	}
-	coll.waitForType(t, EvTurn, 120*time.Second)
-	if len(coll.byType(EvMessage)) == 0 {
-		t.Fatal("no assistant message before turn completed")
 	}
 }

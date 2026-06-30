@@ -57,6 +57,23 @@ func (c *eventCollector) waitForType(t *testing.T, typ string, d time.Duration) 
 	return collectedEvent{}
 }
 
+// waitForCount waits until at least n events of typ have been collected and
+// returns the nth (1-indexed). Unlike waitForType it does not return on a stale
+// earlier event, so a test can feed a second event of an already-seen type and
+// act on it only after the conn has actually processed it.
+func (c *eventCollector) waitForCount(t *testing.T, typ string, n int, d time.Duration) collectedEvent {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if m := c.byType(typ); len(m) >= n {
+			return m[n-1]
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d %q events", n, typ)
+	return collectedEvent{}
+}
+
 // lineCapture is a non-blocking io.Writer that pushes each complete line written
 // to it onto a channel, so a test can read what the conn sent to the CLI without
 // blocking the conn's writes (unlike io.Pipe).

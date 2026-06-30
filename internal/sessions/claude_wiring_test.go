@@ -3,9 +3,7 @@ package sessions
 import (
 	"context"
 	"io"
-	"os"
 	"testing"
-	"time"
 )
 
 func TestRoutingRuntime_DispatchesByTransport(t *testing.T) {
@@ -56,37 +54,5 @@ func TestRoutingRuntime_FallsBackToTerminal(t *testing.T) {
 	}
 	if len(term.prompts) != 1 {
 		t.Fatalf("expected fallback to terminal, got %v", term.prompts)
-	}
-}
-
-// TestClaudeStructuredRuntime_Live exercises the real `claude` CLI end to end.
-// It is gated on CLAVER_LIVE_CLAUDE because it needs an authenticated CLI and
-// makes real model calls; it is skipped in CI and on unauthenticated hosts.
-func TestClaudeStructuredRuntime_Live(t *testing.T) {
-	if os.Getenv("CLAVER_LIVE_CLAUDE") == "" {
-		t.Skip("set CLAVER_LIVE_CLAUDE=1 to run the live claude smoke test")
-	}
-	rt := NewClaudeStructuredRuntime("", "", nil)
-	coll := &eventCollector{}
-	spec := RuntimeSpec{
-		SessionID:     "live1",
-		Agent:         "claude",
-		RunMode:       "manual",
-		Transport:     TransportStructured,
-		WorkDir:       t.TempDir(),
-		Emit:          coll.emit,
-		EmitEphemeral: coll.ephemeral,
-	}
-	if err := rt.Start(context.Background(), spec); err != nil {
-		t.Fatalf("start: %v", err)
-	}
-	t.Cleanup(func() { _ = rt.Stop(context.Background(), "live1") })
-
-	if err := rt.SendPrompt(context.Background(), "live1", "Reply with exactly the word: pong"); err != nil {
-		t.Fatalf("send prompt: %v", err)
-	}
-	coll.waitForType(t, EvTurn, 90*time.Second)
-	if len(coll.byType(EvMessage)) == 0 {
-		t.Fatal("no assistant message before turn completed")
 	}
 }

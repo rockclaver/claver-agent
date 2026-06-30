@@ -76,6 +76,7 @@ func (c *claudeConn) handleLine(line []byte) {
 		Type string `json:"type"`
 	}
 	if json.Unmarshal(line, &env) != nil {
+		c.sink.warnf("claude: dropping malformed protocol line: %s", truncateLine(line))
 		return
 	}
 	switch env.Type {
@@ -94,7 +95,8 @@ func (c *claudeConn) handleLine(line []byte) {
 	}
 	evs, err := translateClaudeLine(line)
 	if err != nil {
-		return // malformed line: log-and-skip semantics
+		c.sink.warnf("claude: skipping untranslatable protocol line (%v): %s", err, truncateLine(line))
+		return
 	}
 	for _, tr := range evs {
 		c.sink.publish(tr)

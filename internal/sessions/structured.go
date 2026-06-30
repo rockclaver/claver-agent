@@ -6,7 +6,12 @@ package sessions
 // through a structuredSink; the translate step produces []translated, which the
 // sink fans out to the Manager's persisted/ephemeral publish paths.
 
-import "github.com/rockclaver/claver-agent/internal/store"
+import (
+	"log"
+	"strings"
+
+	"github.com/rockclaver/claver-agent/internal/store"
+)
 
 // translated is one normalized event a runtime will publish. Ephemeral events
 // (streaming deltas) are delivered live-only; the rest are persisted.
@@ -22,6 +27,19 @@ type structuredSink struct {
 	sessionID string
 	emit      func(store.SessionEvent) // persisted
 	ephemeral func(store.SessionEvent) // live-only
+	warn      func(string, ...any)     // operator log for dropped/unknown lines; nil ⇒ stderr
+}
+
+// warnf logs a dropped or unknown protocol line. It never tears the session
+// down: the runtime read loop logs and skips so one bad frame cannot kill an
+// otherwise healthy stream. Defaults to the standard logger (stderr) when no
+// sink-specific hook is set (tests inject one to assert the log fired).
+func (s structuredSink) warnf(format string, args ...any) {
+	if s.warn != nil {
+		s.warn(format, args...)
+		return
+	}
+	log.Printf(format, args...)
 }
 
 func (s structuredSink) publish(tr translated) {
@@ -48,4 +66,16 @@ func (s structuredSink) publishError(msg string, fatal bool) {
 	if err == nil {
 		s.emit(ev)
 	}
+}
+
+// truncateLine bounds a raw protocol line so a malformed-frame log entry cannot
+// dump a megabyte of payload into the operator log. It trims the trailing
+// newline and caps the body, marking truncation.
+func truncateLine(line []byte) string {
+	const max = 256
+	s := strings.TrimRight(string(line), "\r\n")
+	if len(s) > max {
+		return s[:max] + "…(truncated)"
+	}
+	return s
 }

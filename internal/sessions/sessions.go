@@ -622,12 +622,23 @@ func (m *Manager) Subscribe(ctx context.Context, sessionID string, afterSeq int6
 	go func() {
 		defer close(out)
 		defer close(finished)
+		// maxReplayed is the highest persisted seq already delivered from the
+		// replay snapshot. AppendSessionEvent and fanout are not atomic, so an
+		// event appended just before our snapshot but fanned out just after we
+		// registered would arrive on sub.ch a second time. Skipping live
+		// persisted events at or below the high-water mark de-dupes that
+		// replay/live boundary without holding the manager lock across the store
+		// write. Ephemeral deltas (seq 0) are never persisted and always pass.
+		maxReplayed := afterSeq
 		for _, ev := range replay {
 			// Never replay interactive-menu prompts: sessions created before the
 			// structured cutover still have ask_question rows persisted, and
 			// replaying them would re-pop sheets the user already answered.
 			if ev.Type == "ask_question" {
 				continue
+			}
+			if ev.Seq > maxReplayed {
+				maxReplayed = ev.Seq
 			}
 			select {
 			case out <- ev:
@@ -638,6 +649,9 @@ func (m *Manager) Subscribe(ctx context.Context, sessionID string, afterSeq int6
 		for {
 			select {
 			case ev := <-sub.ch:
+				if ev.Seq > 0 && ev.Seq <= maxReplayed {
+					continue // already delivered by replay; drop the racing duplicate
+				}
 				select {
 				case out <- ev:
 				case <-subCtx.Done():

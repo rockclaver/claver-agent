@@ -89,6 +89,7 @@ func (c *codexConn) handleLine(line []byte) {
 		Error  json.RawMessage `json:"error"`
 	}
 	if json.Unmarshal(line, &env) != nil {
+		c.sink.warnf("codex: dropping malformed protocol line: %s", truncateLine(line))
 		return
 	}
 	hasID := len(env.ID) > 0 && string(env.ID) != "null"
@@ -101,6 +102,7 @@ func (c *codexConn) handleLine(line []byte) {
 		// A server->client request. Only exec/patch approvals are answerable;
 		// decline everything else so the app-server is never left waiting.
 		if !codexApprovalMethods[env.Method] {
+			c.sink.warnf("codex: declining unsupported server request %q", env.Method)
 			c.respondError(env.ID, -32601, "unsupported request: "+env.Method)
 			return
 		}
@@ -111,7 +113,8 @@ func (c *codexConn) handleLine(line []byte) {
 	}
 	evs, err := translateCodexLine(line)
 	if err != nil {
-		return // malformed line: log-and-skip semantics
+		c.sink.warnf("codex: skipping untranslatable protocol line (%v): %s", err, truncateLine(line))
+		return
 	}
 	for _, tr := range evs {
 		c.sink.publish(tr)
