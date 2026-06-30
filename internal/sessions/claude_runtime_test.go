@@ -120,7 +120,7 @@ func newConnHarness(t *testing.T) *connHarness {
 	stdoutR, stdoutW := io.Pipe()
 	out := newLineCapture()
 	coll := &eventCollector{}
-	conn := newClaudeConn(claudeSink{sessionID: "s1", emit: coll.emit, ephemeral: coll.ephemeral}, out)
+	conn := newClaudeConn(structuredSink{sessionID: "s1", emit: coll.emit, ephemeral: coll.ephemeral}, out)
 	go conn.run(stdoutR)
 	t.Cleanup(func() { _ = stdoutW.Close() })
 	return &connHarness{conn: conn, stdout: stdoutW, out: out, coll: coll}

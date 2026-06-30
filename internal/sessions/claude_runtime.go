@@ -29,43 +29,10 @@ import (
 // control_request (initialize/interrupt/set_permission_mode).
 const controlTimeout = 60 * time.Second
 
-// claudeSink publishes normalized events for one session back to the Manager.
-type claudeSink struct {
-	sessionID string
-	emit      func(store.SessionEvent) // persisted
-	ephemeral func(store.SessionEvent) // live-only
-}
-
-func (s claudeSink) publish(tr translated) {
-	ev, err := normalizedEvent(s.sessionID, tr.Type, tr.Payload)
-	if err != nil {
-		return
-	}
-	if tr.Ephemeral {
-		if s.ephemeral != nil {
-			s.ephemeral(ev)
-		}
-		return
-	}
-	if s.emit != nil {
-		s.emit(ev)
-	}
-}
-
-func (s claudeSink) publishError(msg string, fatal bool) {
-	if s.emit == nil {
-		return
-	}
-	ev, err := normalizedEvent(s.sessionID, EvError, ErrorEvent{Message: msg, Fatal: fatal})
-	if err == nil {
-		s.emit(ev)
-	}
-}
-
 // claudeConn is the protocol engine over a CLI process's stdio. It is split from
 // process management so it can be unit-tested over in-memory pipes.
 type claudeConn struct {
-	sink  claudeSink
+	sink  structuredSink
 	stdin io.Writer
 
 	writeMu sync.Mutex
@@ -78,7 +45,7 @@ type claudeConn struct {
 	always    map[string]bool                 // tool name -> standing allow for this session
 }
 
-func newClaudeConn(sink claudeSink, stdin io.Writer) *claudeConn {
+func newClaudeConn(sink structuredSink, stdin io.Writer) *claudeConn {
 	return &claudeConn{
 		sink:      sink,
 		stdin:     stdin,
@@ -426,7 +393,7 @@ func (r *ClaudeStructuredRuntime) Start(ctx context.Context, spec RuntimeSpec) e
 		return fmt.Errorf("start claude: %w", err)
 	}
 
-	sink := claudeSink{sessionID: spec.SessionID, emit: spec.Emit, ephemeral: spec.EmitEphemeral}
+	sink := structuredSink{sessionID: spec.SessionID, emit: spec.Emit, ephemeral: spec.EmitEphemeral}
 	conn := newClaudeConn(sink, stdin)
 	proc := &claudeProc{conn: conn, cancel: cancel, stdin: stdin}
 	r.mu.Lock()

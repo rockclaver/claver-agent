@@ -14,14 +14,6 @@ import (
 // assistant, result) and the official @anthropic-ai/claude-agent-sdk source for
 // content blocks and the can_use_tool control_request.
 
-// translated is one normalized event the runtime will publish. Ephemeral events
-// (streaming deltas) are delivered live-only; the rest are persisted.
-type translated struct {
-	Type      string
-	Payload   any
-	Ephemeral bool
-}
-
 // --- Claude stream-json wire structs (only the fields we consume) ---
 
 type claudeInnerMessage struct {

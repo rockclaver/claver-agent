@@ -47,6 +47,7 @@ func main() {
 	previewExpectedIP := flag.String("preview-expected-ip", os.Getenv("CLAVER_PREVIEW_EXPECTED_IP"), "if set, DNS validation requires the wildcard to resolve to this IP")
 	fcmServiceAccount := flag.String("fcm-service-account", envOr("CLAVER_FCM_SERVICE_ACCOUNT", ""), "path to Firebase service-account JSON; enables server-side push when set")
 	runbookAgent := flag.String("runbook-agent", envOr("CLAVER_RUNBOOK_AGENT", "claude"), "AI CLI to use for runbook generation (claude|codex)")
+	codexRuntimeKind := flag.String("codex-runtime", envOr("CLAVER_CODEX_RUNTIME", "app-server"), "codex structured runtime: app-server (default) or exec (fallback)")
 	serverID := flag.String("server-id", envOr("CLAVER_SERVER_ID", "local"), "stable id labelling this server's cost/usage rows in the cross-fleet dashboard")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
@@ -98,9 +99,15 @@ func main() {
 		Secrets:   authMgr.Secrets,
 	}
 	claudeRuntime := sessions.NewClaudeStructuredRuntime(toolingMgr.BinDir(), homeDirOr(*dataDir), authMgr.Secrets)
+	// Codex defaults to the richer app-server protocol; the exec --json fallback
+	// is selectable for hosts where app-server is unavailable.
+	var codexRuntime sessions.Runtime = sessions.NewCodexStructuredRuntime(toolingMgr.BinDir(), homeDirOr(*dataDir), authMgr.Secrets)
+	if *codexRuntimeKind == "exec" {
+		codexRuntime = sessions.NewCodexExecRuntime(toolingMgr.BinDir(), homeDirOr(*dataDir), authMgr.Secrets)
+	}
 	sessionRuntime := sessions.NewRoutingRuntime(
 		terminalRuntime,
-		map[string]sessions.Runtime{"claude": claudeRuntime},
+		map[string]sessions.Runtime{"claude": claudeRuntime, "codex": codexRuntime},
 		func(sessionID string) (string, string) {
 			s, err := st.GetSession(sessionID)
 			if err != nil {
