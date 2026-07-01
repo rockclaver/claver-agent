@@ -532,7 +532,7 @@ func (m *Manager) listDarwin(ctx context.Context, sortBy string, limit int) ([]P
 	if err != nil {
 		return nil, err
 	}
-	protected := m.protected(ctx)
+	protected := m.protectedDarwin(ctx, out)
 	for i := range out {
 		if reason, ok := protected[out[i].PID]; ok {
 			out[i].Protected = true
@@ -557,6 +557,24 @@ func (m *Manager) listDarwin(ctx context.Context, sortBy string, limit int) ([]P
 	return out, nil
 }
 
+func (m *Manager) protectedDarwin(ctx context.Context, procs []Process) map[int]string {
+	out := map[int]string{
+		1:          "pid 1/init must never be signalled",
+		m.agentPID: "Claver agent supervises this request",
+	}
+	for _, p := range procs {
+		if processCommandContains(p, "sshd") {
+			out[p.PID] = "SSH daemon is the transport into the agent"
+		}
+	}
+	for _, pid := range m.tmuxPanePIDs(ctx) {
+		if pid > 0 {
+			out[pid] = "tmux session pane backs an active agent session"
+		}
+	}
+	return out
+}
+
 func (m *Manager) readDarwinProcess(pid int) (Process, error) {
 	for _, p := range m.mustDarwinProcesses(context.Background()) {
 		if p.PID == pid {
@@ -569,16 +587,20 @@ func (m *Manager) readDarwinProcess(pid int) (Process, error) {
 func (m *Manager) darwinPIDsByCommand(needle string) []int {
 	var pids []int
 	for _, p := range m.mustDarwinProcesses(context.Background()) {
-		fields := strings.Fields(p.Command)
-		base := ""
-		if len(fields) > 0 {
-			base = filepath.Base(fields[0])
-		}
-		if strings.Contains(base, needle) || strings.Contains(p.Command, needle) {
+		if processCommandContains(p, needle) {
 			pids = append(pids, p.PID)
 		}
 	}
 	return pids
+}
+
+func processCommandContains(p Process, needle string) bool {
+	fields := strings.Fields(p.Command)
+	base := ""
+	if len(fields) > 0 {
+		base = filepath.Base(fields[0])
+	}
+	return strings.Contains(base, needle) || strings.Contains(p.Command, needle)
 }
 
 func (m *Manager) mustDarwinProcesses(ctx context.Context) []Process {

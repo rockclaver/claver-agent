@@ -376,18 +376,10 @@ func (l *LsofSocketReader) Listening(ctx context.Context) ([]Socket, error) {
 		run = defaultRunner
 	}
 	tcpOut, tcpErr := run(ctx, "lsof", "-nP", "-iTCP", "-sTCP:LISTEN")
-	udpOut, udpErr := run(ctx, "lsof", "-nP", "-iUDP")
-	if tcpErr != nil && udpErr != nil {
-		return nil, fmt.Errorf("lsof: tcp: %v; udp: %v", tcpErr, udpErr)
+	if tcpErr != nil {
+		return nil, fmt.Errorf("lsof: tcp: %w", tcpErr)
 	}
-	var out []Socket
-	if tcpErr == nil {
-		out = append(out, parseLsof(string(tcpOut), ProtoTCP)...)
-	}
-	if udpErr == nil {
-		out = append(out, parseLsof(string(udpOut), ProtoUDP)...)
-	}
-	return dedupeSockets(out), nil
+	return dedupeSockets(parseLsof(string(tcpOut), ProtoTCP)), nil
 }
 
 var lsofPortRE = regexp.MustCompile(`:(\d+)(?:\s|\(|$)`)

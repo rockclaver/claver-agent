@@ -184,7 +184,10 @@ func (m *Manager) Status(ctx context.Context) (Status, error) {
 	if sockErr != nil {
 		sockets = nil
 	}
-	sshPorts := m.ssh.SSHPorts(ctx)
+	sshPorts := sshPortsFromSockets(sockets)
+	if len(sshPorts) == 0 {
+		sshPorts = m.ssh.SSHPorts(ctx)
+	}
 	sort.Ints(sshPorts)
 
 	backend, reason := m.detect(ctx)
@@ -215,6 +218,22 @@ func (m *Manager) Status(ctx context.Context) (Status, error) {
 		Sockets:   sockets,
 		SSHPorts:  sshPorts,
 	}, nil
+}
+
+func sshPortsFromSockets(sockets []Socket) []int {
+	seen := map[int]bool{}
+	var out []int
+	for _, sock := range sockets {
+		if sock.Process != "sshd" {
+			continue
+		}
+		if seen[sock.Port] {
+			continue
+		}
+		seen[sock.Port] = true
+		out = append(out, sock.Port)
+	}
+	return out
 }
 
 // RuleAdd adds a rule. The anti-lockout guard refuses any deny rule
