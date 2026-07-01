@@ -7,6 +7,8 @@ package sessions
 // sink fans out to the Manager's persisted/ephemeral publish paths.
 
 import (
+	"bufio"
+	"io"
 	"log"
 	"strings"
 
@@ -62,9 +64,32 @@ func (s structuredSink) publishError(msg string, fatal bool) {
 	if s.emit == nil {
 		return
 	}
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		return
+	}
 	ev, err := normalizedEvent(s.sessionID, EvError, ErrorEvent{Message: msg, Fatal: fatal})
 	if err == nil {
 		s.emit(ev)
+	}
+}
+
+func (s structuredSink) publishStderr(r io.Reader, prefix string) {
+	scanner := bufio.NewScanner(r)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		if prefix != "" {
+			line = prefix + ": " + line
+		}
+		s.publishError(line, false)
+	}
+	if err := scanner.Err(); err != nil {
+		s.warnf("structured stderr scan failed: %v", err)
 	}
 }
 

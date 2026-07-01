@@ -24,6 +24,7 @@ import (
 	"github.com/rockclaver/claver-agent/internal/projects"
 	"github.com/rockclaver/claver-agent/internal/review"
 	"github.com/rockclaver/claver-agent/internal/sessions"
+	"github.com/rockclaver/claver-agent/internal/storage"
 	"github.com/rockclaver/claver-agent/internal/store"
 	"github.com/rockclaver/claver-agent/internal/systemd"
 	"github.com/rockclaver/claver-agent/internal/version"
@@ -1638,6 +1639,11 @@ type fakeDockerClient struct {
 
 	actionCalls *[]string
 	actionErr   error
+
+	diskUsage    docker.DiskUsage
+	diskUsageErr error
+	pruneResult  docker.PruneResult
+	pruneErr     error
 }
 
 func (f fakeDockerClient) Version(context.Context) (docker.VersionInfo, error) {
@@ -1722,6 +1728,26 @@ func (f fakeDockerClient) ContainerAction(_ context.Context, id string, action d
 		return f.actionErr
 	}
 	return f.err
+}
+
+func (f fakeDockerClient) DiskUsage(context.Context) (docker.DiskUsage, error) {
+	return f.diskUsage, f.diskUsageErr
+}
+
+func (f fakeDockerClient) PruneContainers(context.Context) (docker.PruneResult, error) {
+	return f.pruneResult, f.pruneErr
+}
+
+func (f fakeDockerClient) PruneImages(context.Context) (docker.PruneResult, error) {
+	return f.pruneResult, f.pruneErr
+}
+
+func (f fakeDockerClient) PruneBuildCache(context.Context) (docker.PruneResult, error) {
+	return f.pruneResult, f.pruneErr
+}
+
+func (f fakeDockerClient) PruneVolumes(context.Context) (docker.PruneResult, error) {
+	return f.pruneResult, f.pruneErr
 }
 
 type fakeErr struct{ cause error }
@@ -2271,8 +2297,9 @@ func TestProcessKill_TokenRequiredAndAudit(t *testing.T) {
 		ProcRoot:     root,
 		AgentPID:     999,
 		TmuxPanePIDs: func(context.Context) []int { return nil },
-		Signal: func(pid int, sig syscall.Signal) error {
+		Signal: func(_ context.Context, pid int, sig syscall.Signal) error {
 			signals = append(signals, sig)
+			_ = os.RemoveAll(filepath.Join(root, fmt.Sprintf("%d", pid)))
 			return nil
 		},
 	})
@@ -2330,7 +2357,7 @@ func TestProcessKill_RejectsPIDReuseAfterConfirmation(t *testing.T) {
 		ProcRoot:     root,
 		AgentPID:     999,
 		TmuxPanePIDs: func(context.Context) []int { return nil },
-		Signal: func(int, syscall.Signal) error {
+		Signal: func(context.Context, int, syscall.Signal) error {
 			signalled = true
 			return nil
 		},
@@ -2374,7 +2401,7 @@ func TestProcessKill_ProtectedPIDRejectedBeforeSignal(t *testing.T) {
 		TmuxPanePIDs: func(context.Context) []int {
 			return []int{66}
 		},
-		Signal: func(int, syscall.Signal) error {
+		Signal: func(context.Context, int, syscall.Signal) error {
 			signalled = true
 			return nil
 		},
@@ -2772,5 +2799,194 @@ func TestSession_ApprovalConsumesConfirmationToken(t *testing.T) {
 	})
 	if resp.Kind != "session.approval" {
 		t.Fatalf("deny kind = %q want session.approval", resp.Kind)
+	}
+}
+
+// AC: storage.clean requires a valid single-use confirmation token bound to
+// the exact category, and every attempt (rejected or successful) is
+// audited — mirroring TestDockerContainerAction_RequiresBoundConfirmationTokenAndAudits.
+func TestStorageClean_RequiresConfirmationTokenAndAudits(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	rm := review.New(nil, st, review.HeuristicSummarizer{})
+
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".cache", "pip"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".cache", "pip", "w.whl"), make([]byte, 1000), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	storageMgr, err := storage.New(storage.Config{HomeDir: home})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	payload, _ := json.Marshal(map[string]any{"category": "pip_cache"})
+	resp := dockerRoundTripConfig(t, Config{Addr: "127.0.0.1:0", Storage: storageMgr, Review: rm}, "storage.clean", payload)
+	if resp.Kind != "error.token_invalid" {
+		t.Fatalf("missing token response kind = %q", resp.Kind)
+	}
+	if _, statErr := os.Stat(filepath.Join(home, ".cache", "pip", "w.whl")); statErr != nil {
+		t.Fatalf("missing token cleaned the cache: %v", statErr)
+	}
+
+	action, projectID, files := storageCleanTokenBinding("pip_cache")
+	tok, err := rm.MintConfirmationToken(action, projectID, files, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ = json.Marshal(map[string]any{"category": "pip_cache", "confirmation_token": tok.Token})
+	resp = dockerRoundTripConfig(t, Config{Addr: "127.0.0.1:0", Storage: storageMgr, Review: rm}, "storage.clean", payload)
+	if resp.Kind != "storage.clean" {
+		t.Fatalf("valid token response kind = %q, payload %s", resp.Kind, resp.Payload)
+	}
+	if _, statErr := os.Stat(filepath.Join(home, ".cache", "pip", "w.whl")); !os.IsNotExist(statErr) {
+		t.Fatalf("valid token did not clean the cache: %v", statErr)
+	}
+
+	entries, err := rm.ListAudit("storage.clean", "storage", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("audit entries = %d want 2: %+v", len(entries), entries)
+	}
+	if !strings.Contains(entries[0].Summary, "succeeded") || !strings.Contains(entries[1].Summary, "invalid") {
+		t.Fatalf("audit entries missing outcome metadata: %+v", entries)
+	}
+
+	// The token is single-use.
+	resp = dockerRoundTripConfig(t, Config{Addr: "127.0.0.1:0", Storage: storageMgr, Review: rm}, "storage.clean", payload)
+	if resp.Kind != "error.token_used" {
+		t.Fatalf("reused token response kind = %q", resp.Kind)
+	}
+}
+
+// AC: storage.delete refuses a protected path before any token is consumed
+// or the filesystem is touched.
+func TestStorageDelete_RejectsProtectedPathBeforeTokenConsumption(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	rm := review.New(nil, st, review.HeuristicSummarizer{})
+	storageMgr, err := storage.New(storage.Config{HomeDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	payload, _ := json.Marshal(map[string]any{"path": "/etc", "recursive": true})
+	resp := dockerRoundTripConfig(t, Config{Addr: "127.0.0.1:0", Storage: storageMgr, Review: rm}, "storage.delete", payload)
+	if resp.Kind != "error.protected_path" {
+		t.Fatalf("protected path response kind = %q, payload %s", resp.Kind, resp.Payload)
+	}
+	if _, statErr := os.Stat("/etc"); statErr != nil {
+		t.Fatalf("/etc must be untouched: %v", statErr)
+	}
+	entries, err := rm.ListAudit("storage.delete", "storage", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || !strings.Contains(entries[0].Summary, "failed") {
+		t.Fatalf("expected one failed audit entry, got %+v", entries)
+	}
+}
+
+// AC: storage.delete requires a valid confirmation token bound to the exact
+// path, removes the target on success, and audits both outcomes.
+func TestStorageDelete_RequiresConfirmationTokenAndAudits(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	rm := review.New(nil, st, review.HeuristicSummarizer{})
+
+	home := t.TempDir()
+	target := filepath.Join(home, "old-log.txt")
+	if err := os.WriteFile(target, make([]byte, 77), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	storageMgr, err := storage.New(storage.Config{HomeDir: home})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	payload, _ := json.Marshal(map[string]any{"path": target})
+	resp := dockerRoundTripConfig(t, Config{Addr: "127.0.0.1:0", Storage: storageMgr, Review: rm}, "storage.delete", payload)
+	if resp.Kind != "error.token_invalid" {
+		t.Fatalf("missing token response kind = %q", resp.Kind)
+	}
+	if _, statErr := os.Stat(target); statErr != nil {
+		t.Fatalf("missing token deleted the file: %v", statErr)
+	}
+
+	action, projectID, files := storageDeleteTokenBinding(target)
+	tok, err := rm.MintConfirmationToken(action, projectID, files, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ = json.Marshal(map[string]any{"path": target, "confirmation_token": tok.Token})
+	resp = dockerRoundTripConfig(t, Config{Addr: "127.0.0.1:0", Storage: storageMgr, Review: rm}, "storage.delete", payload)
+	if resp.Kind != "storage.delete" {
+		t.Fatalf("valid token response kind = %q, payload %s", resp.Kind, resp.Payload)
+	}
+	if _, statErr := os.Stat(target); !os.IsNotExist(statErr) {
+		t.Fatalf("valid token did not delete the file: %v", statErr)
+	}
+
+	entries, err := rm.ListAudit("storage.delete", "storage", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || !strings.Contains(entries[0].Summary, "succeeded") || !strings.Contains(entries[1].Summary, "invalid") {
+		t.Fatalf("expected succeeded+invalid audit entries, got %+v", entries)
+	}
+}
+
+// AC: storage.deep_scan is an unguarded read (no confirmation token) that
+// returns the deep-scan result over the wire, and its own caching means an
+// immediate second call is served without re-walking unless force is set.
+func TestStorageDeepScan_ReturnsResultAndCaches(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "big.bin"), make([]byte, 2000), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	storageMgr, err := storage.New(storage.Config{HomeDir: t.TempDir(), DeepScanRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	payload, _ := json.Marshal(map[string]any{"min_size_bytes": 500})
+	resp := dockerRoundTripConfig(t, Config{Addr: "127.0.0.1:0", Storage: storageMgr}, "storage.deep_scan", payload)
+	if resp.Kind != "storage.deep_scan" {
+		t.Fatalf("response kind = %q, payload %s", resp.Kind, resp.Payload)
+	}
+	var out storage.DeepScanResult
+	if err := json.Unmarshal(resp.Payload, &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.LargeFiles) != 1 || out.LargeFilesTotalBytes != 2000 {
+		t.Fatalf("unexpected result: %+v", out)
+	}
+	firstGeneratedAt := out.GeneratedAt
+
+	// A second call with the same threshold returns the cached snapshot —
+	// same generated_at — rather than re-walking.
+	resp2 := dockerRoundTripConfig(t, Config{Addr: "127.0.0.1:0", Storage: storageMgr}, "storage.deep_scan", payload)
+	var out2 storage.DeepScanResult
+	if err := json.Unmarshal(resp2.Payload, &out2); err != nil {
+		t.Fatal(err)
+	}
+	if !out2.GeneratedAt.Equal(firstGeneratedAt) {
+		t.Fatalf("expected cached generated_at %v, got %v", firstGeneratedAt, out2.GeneratedAt)
 	}
 }

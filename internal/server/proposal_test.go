@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 	"github.com/rockclaver/claver-agent/internal/infra"
 	agentprocess "github.com/rockclaver/claver-agent/internal/process"
 	"github.com/rockclaver/claver-agent/internal/review"
+	"github.com/rockclaver/claver-agent/internal/security"
 	"github.com/rockclaver/claver-agent/internal/store"
 	"github.com/rockclaver/claver-agent/internal/systemd"
 )
@@ -75,6 +77,107 @@ func TestProposal_InfraSnapshotGroundsAIWithAllFourReads(t *testing.T) {
 		if strings.Contains(string(resp.Payload), `"`+key+`":null`) {
 			t.Fatalf("snapshot %q was null: %s", key, resp.Payload)
 		}
+	}
+}
+
+func TestProposalTokenBinding_SecurityFix(t *testing.T) {
+	action, projectID, files, err := proposalTokenBinding(
+		aiproposal.KindSecurityFix,
+		map[string]any{"kind": "enable_auditd"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != "security.fix.enable_auditd" || projectID != "security" || len(files) != 1 || files[0] != "auditd" {
+		t.Fatalf("binding = %s %s %+v", action, projectID, files)
+	}
+}
+
+func TestExecuteProposal_SecurityFixEnablesAuditd(t *testing.T) {
+	var calls []string
+	sec, err := security.New(security.Config{
+		ReadFile: func(path string) ([]byte, error) {
+			if path == "/etc/debian_version" {
+				return []byte("12\n"), nil
+			}
+			return nil, errors.New("missing")
+		},
+		Run: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			call := strings.Join(append([]string{name}, args...), " ")
+			calls = append(calls, call)
+			if name == "systemctl" && strings.Join(args, " ") == "is-active auditd" {
+				return []byte("inactive\n"), errors.New("inactive")
+			}
+			return []byte("ok\n"), nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(Config{Security: sec})
+	err = s.executeProposal(context.Background(), aiproposal.Proposal{
+		Kind:   aiproposal.KindSecurityFix,
+		Params: map[string]any{"kind": "enable_auditd"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(calls, "\n")
+	if !strings.Contains(joined, "apt-get install -y auditd") || !strings.Contains(joined, "systemctl enable --now auditd") {
+		t.Fatalf("calls =\n%s", joined)
+	}
+}
+
+func TestProposalTokenBinding_SecurityFixRunScript(t *testing.T) {
+	script := "chmod 640 /etc/shadow && chown root:shadow /etc/shadow"
+	action, projectID, files, err := proposalTokenBinding(
+		aiproposal.KindSecurityFix,
+		map[string]any{"kind": "run_script", "script": script},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != "security.fix.run_script" || projectID != "security" {
+		t.Fatalf("binding = %s %s", action, projectID)
+	}
+	// The token must bind to the exact script text, not a short label —
+	// approving one script must never authorise executing a different one.
+	if len(files) != 1 || files[0] != script {
+		t.Fatalf("token files = %+v, want exact script text", files)
+	}
+}
+
+func TestProposalTokenBinding_SecurityFixRunScriptRequiresScript(t *testing.T) {
+	if _, _, _, err := proposalTokenBinding(
+		aiproposal.KindSecurityFix,
+		map[string]any{"kind": "run_script"},
+	); err == nil {
+		t.Fatal("expected error for missing script")
+	}
+}
+
+func TestExecuteProposal_SecurityFixRunsScriptAsRoot(t *testing.T) {
+	var calls []string
+	sec, err := security.New(security.Config{
+		Run: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			calls = append(calls, strings.Join(append([]string{name}, args...), " "))
+			return []byte("ok\n"), nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(Config{Security: sec})
+	err = s.executeProposal(context.Background(), aiproposal.Proposal{
+		Kind:   aiproposal.KindSecurityFix,
+		Params: map[string]any{"kind": "run_script", "script": "chmod 640 /etc/shadow"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(calls, "\n")
+	if !strings.Contains(joined, "-c chmod 640 /etc/shadow") {
+		t.Fatalf("calls =\n%s", joined)
 	}
 }
 
@@ -288,7 +391,7 @@ func TestProposal_ProtectedPIDRejected(t *testing.T) {
 		TmuxPanePIDs: func(context.Context) []int {
 			return []int{66}
 		},
-		Signal: func(int, syscall.Signal) error {
+		Signal: func(context.Context, int, syscall.Signal) error {
 			signalled = true
 			return nil
 		},

@@ -37,8 +37,10 @@ import (
 	"github.com/rockclaver/claver-agent/internal/projects"
 	"github.com/rockclaver/claver-agent/internal/review"
 	"github.com/rockclaver/claver-agent/internal/runbook"
+	"github.com/rockclaver/claver-agent/internal/security"
 	"github.com/rockclaver/claver-agent/internal/sessions"
 	"github.com/rockclaver/claver-agent/internal/skills"
+	"github.com/rockclaver/claver-agent/internal/storage"
 	"github.com/rockclaver/claver-agent/internal/store"
 	"github.com/rockclaver/claver-agent/internal/systemd"
 	"github.com/rockclaver/claver-agent/internal/tooling"
@@ -93,6 +95,12 @@ type Config struct {
 	Processes *agentprocess.Manager
 	// Firewall, when non-nil, enables infra.firewall.* kinds.
 	Firewall *firewall.Manager
+	// Storage, when non-nil, enables storage.* kinds (Storage Analyzer: scan
+	// culprits, guarded category cleanup, browse, and guarded delete).
+	Storage *storage.Manager
+	// Security, when non-nil, enables security.* kinds (defensive host audit
+	// and narrow guarded fixes such as firewall-blocking risky ports).
+	Security *security.Manager
 	// Webservers, when non-nil, enables infra.webserver.* host proxy kinds.
 	Webservers *webserver.Manager
 	// Alerts, when non-nil, enables infra.alerts.* kinds.
@@ -485,6 +493,16 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 		"infra.firewall.rule_add",
 		"infra.firewall.rule_remove":
 		s.dispatchFirewall(ctx, c, writeMu, f)
+	case "storage.scan",
+		"storage.browse",
+		"storage.clean",
+		"storage.delete",
+		"storage.deep_scan":
+		s.dispatchStorage(ctx, c, writeMu, f)
+	case "security.audit",
+		"security.fix",
+		"security.ai_fix":
+		s.dispatchSecurity(ctx, c, writeMu, f)
 	case "infra.alerts.config",
 		"infra.alerts.config_set",
 		"infra.alerts.silence",
@@ -2434,6 +2452,14 @@ func (s *Server) dispatchProcess(ctx context.Context, c *websocket.Conn, writeMu
 				s.writeError(ctx, c, writeMu, f.ID, "process_identity_mismatch", err.Error())
 				return
 			}
+			if errors.Is(err, agentprocess.ErrTerminationFailed) {
+				s.writeError(ctx, c, writeMu, f.ID, "process_termination_failed", err.Error())
+				return
+			}
+			if errors.Is(err, agentprocess.ErrKernelThread) {
+				s.writeError(ctx, c, writeMu, f.ID, "process_kernel_thread", err.Error())
+				return
+			}
 			s.writeError(ctx, c, writeMu, f.ID, "process_error", err.Error())
 			return
 		}
@@ -2560,6 +2586,504 @@ func (s *Server) dispatchFirewall(ctx context.Context, c *websocket.Conn, writeM
 		audit := s.auditFirewallRule(verb, rule, true, "ok")
 		s.writeOK(ctx, c, writeMu, f.ID, "infra.firewall."+verb, map[string]any{
 			"rule":     rule,
+			"audit_id": audit.ID,
+		})
+	}
+}
+
+func storageCleanTokenBinding(category string) (string, string, []string) {
+	return "storage.clean." + category, "storage", []string{category}
+}
+
+func storageDeleteTokenBinding(path string) (string, string, []string) {
+	return "storage.delete", "storage", []string{path}
+}
+
+func (s *Server) auditStorageClean(category string, ok bool, freedBytes int64, summary string) store.AuditEntry {
+	if s.cfg.Review == nil {
+		return store.AuditEntry{}
+	}
+	status := "failed"
+	if ok {
+		status = "succeeded"
+	}
+	body, _ := json.Marshal(map[string]any{
+		"category":    category,
+		"ok":          ok,
+		"freed_bytes": freedBytes,
+		"summary":     summary,
+	})
+	entry, _ := s.cfg.Review.LogAudit(store.AuditEntry{
+		Type:      "storage.clean",
+		ProjectID: "storage",
+		Actor:     "mobile",
+		Summary:   fmt.Sprintf("storage clean %s for %s: %s", status, category, summary),
+		Data:      string(body),
+		CreatedAt: s.cfg.Now(),
+	})
+	return entry
+}
+
+func (s *Server) auditStorageDelete(path string, ok bool, freedBytes int64, summary string) store.AuditEntry {
+	if s.cfg.Review == nil {
+		return store.AuditEntry{}
+	}
+	status := "failed"
+	if ok {
+		status = "succeeded"
+	}
+	body, _ := json.Marshal(map[string]any{
+		"path":        path,
+		"ok":          ok,
+		"freed_bytes": freedBytes,
+		"summary":     summary,
+	})
+	entry, _ := s.cfg.Review.LogAudit(store.AuditEntry{
+		Type:      "storage.delete",
+		ProjectID: "storage",
+		Actor:     "mobile",
+		Summary:   fmt.Sprintf("storage delete %s for %s: %s", status, path, summary),
+		Data:      string(body),
+		CreatedAt: s.cfg.Now(),
+	})
+	return entry
+}
+
+// dispatchStorage handles storage.* kinds. Reads (scan, browse) require no
+// confirmation token — browsing/measuring is always safe. Writes (clean,
+// delete) reuse the existing auth.confirm -> ConsumeToken -> LogAudit gate,
+// exactly like docker.container.action and infra.service.action.
+func (s *Server) dispatchStorage(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
+	if s.cfg.Storage == nil {
+		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "storage subsystem not configured")
+		return
+	}
+	switch f.Kind {
+	case "storage.scan":
+		categories, err := s.cfg.Storage.Scan(ctx)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "storage_error", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "storage.scan", map[string]any{"categories": categories})
+	case "storage.deep_scan":
+		var in struct {
+			Force        bool  `json:"force"`
+			MinSizeBytes int64 `json:"min_size_bytes"`
+		}
+		_ = json.Unmarshal(f.Payload, &in) // payload optional; defaults apply
+		result, err := s.cfg.Storage.DeepScan(ctx, storage.DeepScanOptions{
+			Force:        in.Force,
+			MinSizeBytes: in.MinSizeBytes,
+		})
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "storage_error", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "storage.deep_scan", result)
+	case "storage.browse":
+		var in struct {
+			Path string `json:"path"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "invalid payload")
+			return
+		}
+		listing, err := s.cfg.Storage.Browse(ctx, in.Path)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "storage_error", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "storage.browse", listing)
+	case "storage.clean":
+		var in struct {
+			Category          string `json:"category"`
+			ConfirmationToken string `json:"confirmation_token"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Category == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "category required")
+			return
+		}
+		if s.cfg.Review == nil {
+			s.writeError(ctx, c, writeMu, f.ID, "unavailable", "confirmation subsystem not configured")
+			return
+		}
+		tokenAction, projectID, files := storageCleanTokenBinding(in.Category)
+		if err := s.cfg.Review.ConsumeToken(in.ConfirmationToken, tokenAction, projectID, files, ""); err != nil {
+			s.auditStorageClean(in.Category, false, 0, err.Error())
+			s.writeReviewErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		res, err := s.cfg.Storage.Clean(ctx, in.Category)
+		if err != nil {
+			s.auditStorageClean(in.Category, false, 0, err.Error())
+			s.writeError(ctx, c, writeMu, f.ID, "storage_error", err.Error())
+			return
+		}
+		audit := s.auditStorageClean(in.Category, true, res.FreedBytes, "ok")
+		s.writeOK(ctx, c, writeMu, f.ID, "storage.clean", map[string]any{
+			"category":      res.Category,
+			"freed_bytes":   res.FreedBytes,
+			"items_removed": res.ItemsRemoved,
+			"audit_id":      audit.ID,
+		})
+	case "storage.delete":
+		var in struct {
+			Path              string `json:"path"`
+			Recursive         bool   `json:"recursive"`
+			ConfirmationToken string `json:"confirmation_token"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Path == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "path required")
+			return
+		}
+		// Run the protected-path guard BEFORE consuming the token so the
+		// caller can't burn a token attempting to delete a system directory.
+		if reason, protected := s.cfg.Storage.IsProtectedPath(in.Path); protected {
+			s.auditStorageDelete(in.Path, false, 0, "protected path")
+			s.writeError(ctx, c, writeMu, f.ID, "protected_path", fmt.Sprintf("refused delete of protected path %s: %s", in.Path, reason))
+			return
+		}
+		if s.cfg.Review == nil {
+			s.writeError(ctx, c, writeMu, f.ID, "unavailable", "confirmation subsystem not configured")
+			return
+		}
+		tokenAction, projectID, files := storageDeleteTokenBinding(in.Path)
+		if err := s.cfg.Review.ConsumeToken(in.ConfirmationToken, tokenAction, projectID, files, ""); err != nil {
+			s.auditStorageDelete(in.Path, false, 0, err.Error())
+			s.writeReviewErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		res, err := s.cfg.Storage.DeletePath(ctx, in.Path, in.Recursive)
+		if err != nil {
+			s.auditStorageDelete(in.Path, false, 0, err.Error())
+			var ppe *storage.ProtectedPathError
+			if errors.As(err, &ppe) {
+				s.writeError(ctx, c, writeMu, f.ID, "protected_path", err.Error())
+				return
+			}
+			s.writeError(ctx, c, writeMu, f.ID, "storage_error", err.Error())
+			return
+		}
+		audit := s.auditStorageDelete(in.Path, true, res.FreedBytes, "ok")
+		s.writeOK(ctx, c, writeMu, f.ID, "storage.delete", map[string]any{
+			"path":        res.Path,
+			"freed_bytes": res.FreedBytes,
+			"audit_id":    audit.ID,
+		})
+	}
+}
+
+func securityFixTokenBinding(req security.FixRequest) (string, string, []string) {
+	return "security.fix." + string(req.Kind), "security", securityFixTokenFiles(req)
+}
+
+// securityFixTokenFiles returns the confirmation token's file-identity list.
+// For every kind except run_script this is the same short label used for
+// display (securityFixTarget); for run_script it must be the exact script
+// text so the token's action hash pins approval to that precise script byte
+// for byte — swapping in a different script after mint invalidates the
+// token.
+func securityFixTokenFiles(req security.FixRequest) []string {
+	if req.Kind == security.FixRunScript {
+		return []string{req.Script}
+	}
+	return []string{securityFixTarget(req)}
+}
+
+func securityFixTarget(req security.FixRequest) string {
+	switch req.Kind {
+	case security.FixClosePort:
+		proto := req.Protocol
+		if proto == "" {
+			proto = string(firewall.ProtoTCP)
+		}
+		return fmt.Sprintf("%s/%d", proto, req.Port)
+	case security.FixKillProcess:
+		return fmt.Sprintf("pid/%d/%d", req.PID, req.StartTimeTicks)
+	case security.FixEnableAuditd:
+		return "auditd"
+	case security.FixRunScript:
+		return "script:" + scriptPreview(req.Script)
+	default:
+		return string(req.Kind)
+	}
+}
+
+// scriptPreview renders a short, single-line human-readable label for an
+// arbitrary remediation script — used in audit summaries and error messages
+// where the full script text (kept verbatim in the token binding and the
+// audit entry's Data JSON) would be unreadable.
+func scriptPreview(script string) string {
+	s := strings.Join(strings.Fields(script), " ")
+	const maxLen = 60
+	if len(s) > maxLen {
+		return s[:maxLen] + "…"
+	}
+	return s
+}
+
+func (s *Server) auditSecurityFix(req security.FixRequest, ok bool, summary string) store.AuditEntry {
+	if s.cfg.Review == nil {
+		return store.AuditEntry{}
+	}
+	status := "failed"
+	if ok {
+		status = "succeeded"
+	}
+	data := map[string]any{
+		"kind":    req.Kind,
+		"target":  securityFixTarget(req),
+		"ok":      ok,
+		"summary": summary,
+	}
+	if req.Kind == security.FixRunScript {
+		data["script"] = req.Script
+	}
+	body, _ := json.Marshal(data)
+	entry, _ := s.cfg.Review.LogAudit(store.AuditEntry{
+		Type:      "security.fix." + string(req.Kind),
+		ProjectID: "security",
+		Actor:     "mobile",
+		Summary:   fmt.Sprintf("security fix %s for %s: %s", status, securityFixTarget(req), summary),
+		Data:      string(body),
+		CreatedAt: s.cfg.Now(),
+	})
+	return entry
+}
+
+func securityFindingRunbookBody(f security.Finding) string {
+	var b strings.Builder
+	b.WriteString("Security audit finding: ")
+	b.WriteString(f.Title)
+	b.WriteString("\nSeverity: ")
+	b.WriteString(string(f.Severity))
+	b.WriteString("\nCategory: ")
+	b.WriteString(f.Category)
+	b.WriteString("\nSummary: ")
+	b.WriteString(f.Summary)
+	if len(f.Evidence) > 0 {
+		b.WriteString("\nEvidence:")
+		for _, ev := range f.Evidence {
+			b.WriteString("\n- ")
+			b.WriteString(ev)
+		}
+	}
+	b.WriteString("\nRecommended direction: ")
+	b.WriteString(f.Recommendation)
+	if f.Fix != nil {
+		b.WriteString("\nExisting typed fix available: ")
+		b.WriteString(string(f.Fix.Kind))
+		b.WriteString(" target=")
+		b.WriteString(f.Fix.Target)
+		b.WriteString("\nTo use the existing typed fix, return a step with kind=security.fix params={\"kind\":\"")
+		b.WriteString(string(f.Fix.Kind))
+		b.WriteString("\"")
+		if f.Fix.Port > 0 {
+			b.WriteString(fmt.Sprintf(", \"port\":%d", f.Fix.Port))
+		}
+		if f.Fix.Protocol != "" {
+			b.WriteString(", \"protocol\":\"")
+			b.WriteString(f.Fix.Protocol)
+			b.WriteString("\"")
+		}
+		if f.Fix.PID > 0 {
+			b.WriteString(fmt.Sprintf(", \"pid\":%d", f.Fix.PID))
+		}
+		if f.Fix.StartTimeTicks > 0 {
+			b.WriteString(fmt.Sprintf(", \"start_time_ticks\":%d", f.Fix.StartTimeTicks))
+		}
+		if f.Fix.Signal != "" {
+			b.WriteString(", \"signal\":\"")
+			b.WriteString(f.Fix.Signal)
+			b.WriteString("\"")
+		}
+		b.WriteString("}.")
+		b.WriteString("\nPrefer this typed fix over a raw script.")
+	} else {
+		b.WriteString("\nNo existing typed fix covers this finding (e.g. it needs a filesystem ownership/permission change, a config edit, or a command ")
+		b.WriteString("no other step kind models). Propose a step with kind=security.fix params={\"kind\":\"run_script\",\"script\":\"<POSIX sh script>\"} ")
+		b.WriteString("that does exactly what the finding requires — minimal, idempotent, no unrelated side effects.")
+	}
+	b.WriteString("\nOnly propose kind=run_script when no other listed step kind applies; it always runs as root and always requires individual operator approval.")
+	return b.String()
+}
+
+func (s *Server) dispatchSecurity(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
+	if s.cfg.Security == nil {
+		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "security subsystem not configured")
+		return
+	}
+	switch f.Kind {
+	case "security.audit":
+		audit, err := s.cfg.Security.Audit(ctx)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "security_error", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "security.audit", audit)
+	case "security.ai_fix":
+		var in struct {
+			FindingID string `json:"finding_id"`
+			Agent     string `json:"agent"`
+			ServerID  string `json:"server_id"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.FindingID == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "finding_id required")
+			return
+		}
+		if in.Agent == "" {
+			in.Agent = "claude"
+		}
+		if in.Agent != "claude" && in.Agent != "codex" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "agent must be claude or codex")
+			return
+		}
+		if s.cfg.Tooling != nil {
+			st, err := s.cfg.Tooling.Check(ctx, tooling.Kind(in.Agent))
+			if err != nil {
+				s.writeError(ctx, c, writeMu, f.ID, "tooling_error", err.Error())
+				return
+			}
+			if !st.Installed {
+				s.writeError(ctx, c, writeMu, f.ID, "tool_missing", fmt.Sprintf("%s CLI is not installed on this server. Install it from Project tooling, then retry Fix with AI.", in.Agent))
+				return
+			}
+		}
+		if s.cfg.Auth == nil {
+			s.writeError(ctx, c, writeMu, f.ID, "unavailable", "auth subsystem not configured")
+			return
+		}
+		authStatus, err := s.cfg.Auth.Status(ctx, in.Agent)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "auth_error", err.Error())
+			return
+		}
+		if !authStatus.LoggedIn {
+			s.writeError(ctx, c, writeMu, f.ID, "auth_required", in.Agent+" is not signed in")
+			return
+		}
+		if s.cfg.Runbook == nil {
+			s.writeError(ctx, c, writeMu, f.ID, "unavailable", "runbook subsystem not configured")
+			return
+		}
+		audit, err := s.cfg.Security.Audit(ctx)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "security_error", err.Error())
+			return
+		}
+		var finding *security.Finding
+		for i := range audit.Findings {
+			if audit.Findings[i].ID == in.FindingID {
+				finding = &audit.Findings[i]
+				break
+			}
+		}
+		if finding == nil {
+			s.writeError(ctx, c, writeMu, f.ID, "not_found", "security finding no longer exists")
+			return
+		}
+		serverID := in.ServerID
+		if serverID == "" {
+			serverID = "local"
+		}
+		alert := runbook.Alert{
+			ServerID: serverID,
+			Rule:     "security." + finding.Category,
+			Target:   finding.ID,
+			Body:     securityFindingRunbookBody(*finding),
+			Severity: string(finding.Severity),
+			FiredAt:  s.cfg.Now(),
+		}
+		rb, err := s.cfg.Runbook.HandleManual(ctx, alert, in.Agent)
+		if err != nil {
+			s.writeError(ctx, c, writeMu, f.ID, "runbook_error", err.Error())
+			return
+		}
+		s.writeOK(ctx, c, writeMu, f.ID, "security.ai_fix", map[string]any{"runbook": rb})
+	case "security.fix":
+		var in struct {
+			Kind              string `json:"kind"`
+			Port              int    `json:"port"`
+			Protocol          string `json:"protocol"`
+			PID               int    `json:"pid"`
+			StartTimeTicks    uint64 `json:"start_time_ticks"`
+			Signal            string `json:"signal"`
+			ConfirmationToken string `json:"confirmation_token"`
+		}
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Kind == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "kind required")
+			return
+		}
+		req := security.FixRequest{
+			Kind:           security.FixKind(in.Kind),
+			Port:           in.Port,
+			Protocol:       in.Protocol,
+			PID:            in.PID,
+			StartTimeTicks: in.StartTimeTicks,
+			Signal:         in.Signal,
+		}
+		if req.Kind == security.FixClosePort && req.Port <= 0 {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "port required")
+			return
+		}
+		if req.Kind == security.FixKillProcess && (req.PID <= 0 || req.StartTimeTicks == 0) {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "pid and start_time_ticks required")
+			return
+		}
+		switch req.Kind {
+		case security.FixClosePort, security.FixKillProcess, security.FixEnableAuditd:
+		default:
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "unsupported security fix")
+			return
+		}
+		if s.cfg.Review == nil {
+			s.writeError(ctx, c, writeMu, f.ID, "unavailable", "confirmation subsystem not configured")
+			return
+		}
+		tokenAction, projectID, files := securityFixTokenBinding(req)
+		if err := s.cfg.Review.ConsumeToken(in.ConfirmationToken, tokenAction, projectID, files, ""); err != nil {
+			s.auditSecurityFix(req, false, err.Error())
+			s.writeReviewErr(ctx, c, writeMu, f.ID, err)
+			return
+		}
+		res, err := s.cfg.Security.Fix(ctx, req)
+		if err != nil {
+			s.auditSecurityFix(req, false, err.Error())
+			var ale *firewall.AntiLockoutError
+			if errors.As(err, &ale) {
+				s.writeError(ctx, c, writeMu, f.ID, "anti_lockout", err.Error())
+				return
+			}
+			var pe *agentprocess.ProtectedPIDError
+			if errors.As(err, &pe) {
+				s.writeError(ctx, c, writeMu, f.ID, "protected_pid", err.Error())
+				return
+			}
+			if errors.Is(err, firewall.ErrReadOnly) {
+				s.writeError(ctx, c, writeMu, f.ID, "firewall_read_only", err.Error())
+				return
+			}
+			if errors.Is(err, agentprocess.ErrIdentityMismatch) {
+				s.writeError(ctx, c, writeMu, f.ID, "process_identity_mismatch", err.Error())
+				return
+			}
+			if errors.Is(err, agentprocess.ErrTerminationFailed) {
+				s.writeError(ctx, c, writeMu, f.ID, "process_termination_failed", err.Error())
+				return
+			}
+			if errors.Is(err, agentprocess.ErrKernelThread) {
+				s.writeError(ctx, c, writeMu, f.ID, "process_kernel_thread", err.Error())
+				return
+			}
+			s.writeError(ctx, c, writeMu, f.ID, "security_error", err.Error())
+			return
+		}
+		audit := s.auditSecurityFix(req, true, res.Summary)
+		s.writeOK(ctx, c, writeMu, f.ID, "security.fix", map[string]any{
+			"kind":     res.Kind,
+			"target":   res.Target,
+			"summary":  res.Summary,
 			"audit_id": audit.ID,
 		})
 	}
@@ -3023,8 +3547,52 @@ func proposalTokenBinding(kind aiproposal.Kind, params map[string]any) (action, 
 		}
 		a, p, f := firewallRuleTokenBinding(verb, rule)
 		return a, p, f, nil
+	case aiproposal.KindSecurityFix:
+		req, rerr := securityFixRequestFromParams(params)
+		if rerr != nil {
+			return "", "", nil, rerr
+		}
+		a, p, f := securityFixTokenBinding(req)
+		return a, p, f, nil
 	}
 	return "", "", nil, fmt.Errorf("unknown kind")
+}
+
+func securityFixRequestFromParams(params map[string]any) (security.FixRequest, error) {
+	kind, _ := params["kind"].(string)
+	if kind == "" {
+		return security.FixRequest{}, fmt.Errorf("kind required")
+	}
+	req := security.FixRequest{
+		Kind:           security.FixKind(kind),
+		Port:           intFromParams(params["port"]),
+		PID:            intFromParams(params["pid"]),
+		StartTimeTicks: uint64FromParams(params["start_time_ticks"]),
+	}
+	req.Protocol, _ = params["protocol"].(string)
+	req.Signal, _ = params["signal"].(string)
+	req.Script, _ = params["script"].(string)
+	switch req.Kind {
+	case security.FixClosePort:
+		if req.Port <= 0 {
+			return security.FixRequest{}, fmt.Errorf("port required")
+		}
+	case security.FixKillProcess:
+		if req.PID <= 0 || req.StartTimeTicks == 0 {
+			return security.FixRequest{}, fmt.Errorf("pid and start_time_ticks required")
+		}
+	case security.FixEnableAuditd:
+	case security.FixRunScript:
+		if strings.TrimSpace(req.Script) == "" {
+			return security.FixRequest{}, fmt.Errorf("script required")
+		}
+		if len(req.Script) > security.MaxScriptBytes {
+			return security.FixRequest{}, fmt.Errorf("script exceeds %d bytes", security.MaxScriptBytes)
+		}
+	default:
+		return security.FixRequest{}, fmt.Errorf("unsupported security fix %q", req.Kind)
+	}
+	return req, nil
 }
 
 func intFromParams(v any) int {
@@ -3270,6 +3838,11 @@ func (s *Server) handleProposalApprove(ctx context.Context, c *websocket.Conn, w
 			return
 		}
 		// anti-lockout is enforced inside Firewall.RuleRemove (post-token)
+	case aiproposal.KindSecurityFix:
+		if s.cfg.Security == nil {
+			s.writeError(ctx, c, writeMu, f.ID, "unavailable", "security subsystem not configured")
+			return
+		}
 	}
 
 	// Consume the confirmation token. A token failure here is recoverable:
@@ -3303,6 +3876,10 @@ func (s *Server) handleProposalApprove(ctx context.Context, c *websocket.Conn, w
 			s.writeError(ctx, c, writeMu, f.ID, "anti_lockout", execErr.Error())
 		case errors.Is(execErr, agentprocess.ErrIdentityMismatch):
 			s.writeError(ctx, c, writeMu, f.ID, "process_identity_mismatch", execErr.Error())
+		case errors.Is(execErr, agentprocess.ErrTerminationFailed):
+			s.writeError(ctx, c, writeMu, f.ID, "process_termination_failed", execErr.Error())
+		case errors.Is(execErr, agentprocess.ErrKernelThread):
+			s.writeError(ctx, c, writeMu, f.ID, "process_kernel_thread", execErr.Error())
 		case errors.Is(execErr, firewall.ErrReadOnly):
 			s.writeError(ctx, c, writeMu, f.ID, "firewall_read_only", execErr.Error())
 		default:
@@ -3343,6 +3920,13 @@ func (s *Server) executeProposal(ctx context.Context, p aiproposal.Proposal) err
 			return err
 		}
 		return s.cfg.Firewall.RuleRemove(ctx, rule)
+	case aiproposal.KindSecurityFix:
+		req, err := securityFixRequestFromParams(p.Params)
+		if err != nil {
+			return err
+		}
+		_, err = s.cfg.Security.Fix(ctx, req)
+		return err
 	}
 	return fmt.Errorf("unknown proposal kind %q", p.Kind)
 }

@@ -6,7 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -93,8 +96,11 @@ func cliCommand(agent string) (string, []string) {
 	switch agent {
 	case "codex":
 		// `codex exec -` reads the prompt from stdin and prints the
-		// final assistant message on stdout.
-		return "codex", []string{"exec", "-"}
+		// final assistant message on stdout. Runbook generation is not
+		// tied to a repository checkout, so explicitly allow the agent's
+		// data directory/non-repo cwd and avoid persisting a duplicate
+		// Codex session transcript for this one-shot draft.
+		return "codex", []string{"exec", "--skip-git-repo-check", "--ephemeral", "-"}
 	default:
 		// `claude -p` is the non-interactive "print" mode;
 		// --output-format json emits a single JSON envelope on stdout.
@@ -136,13 +142,105 @@ func parseProposal(stdout []byte, agent string) (Proposal, error) {
 			}
 		}
 	}
-	// Shape 3: raw text with embedded JSON.
+	// Shape 3: JSONL/event streams whose final assistant text contains
+	// the proposal. Some codex versions emit progress events rather than
+	// only the final assistant message.
+	if p, ok := parseProposalStream(stdout); ok {
+		return p, nil
+	}
+	// Shape 4: raw text with embedded JSON.
 	if body := extractJSONObject(stdout); body != nil {
 		if p, ok := tryParse(body); ok {
 			return p, nil
 		}
 	}
 	return Proposal{}, fmt.Errorf("no parseable proposal in %d bytes of output", len(stdout))
+}
+
+func parseProposalStream(stdout []byte) (Proposal, bool) {
+	var fragments []string
+	for _, line := range bytes.Split(stdout, []byte{'\n'}) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		if p, ok := tryParse(line); ok {
+			return p, true
+		}
+		var v any
+		if err := json.Unmarshal(line, &v); err != nil {
+			continue
+		}
+		lineFragments := textFragments(v)
+		for _, fragment := range lineFragments {
+			if p, ok := parseProposalText(fragment); ok {
+				return p, true
+			}
+		}
+		fragments = append(fragments, lineFragments...)
+	}
+	if len(fragments) == 0 {
+		return Proposal{}, false
+	}
+	if p, ok := parseProposalText(strings.Join(fragments, "")); ok {
+		return p, true
+	}
+	if p, ok := parseProposalText(strings.Join(fragments, "\n")); ok {
+		return p, true
+	}
+	return Proposal{}, false
+}
+
+func parseProposalText(s string) (Proposal, bool) {
+	if body := extractJSONObject([]byte(s)); body != nil {
+		return tryParse(body)
+	}
+	return Proposal{}, false
+}
+
+func textFragments(v any) []string {
+	switch x := v.(type) {
+	case string:
+		return []string{x}
+	case []any:
+		var out []string
+		for _, item := range x {
+			out = append(out, textFragments(item)...)
+		}
+		return out
+	case map[string]any:
+		return textFragmentsFromMap(x)
+	default:
+		return nil
+	}
+}
+
+func textFragmentsFromMap(m map[string]any) []string {
+	keys := []string{"result", "message", "content", "text", "delta", "output_text", "final", "response", "msg", "data"}
+	seen := make(map[string]bool, len(keys))
+	var out []string
+	for _, key := range keys {
+		seen[key] = true
+		if v, ok := m[key]; ok {
+			out = append(out, textFragments(v)...)
+		}
+	}
+	var rest []string
+	for key := range m {
+		if !seen[key] {
+			rest = append(rest, key)
+		}
+	}
+	sort.Strings(rest)
+	for _, key := range rest {
+		switch m[key].(type) {
+		case string:
+			continue
+		default:
+			out = append(out, textFragments(m[key])...)
+		}
+	}
+	return out
 }
 
 func tryParse(b []byte) (Proposal, bool) {
@@ -228,10 +326,52 @@ func (p CLIProposer) buildEnv(agent string) []string {
 }
 
 func defaultExec(ctx context.Context, name string, args []string, env []string, stdin string) ([]byte, error) {
+	if resolved := lookPathWithEnv(name, env); resolved != "" {
+		name = resolved
+	}
 	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Env = env
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
 	cmd.Stdin = strings.NewReader(stdin)
 	return cmd.CombinedOutput()
+}
+
+func lookPathWithEnv(name string, env []string) string {
+	if strings.ContainsRune(name, os.PathSeparator) {
+		return name
+	}
+	path := ""
+	for i := len(env) - 1; i >= 0; i-- {
+		if strings.HasPrefix(env[i], "PATH=") {
+			path = strings.TrimPrefix(env[i], "PATH=")
+			break
+		}
+	}
+	if path == "" {
+		if resolved, err := exec.LookPath(name); err == nil {
+			return resolved
+		}
+		return ""
+	}
+	for _, dir := range filepath.SplitList(path) {
+		if dir == "" {
+			dir = "."
+		}
+		candidate := filepath.Join(dir, name)
+		if isExecutable(candidate) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func isExecutable(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return false
+	}
+	return info.Mode()&0o111 != 0
 }
 
 // buildPrompt is intentionally precise: it tells the model exactly which
@@ -260,7 +400,13 @@ func buildPrompt(alert Alert, g Grounding) (string, error) {
 	b.WriteString("  - infra.process.kill        params={pid:int, start_time_ticks:int, signal:\"TERM\"|\"KILL\"}\n")
 	b.WriteString("  - infra.firewall.rule_add   params={action,protocol,port,source,comment}\n")
 	b.WriteString("  - infra.firewall.rule_remove params={action,protocol,port,source}\n")
-	b.WriteString("If no safe automated remediation is possible, return steps=[] with a summary explaining why; ")
+	b.WriteString("  - security.fix              params={kind:\"close_port\"|\"kill_process\"|\"enable_auditd\"|\"run_script\", port:int, protocol:string, pid:int, start_time_ticks:int, signal:string, script:string}\n")
+	b.WriteString("    run_script is the ONLY way to propose a raw shell command; use it whenever the fix needs something none of the other typed kinds cover ")
+	b.WriteString("(e.g. correcting ownership/permissions on a file such as /etc/shadow). script must be a POSIX sh script that does exactly what the finding ")
+	b.WriteString("requires and nothing else, is idempotent, and contains no destructive side effects beyond the fix itself; it always runs as root and always ")
+	b.WriteString("requires the operator's individual biometric approval, never a batch \"approve all\". Prefer run_script over returning steps=[] whenever a ")
+	b.WriteString("safe, minimal shell fix exists.\n")
+	b.WriteString("If no safe automated remediation is possible even as a script, return steps=[] with a summary explaining why; ")
 	b.WriteString("do NOT invent steps. Output JSON only — no prose, no code fences.\n\n")
 	b.WriteString("ALERT:\n")
 	b.Write(alertJSON)

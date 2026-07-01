@@ -3,6 +3,7 @@ package runbook
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -103,6 +104,145 @@ func TestHandle_CreatesRunbookAndFansOutSteps(t *testing.T) {
 	}
 	if ap.Rationale != "restart postgres" {
 		t.Fatalf("rationale mismatch: %q", ap.Rationale)
+	}
+}
+
+func TestHandleManual_UsesSelectedAgentProposerAndBypassesThrottle(t *testing.T) {
+	defaultProp := &stubProposer{result: Proposal{
+		Summary: "default",
+		Steps:   []Step{{Kind: aiproposal.KindServiceAction, Params: map[string]any{"name": "default.service", "action": "restart"}}},
+	}}
+	codexProp := &stubProposer{result: Proposal{
+		Summary: "codex fix",
+		Risk:    RiskLow,
+		Steps:   []Step{{Kind: aiproposal.KindFirewallAdd, Params: map[string]any{"action": "deny", "protocol": "tcp", "port": 6379}}},
+	}}
+	apm := aiproposal.New()
+	m, err := New(Config{
+		AIProposals: apm,
+		Proposer:    defaultProp,
+		ProposerForAgent: func(agent string) Proposer {
+			if agent == "codex" {
+				return codexProp
+			}
+			return nil
+		},
+		Now:      func() time.Time { return time.Unix(1700000000, 0) },
+		Throttle: 10 * time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rb1, err := m.HandleManual(context.Background(), sampleAlert(), "codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rb2, err := m.HandleManual(context.Background(), sampleAlert(), "codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rb1.ID == "" || rb2.ID == "" {
+		t.Fatalf("manual runbooks should be created, got %+v %+v", rb1, rb2)
+	}
+	if defaultProp.Calls() != 0 {
+		t.Fatalf("default proposer calls=%d, want 0", defaultProp.Calls())
+	}
+	if codexProp.Calls() != 2 {
+		t.Fatalf("codex proposer calls=%d, want 2", codexProp.Calls())
+	}
+	if len(apm.List()) != 2 {
+		t.Fatalf("aiproposals=%d, want 2", len(apm.List()))
+	}
+}
+
+func TestHandleManual_ReturnsProposerError(t *testing.T) {
+	proposer := &stubProposer{err: errors.New("codex exec: auth token expired")}
+	m, _, _ := newTestManager(t, proposer)
+
+	_, err := m.HandleManual(context.Background(), sampleAlert(), "")
+	if err == nil {
+		t.Fatal("expected proposer error")
+	}
+	if !strings.Contains(err.Error(), "auth token expired") {
+		t.Fatalf("err=%q", err)
+	}
+}
+
+func TestHandle_SecurityFixStepFansOutAsProposal(t *testing.T) {
+	prop := &stubProposer{result: Proposal{
+		Summary: "enable auditd",
+		Risk:    RiskLow,
+		Steps: []Step{{
+			Kind:        aiproposal.KindSecurityFix,
+			Params:      map[string]any{"kind": "enable_auditd"},
+			Description: "install and enable auditd",
+		}},
+	}}
+	m, apm, _ := newTestManager(t, prop)
+
+	rb := m.Handle(context.Background(), sampleAlert())
+	if rb.ID == "" || len(rb.ProposalIDs) != 1 || rb.ProposalIDs[0] == "" {
+		t.Fatalf("runbook/proposals = %+v", rb)
+	}
+	ap, err := apm.Get(rb.ProposalIDs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ap.Kind != aiproposal.KindSecurityFix {
+		t.Fatalf("kind = %q", ap.Kind)
+	}
+	if ap.TokenAction != "security.fix.enable_auditd" || ap.TokenProjectID != "security" || len(ap.TokenFiles) != 1 || ap.TokenFiles[0] != "auditd" {
+		t.Fatalf("token binding = %s %s %+v", ap.TokenAction, ap.TokenProjectID, ap.TokenFiles)
+	}
+}
+
+func TestHandle_RunScriptStepForcesHighRiskAndBindsExactScript(t *testing.T) {
+	script := "chmod 640 /etc/shadow && chown root:shadow /etc/shadow"
+	prop := &stubProposer{result: Proposal{
+		Summary: "tighten /etc/shadow permissions",
+		Risk:    RiskLow, // model under-reports; manager must not trust this.
+		Steps: []Step{{
+			Kind:        aiproposal.KindSecurityFix,
+			Params:      map[string]any{"kind": "run_script", "script": script},
+			Description: "fix /etc/shadow ownership and permissions",
+		}},
+	}}
+	m, apm, _ := newTestManager(t, prop)
+
+	rb := m.Handle(context.Background(), sampleAlert())
+	if rb.Risk != RiskHigh {
+		t.Fatalf("risk = %q, want forced high for a run_script step", rb.Risk)
+	}
+	if len(rb.ProposalIDs) != 1 || rb.ProposalIDs[0] == "" {
+		t.Fatalf("step not fanned out: %+v", rb)
+	}
+	ap, err := apm.Get(rb.ProposalIDs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ap.TokenAction != "security.fix.run_script" || ap.TokenProjectID != "security" {
+		t.Fatalf("token binding = %s %s", ap.TokenAction, ap.TokenProjectID)
+	}
+	if len(ap.TokenFiles) != 1 || ap.TokenFiles[0] != script {
+		t.Fatalf("token files = %+v, want exact script text", ap.TokenFiles)
+	}
+}
+
+func TestHandle_RunScriptStepMissingScriptSkipped(t *testing.T) {
+	prop := &stubProposer{result: Proposal{
+		Summary: "bad step",
+		Risk:    RiskMedium,
+		Steps: []Step{{
+			Kind:   aiproposal.KindSecurityFix,
+			Params: map[string]any{"kind": "run_script"},
+		}},
+	}}
+	m, _, _ := newTestManager(t, prop)
+
+	rb := m.Handle(context.Background(), sampleAlert())
+	if len(rb.ProposalIDs) != 1 || rb.ProposalIDs[0] != "" {
+		t.Fatalf("expected invalid step skipped with empty proposal id: %+v", rb.ProposalIDs)
 	}
 }
 

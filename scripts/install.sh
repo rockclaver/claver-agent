@@ -162,6 +162,26 @@ else
   fi
 fi
 
+# Install the /run/sudo tmpfiles fragment: sudo needs to create its own
+# timestamp directory there on every call (even with NOPASSWD), and
+# ProtectSystem=strict in the unit above makes /run read-only unless this
+# path is pre-created and listed in ReadWritePaths=. Apply it immediately
+# (not just at next boot) so an existing deployment doesn't need a reboot
+# for sudo-gated actions (firewall, reboot, storage cleanup) to start working.
+TMPFILES_SRC="$(dirname "$0")/../systemd/claver-agent-sudo.tmpfiles.conf"
+TMPFILES_DST="/etc/tmpfiles.d/claver-agent-sudo.conf"
+if [[ -f "$TMPFILES_SRC" ]]; then
+  install -m 0644 "$TMPFILES_SRC" "$TMPFILES_DST"
+else
+  tmpfiles_url="${RELEASE_BASE}/v${VERSION}/claver-agent-sudo.tmpfiles.conf"
+  if ! curl -fsSL "$tmpfiles_url" -o "$TMPFILES_DST"; then
+    echo "warning: claver-agent-sudo tmpfiles fragment not found; sudo-gated actions (firewall, reboot, storage cleanup) may fail until /run/sudo is created" >&2
+  fi
+fi
+if [[ -f "$TMPFILES_DST" ]] && command -v systemd-tmpfiles >/dev/null 2>&1; then
+  systemd-tmpfiles --create "$TMPFILES_DST"
+fi
+
 systemctl daemon-reload
 systemctl enable claver-agent.service
 # `enable --now` only starts inactive units; on re-install we have just

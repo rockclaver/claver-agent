@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -129,10 +130,14 @@ type Runbook struct {
 // Config wires Manager. AIProposals + Proposer are required; Snapshotter,
 // Notifications, Session, and Now have sensible zero-value behaviour.
 type Config struct {
-	AIProposals   *aiproposal.Manager
-	Proposer      Proposer
-	Snapshotter   Snapshotter
-	Notifications *notifications.Hub
+	AIProposals *aiproposal.Manager
+	Proposer    Proposer
+	// ProposerForAgent returns a proposer for a user-selected CLI agent
+	// ("claude" or "codex"). It is used by manual remediation requests where
+	// the operator chooses which signed-in tool should draft the runbook.
+	ProposerForAgent func(agent string) Proposer
+	Snapshotter      Snapshotter
+	Notifications    *notifications.Hub
 	// Session is an optional hook that opens (or reuses) an AI-attributed
 	// session for the runbook and returns the session ID. Implementations
 	// may persist the prompt + response as session events so the operator
@@ -205,17 +210,50 @@ func (m *Manager) Handle(ctx context.Context, a Alert) Runbook {
 	if !m.tryClaim(a) {
 		return Runbook{}
 	}
-	g := Grounding{}
-	if m.cfg.Snapshotter != nil {
-		g = m.cfg.Snapshotter.Snapshot(ctx)
+	return m.proposeAndMaterialise(ctx, a, m.cfg.Proposer)
+}
+
+// HandleManual is the user-initiated variant. It bypasses alert throttling
+// because the operator explicitly asked for a fresh runbook, and optionally
+// routes through a selected CLI agent.
+func (m *Manager) HandleManual(ctx context.Context, a Alert, agent string) (Runbook, error) {
+	proposer := m.cfg.Proposer
+	if agent != "" {
+		if m.cfg.ProposerForAgent == nil {
+			return Runbook{}, fmt.Errorf("runbook: selected agent %q is not supported", agent)
+		}
+		proposer = m.cfg.ProposerForAgent(agent)
+		if proposer == nil {
+			return Runbook{}, fmt.Errorf("runbook: selected agent %q is not supported", agent)
+		}
 	}
-	p, err := m.cfg.Proposer.Propose(ctx, a, g)
+	return m.proposeAndMaterialiseErr(ctx, a, proposer)
+}
+
+func (m *Manager) proposeAndMaterialise(ctx context.Context, a Alert, proposer Proposer) Runbook {
+	rb, err := m.proposeAndMaterialiseErr(ctx, a, proposer)
 	if err != nil {
 		// Don't release the throttle on failure: that's exactly the
 		// flapping-alert case the throttle exists to bound.
 		return Runbook{}
 	}
-	return m.materialise(ctx, a, p)
+	return rb
+}
+
+func (m *Manager) proposeAndMaterialiseErr(ctx context.Context, a Alert, proposer Proposer) (Runbook, error) {
+	g := Grounding{}
+	if m.cfg.Snapshotter != nil {
+		g = m.cfg.Snapshotter.Snapshot(ctx)
+	}
+	p, err := proposer.Propose(ctx, a, g)
+	if err != nil {
+		return Runbook{}, err
+	}
+	rb := m.materialise(ctx, a, p)
+	if rb.ID == "" {
+		return Runbook{}, errors.New("runbook: AI proposer did not produce a runbook")
+	}
+	return rb, nil
 }
 
 // tryClaim atomically records "we just fired for this alert key" and returns
@@ -255,6 +293,17 @@ func (m *Manager) materialise(ctx context.Context, a Alert, p Proposal) Runbook 
 	}
 	if rb.Risk == "" {
 		rb.Risk = RiskMedium
+	}
+	// A run_script step executes an AI-authored shell script as root with no
+	// typed guard rails; the model's self-reported Risk is not trusted for
+	// this — force high so the mobile client (see _canOfferApproveAll)
+	// always requires a fresh per-step biometric instead of one-tap
+	// "approve all".
+	for _, step := range rb.Steps {
+		if isRunScriptStep(step) {
+			rb.Risk = RiskHigh
+			break
+		}
 	}
 
 	// Run the optional Session hook so the AC's "agent automatically opens
@@ -363,10 +412,54 @@ func tokenBindingForKind(kind aiproposal.Kind, params map[string]any) (action, p
 			verb = "rule_remove"
 		}
 		return "infra.firewall." + verb, "infra", []string{fmt.Sprintf("%s:%s:%d:%s:%s", actStr, proto, port, source, "")}, nil
+	case aiproposal.KindSecurityFix:
+		fixKind, _ := params["kind"].(string)
+		if fixKind == "" {
+			return "", "", nil, errors.New("security fix step missing kind")
+		}
+		if fixKind == "run_script" {
+			script, _ := params["script"].(string)
+			if strings.TrimSpace(script) == "" {
+				return "", "", nil, errors.New("security fix step missing script")
+			}
+			// Bind to the exact script text (not a short label) so the
+			// confirmation token's action hash pins approval to precisely
+			// what will execute as root.
+			return "security.fix.run_script", "security", []string{script}, nil
+		}
+		return "security.fix." + fixKind, "security", []string{securityFixTarget(fixKind, params)}, nil
 	}
 	return "", "", nil, fmt.Errorf("runbook: unsupported step kind %q", kind)
 }
 
+func securityFixTarget(kind string, params map[string]any) string {
+	switch kind {
+	case "close_port":
+		proto, _ := params["protocol"].(string)
+		if proto == "" {
+			proto = "tcp"
+		}
+		return fmt.Sprintf("%s/%d", proto, intFrom(params["port"]))
+	case "kill_process":
+		return fmt.Sprintf("pid/%d/%d", intFrom(params["pid"]), uint64From(params["start_time_ticks"]))
+	case "enable_auditd":
+		return "auditd"
+	default:
+		return kind
+	}
+}
+
+// isRunScriptStep reports whether step is an AI-authored raw-shell
+// remediation (aiproposal.KindSecurityFix, params.kind=="run_script"). Used
+// by materialise to force the runbook's overall Risk to high regardless of
+// what the model self-reported.
+func isRunScriptStep(step Step) bool {
+	if step.Kind != aiproposal.KindSecurityFix {
+		return false
+	}
+	kind, _ := step.Params["kind"].(string)
+	return kind == "run_script"
+}
 func intFrom(v any) int {
 	switch n := v.(type) {
 	case float64:

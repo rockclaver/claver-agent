@@ -65,6 +65,43 @@ type Client interface {
 	ContainerStats(ctx context.Context, id string) (StatsSample, error)
 	ContainerStatsStream(ctx context.Context, id string, emit func(StatsSample)) error
 	ContainerAction(ctx context.Context, id string, action ContainerAction) error
+	// DiskUsage reads the Docker Engine's verbose system/df snapshot, used to
+	// compute reclaimable space per resource kind for the Storage module.
+	DiskUsage(ctx context.Context) (DiskUsage, error)
+	// PruneContainers removes every stopped container. Mirrors
+	// `docker container prune`.
+	PruneContainers(ctx context.Context) (PruneResult, error)
+	// PruneImages removes dangling (untagged, unreferenced) images only.
+	// Mirrors `docker image prune` (no -a).
+	PruneImages(ctx context.Context) (PruneResult, error)
+	// PruneBuildCache removes unused build cache. Mirrors `docker builder prune`.
+	PruneBuildCache(ctx context.Context) (PruneResult, error)
+	// PruneVolumes removes every unused volume, including unattached named
+	// volumes. Mirrors `docker volume prune --filter all=true`; callers must
+	// treat this as a not-fully-safe, data-loss-capable action.
+	PruneVolumes(ctx context.Context) (PruneResult, error)
+}
+
+// DiskUsage is the Storage module's view of Docker's reclaimable space,
+// derived from the Engine's verbose system/df snapshot. Available is false
+// (with every byte/count field zero) when the daemon can't be reached; the
+// Storage module treats that as "omit the Docker categories", never an
+// error.
+type DiskUsage struct {
+	Available                  bool  `json:"available"`
+	ContainersReclaimableBytes int64 `json:"containers_reclaimable_bytes"`
+	ContainersReclaimableCount int   `json:"containers_reclaimable_count"`
+	ImagesReclaimableBytes     int64 `json:"images_reclaimable_bytes"`
+	ImagesReclaimableCount     int   `json:"images_reclaimable_count"`
+	BuildCacheReclaimableBytes int64 `json:"build_cache_reclaimable_bytes"`
+	VolumesReclaimableBytes    int64 `json:"volumes_reclaimable_bytes"`
+	VolumesReclaimableCount    int   `json:"volumes_reclaimable_count"`
+}
+
+// PruneResult is the outcome of a prune call: bytes freed and items removed.
+type PruneResult struct {
+	FreedBytes int64 `json:"freed_bytes"`
+	Count      int   `json:"count"`
 }
 
 // Status is the typed daemon status returned by Manager.Status.
@@ -229,6 +266,40 @@ func (m *Manager) ContainerAction(ctx context.Context, id string, action Contain
 		return fmt.Errorf("docker: unsupported container action %q", action)
 	}
 	return m.client.ContainerAction(ctx, id, action)
+}
+
+// DiskUsage returns Docker's reclaimable-space snapshot for the Storage
+// module. Unlike Status, an unreachable daemon collapses into
+// Available:false rather than an error — callers (the Storage scan) treat
+// that as "omit the Docker categories".
+func (m *Manager) DiskUsage(ctx context.Context) (DiskUsage, error) {
+	du, err := m.client.DiskUsage(ctx)
+	if err != nil {
+		return DiskUsage{Available: false}, nil
+	}
+	du.Available = true
+	return du, nil
+}
+
+// PruneContainers removes every stopped container.
+func (m *Manager) PruneContainers(ctx context.Context) (PruneResult, error) {
+	return m.client.PruneContainers(ctx)
+}
+
+// PruneImages removes dangling images only (the safe, non -a prune).
+func (m *Manager) PruneImages(ctx context.Context) (PruneResult, error) {
+	return m.client.PruneImages(ctx)
+}
+
+// PruneBuildCache removes unused build cache.
+func (m *Manager) PruneBuildCache(ctx context.Context) (PruneResult, error) {
+	return m.client.PruneBuildCache(ctx)
+}
+
+// PruneVolumes removes every unused volume, including unattached named
+// volumes. Not fully safe — callers must surface that to the user.
+func (m *Manager) PruneVolumes(ctx context.Context) (PruneResult, error) {
+	return m.client.PruneVolumes(ctx)
 }
 
 func (m *Manager) enrichSummary(c *ContainerSummary) {
@@ -1087,6 +1158,150 @@ func (c *SocketClient) Info(ctx context.Context) (DaemonInfo, error) {
 		Architecture:      raw.Architecture,
 		KernelVersion:     raw.KernelVersion,
 	}, nil
+}
+
+// dfImage/dfContainer/dfVolume/dfBuildCache mirror the shapes the Engine's
+// verbose GET /system/df returns for each resource kind — only the fields
+// DiskUsage needs to compute reclaimable space.
+type dfImage struct {
+	RepoTags   []string `json:"RepoTags"`
+	Size       int64    `json:"Size"`
+	Containers int64    `json:"Containers"`
+}
+
+type dfContainer struct {
+	SizeRw int64  `json:"SizeRw"`
+	State  string `json:"State"`
+}
+
+type dfVolume struct {
+	UsageData *struct {
+		Size     int64 `json:"Size"`
+		RefCount int64 `json:"RefCount"`
+	} `json:"UsageData"`
+}
+
+type dfBuildCache struct {
+	Size  int64 `json:"Size"`
+	InUse bool  `json:"InUse"`
+}
+
+// isDangling reports whether a df image entry is untagged (has no real
+// RepoTags, or only the synthetic "<none>:<none>").
+func (i dfImage) isDangling() bool {
+	return len(dropNoneTags(i.RepoTags)) == 0
+}
+
+// DiskUsage calls GET /system/df?verbose=1 and aggregates reclaimable bytes
+// per resource kind the same way `docker system df -v` does: stopped
+// containers' writable layer, dangling (untagged) images, unused build
+// cache, and volumes with no attached container.
+func (c *SocketClient) DiskUsage(ctx context.Context) (DiskUsage, error) {
+	var raw struct {
+		Images     []dfImage      `json:"Images"`
+		Containers []dfContainer  `json:"Containers"`
+		Volumes    []dfVolume     `json:"Volumes"`
+		BuildCache []dfBuildCache `json:"BuildCache"`
+	}
+	if err := c.getJSON(ctx, "/system/df?verbose=1", &raw); err != nil {
+		return DiskUsage{}, err
+	}
+	var out DiskUsage
+	for _, ct := range raw.Containers {
+		if ct.State == "running" || ct.State == "paused" {
+			continue
+		}
+		out.ContainersReclaimableBytes += ct.SizeRw
+		out.ContainersReclaimableCount++
+	}
+	for _, img := range raw.Images {
+		if !img.isDangling() || img.Containers > 0 {
+			continue
+		}
+		out.ImagesReclaimableBytes += img.Size
+		out.ImagesReclaimableCount++
+	}
+	for _, bc := range raw.BuildCache {
+		if bc.InUse {
+			continue
+		}
+		out.BuildCacheReclaimableBytes += bc.Size
+	}
+	for _, v := range raw.Volumes {
+		if v.UsageData == nil || v.UsageData.RefCount > 0 {
+			continue
+		}
+		out.VolumesReclaimableBytes += v.UsageData.Size
+		out.VolumesReclaimableCount++
+	}
+	return out, nil
+}
+
+// postPrune POSTs a prune endpoint (optionally with a `filters` query
+// parameter) and decodes Docker's standard
+// {..Deleted:[...], SpaceReclaimed:N} response shape into a PruneResult.
+func (c *SocketClient) postPrune(ctx context.Context, path string, deletedField string) (PruneResult, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://docker"+path, nil)
+	if err != nil {
+		return PruneResult{}, err
+	}
+	resp, err := c.actionc.Do(req)
+	if err != nil {
+		return PruneResult{}, translateDialError(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
+		return PruneResult{}, fmt.Errorf("%w: docker returned %d", ErrPermissionDenied, resp.StatusCode)
+	}
+	if resp.StatusCode >= 500 {
+		return PruneResult{}, fmt.Errorf("%w: docker returned %d", ErrDaemonDown, resp.StatusCode)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		msg := strings.TrimSpace(string(body))
+		if msg == "" {
+			msg = fmt.Sprintf("docker returned %d", resp.StatusCode)
+		}
+		return PruneResult{}, fmt.Errorf("docker: %s", msg)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return PruneResult{}, fmt.Errorf("docker: decode %s: %w", path, err)
+	}
+	var reclaimed int64
+	_ = json.Unmarshal(raw["SpaceReclaimed"], &reclaimed)
+	count := 0
+	if deletedField != "" {
+		var deleted []json.RawMessage
+		_ = json.Unmarshal(raw[deletedField], &deleted)
+		count = len(deleted)
+	}
+	return PruneResult{FreedBytes: reclaimed, Count: count}, nil
+}
+
+// PruneContainers calls POST /containers/prune (removes every stopped
+// container).
+func (c *SocketClient) PruneContainers(ctx context.Context) (PruneResult, error) {
+	return c.postPrune(ctx, "/containers/prune", "ContainersDeleted")
+}
+
+// PruneImages calls POST /images/prune with no filters, matching the
+// default (dangling-only) `docker image prune` behavior.
+func (c *SocketClient) PruneImages(ctx context.Context) (PruneResult, error) {
+	return c.postPrune(ctx, "/images/prune", "ImagesDeleted")
+}
+
+// PruneBuildCache calls POST /build/prune, removing all unused build cache.
+func (c *SocketClient) PruneBuildCache(ctx context.Context) (PruneResult, error) {
+	return c.postPrune(ctx, "/build/prune", "CachesDeleted")
+}
+
+// PruneVolumes calls POST /volumes/prune with filters={"all":["true"]} so
+// unattached *named* volumes are removed too, not just anonymous ones —
+// callers must treat this as not fully safe.
+func (c *SocketClient) PruneVolumes(ctx context.Context) (PruneResult, error) {
+	filters := url.QueryEscape(`{"all":["true"]}`)
+	return c.postPrune(ctx, "/volumes/prune?filters="+filters, "VolumesDeleted")
 }
 
 func dropNoneTags(tags []string) []string {

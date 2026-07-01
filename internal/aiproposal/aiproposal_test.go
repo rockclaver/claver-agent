@@ -21,6 +21,19 @@ func TestManager_CreateAssignsIDAndPending(t *testing.T) {
 	}
 }
 
+func TestManager_CreateAcceptsSecurityFix(t *testing.T) {
+	p, err := New().Create(Proposal{
+		Kind:   KindSecurityFix,
+		Params: map[string]any{"kind": "enable_auditd"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Kind != KindSecurityFix || p.Status != StatusPending {
+		t.Fatalf("bad proposal: %+v", p)
+	}
+}
+
 func TestManager_CreateRejectsUnknownKind(t *testing.T) {
 	if _, err := New().Create(Proposal{Kind: "bogus"}); !errors.Is(err, ErrUnknownKind) {
 		t.Fatalf("err = %v", err)

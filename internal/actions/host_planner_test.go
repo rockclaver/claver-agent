@@ -84,6 +84,33 @@ func TestHostQueryPlanner_MultipleIntentsOrdered(t *testing.T) {
 	}
 }
 
+func TestHostQueryPlanner_DiskSummaryIsUserReadable(t *testing.T) {
+	snap := infra.HostMetrics{Disks: []infra.DiskMetric{
+		{Mountpoint: "/", Available: true, TotalBytes: 144 * 1024 * 1024 * 1024, AvailableBytes: 102 * 1024 * 1024 * 1024, Percent: 29},
+		{Mountpoint: "/boot", Available: true, TotalBytes: 880 * 1024 * 1024, AvailableBytes: 702 * 1024 * 1024, Percent: 20},
+		{Mountpoint: "/boot/efi", Available: true, TotalBytes: 104 * 1024 * 1024, AvailableBytes: 98 * 1024 * 1024, Percent: 6},
+	}}
+	p := HostQueryPlanner{Metrics: fakeMetrics{snap}, Hostname: "Orivo"}
+	res, err := p.Plan(context.Background(), Request{Text: "check disk space"})
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if res.Status != StatusObserved {
+		t.Fatalf("status = %q, want observed", res.Status)
+	}
+	if strings.Contains(res.Summary, ", /boot") {
+		t.Fatalf("summary still looks like raw mount dump: %q", res.Summary)
+	}
+	for _, want := range []string{"Orivo:", "Disk space looks OK", "/ has", "Checked 3 mountpoints"} {
+		if !strings.Contains(res.Summary, want) {
+			t.Fatalf("summary %q missing %q", res.Summary, want)
+		}
+	}
+	if !strings.Contains(res.Events[0].Message, "/boot") {
+		t.Fatalf("raw mount evidence should remain in event: %q", res.Events[0].Message)
+	}
+}
+
 func TestHostQueryPlanner_MemoryUnavailable(t *testing.T) {
 	snap := infra.HostMetrics{Memory: infra.MemoryMetric{
 		MetricReason: infra.MetricReason{Available: false, Reason: infra.ReasonUnavailable, Message: "meminfo missing"},

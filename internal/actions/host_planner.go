@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/rockclaver/claver-agent/internal/infra"
@@ -84,48 +85,103 @@ func (p HostQueryPlanner) observe(in hostIntent, snap infra.HostMetrics) (string
 		if !m.Available {
 			return "memory metrics unavailable", PlannerEvent{Type: "observation", Message: "memory: " + reasonText(m.MetricReason)}
 		}
-		line := fmt.Sprintf("%s RAM free of %s (%.0f%% used)",
+		figures := fmt.Sprintf("%s RAM free of %s (%.0f%% used)",
 			humanBytes(m.AvailableBytes), humanBytes(m.TotalBytes), m.Percent)
-		return line, PlannerEvent{Type: "observation", Message: "read /proc/meminfo: " + line}
+		return fmt.Sprintf("%s: %s.", usageLead("Memory", m.Percent), figures),
+			PlannerEvent{Type: "observation", Message: "read /proc/meminfo: " + figures}
 	case intentSwap:
 		s := snap.Swap
 		if !s.Available || s.TotalBytes == 0 {
 			return "no swap configured", PlannerEvent{Type: "observation", Message: "swap: none configured"}
 		}
-		line := fmt.Sprintf("%s swap free of %s (%.0f%% used)",
+		figures := fmt.Sprintf("%s swap free of %s (%.0f%% used)",
 			humanBytes(s.AvailableBytes), humanBytes(s.TotalBytes), s.Percent)
-		return line, PlannerEvent{Type: "observation", Message: "read /proc/meminfo (swap): " + line}
+		return fmt.Sprintf("%s: %s.", usageLead("Swap", s.Percent), figures),
+			PlannerEvent{Type: "observation", Message: "read /proc/meminfo (swap): " + figures}
 	case intentDisk:
 		if len(snap.Disks) == 0 {
 			return "disk metrics unavailable", PlannerEvent{Type: "observation", Message: "disk: no mountpoints reported"}
 		}
-		var parts []string
+		var details []string
+		var available []infra.DiskMetric
 		for _, d := range snap.Disks {
 			if !d.Available {
-				parts = append(parts, fmt.Sprintf("%s unavailable", d.Mountpoint))
+				details = append(details, fmt.Sprintf("%s unavailable", d.Mountpoint))
 				continue
 			}
-			parts = append(parts, fmt.Sprintf("%s %s free of %s (%.0f%% used)",
+			available = append(available, d)
+			details = append(details, fmt.Sprintf("%s %s free of %s (%.0f%% used)",
 				d.Mountpoint, humanBytes(d.AvailableBytes), humanBytes(d.TotalBytes), d.Percent))
 		}
-		line := strings.Join(parts, ", ")
-		return line, PlannerEvent{Type: "observation", Message: "statfs mountpoints: " + line}
+		detailLine := strings.Join(details, ", ")
+		return summarizeDisks(available), PlannerEvent{Type: "observation", Message: "statfs mountpoints: " + detailLine}
 	case intentCPU:
 		c := snap.CPU
 		if !c.Available {
 			return "CPU metrics unavailable", PlannerEvent{Type: "observation", Message: "cpu: " + reasonText(c.MetricReason)}
 		}
-		line := fmt.Sprintf("CPU at %.0f%%", c.Percent)
-		return line, PlannerEvent{Type: "observation", Message: "sampled /proc/stat: " + line}
+		figures := fmt.Sprintf("CPU at %.0f%%", c.Percent)
+		return fmt.Sprintf("%s: %s.", usageLead("CPU", c.Percent), figures),
+			PlannerEvent{Type: "observation", Message: "sampled /proc/stat: " + figures}
 	case intentLoad:
 		l := snap.Load
 		if !l.Available {
 			return "load metrics unavailable", PlannerEvent{Type: "observation", Message: "load: " + reasonText(l.MetricReason)}
 		}
-		line := fmt.Sprintf("load %.2f / %.2f / %.2f (1/5/15m)", l.One, l.Five, l.Fifteen)
+		line := fmt.Sprintf("Load average is %.2f / %.2f / %.2f over 1/5/15 minutes.", l.One, l.Five, l.Fifteen)
 		return line, PlannerEvent{Type: "observation", Message: "read /proc/loadavg: " + line}
 	}
 	return "", PlannerEvent{}
+}
+
+func usageLead(name string, percent float64) string {
+	switch {
+	case percent >= 90:
+		return name + " is critically high"
+	case percent >= 80:
+		return name + " is getting high"
+	default:
+		return name + " looks OK"
+	}
+}
+
+func summarizeDisks(disks []infra.DiskMetric) string {
+	if len(disks) == 0 {
+		return "disk metrics unavailable"
+	}
+	var root *infra.DiskMetric
+	highest := disks[0]
+	lowestFree := disks[0]
+	for i := range disks {
+		d := disks[i]
+		if d.Mountpoint == "/" {
+			root = &d
+		}
+		if d.Percent > highest.Percent {
+			highest = d
+		}
+		if d.AvailableBytes < lowestFree.AvailableBytes {
+			lowestFree = d
+		}
+	}
+	focus := highest
+	if root != nil {
+		focus = *root
+	}
+	lead := usageLead("Disk space", focus.Percent)
+	msg := fmt.Sprintf("%s: %s has %s free of %s (%.0f%% used).",
+		lead, focus.Mountpoint, humanBytes(focus.AvailableBytes), humanBytes(focus.TotalBytes), focus.Percent)
+	if len(disks) == 1 {
+		return msg
+	}
+	var extra string
+	if math.Abs(highest.Percent-focus.Percent) >= 1 {
+		extra = fmt.Sprintf(" Highest usage is %s at %.0f%%.", highest.Mountpoint, highest.Percent)
+	}
+	if lowestFree.Mountpoint != focus.Mountpoint && lowestFree.AvailableBytes < 1024*1024*1024 {
+		extra += fmt.Sprintf(" Tightest mount is %s with %s free.", lowestFree.Mountpoint, humanBytes(lowestFree.AvailableBytes))
+	}
+	return fmt.Sprintf("%s Checked %d mountpoints.%s", msg, len(disks), extra)
 }
 
 func reasonText(r infra.MetricReason) string {

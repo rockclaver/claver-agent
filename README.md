@@ -60,6 +60,38 @@ go run ./cmd/claver-agent \
   --data-dir ./claver-data
 ```
 
+## Network Access
+
+The agent control plane must stay private. It binds to loopback and the mobile
+app reaches it by opening an SSH tunnel to `127.0.0.1:7676` on the managed
+host. Do not expose port `7676` on a public interface.
+
+For a VPS with a public SSH address, add the server normally in DevDeck. For a
+MacBook or a private server, use Tailscale so the device has a stable private
+address without opening SSH to the internet:
+
+1. Install Tailscale on the host.
+   - Linux: `curl -fsSL https://tailscale.com/install.sh | sh`, then run
+     `sudo tailscale up`.
+   - macOS: install Tailscale's standalone macOS app, then sign in.
+2. Confirm the host appears in your tailnet and copy its Tailscale IP or
+   MagicDNS name.
+3. Enable SSH on the host. On macOS this is **System Settings → General →
+   Sharing → Remote Login**.
+4. Add the host in DevDeck using the Tailscale IP or MagicDNS name, port `22`,
+   your SSH username, and the SSH key you authorized on that host.
+
+For unattended Linux servers, Tailscale supports auth keys:
+
+```sh
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up --auth-key=tskey-...
+```
+
+Use a short-lived, pre-approved, tagged auth key for server provisioning. Do not
+enable exit-node, subnet-router, or Tailscale SSH modes unless you have reviewed
+the tailnet ACL and the operational tradeoffs.
+
 For a systemd install, prefer an override instead of editing the packaged unit:
 
 ```sh
@@ -125,7 +157,40 @@ the service, and prints the installed version on stdout. It also installs the
 OS-level Bubblewrap package so Codex CLI can find `bwrap` on PATH, and creates
 the persistent Claude/Codex skill roots under `/var/lib/claver`.
 
+## Install on macOS
+
+Install Tailscale and enable Remote Login first if the Mac is not reachable on
+the same LAN. Then install the agent as the macOS user that DevDeck will SSH
+into:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/rockclaver/claver-agent/main/scripts/install-macos.sh \
+  | bash
+```
+
+To pin a specific release:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/rockclaver/claver-agent/main/scripts/install-macos.sh \
+  | bash -s -- --version 0.1.2
+```
+
+The macOS installer creates a per-user LaunchAgent at
+`~/Library/LaunchAgents/com.rockclaver.claver-agent.plist`, installs the binary
+under `~/Library/Application Support/ClaverAgent/bin`, stores agent data under
+`~/Library/Application Support/ClaverAgent`, and writes logs to
+`~/Library/Logs/ClaverAgent`. Do not run it with `sudo`; the agent should use
+the same user-level Claude, Codex, GitHub CLI, and SSH state as the account
+DevDeck connects to.
+
+macOS support is for running coding sessions and project operations on the
+MacBook. Linux host-management features such as systemd, ufw/firewalld, Caddy
+service control, and Linux storage cleanup are reported as unavailable or are
+limited on macOS.
+
 The requested version must already exist as a GitHub release. Push a tag such
 as `v0.1.0` to publish the `claver-agent-linux-amd64`,
-`claver-agent-linux-arm64`, `claver-agent.service`, and
-`claver-agent-firewall.sudoers` assets consumed by the installer.
+`claver-agent-linux-arm64`, `claver-agent-darwin-amd64`,
+`claver-agent-darwin-arm64`, `claver-agent.service`,
+`claver-agent-firewall.sudoers`, `claver-agent-sudo.tmpfiles.conf`, and
+`install-macos.sh` assets consumed by the installers.

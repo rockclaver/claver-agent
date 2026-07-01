@@ -30,9 +30,11 @@ import (
 	"github.com/rockclaver/claver-agent/internal/push"
 	"github.com/rockclaver/claver-agent/internal/review"
 	"github.com/rockclaver/claver-agent/internal/runbook"
+	"github.com/rockclaver/claver-agent/internal/security"
 	"github.com/rockclaver/claver-agent/internal/server"
 	"github.com/rockclaver/claver-agent/internal/sessions"
 	"github.com/rockclaver/claver-agent/internal/skills"
+	"github.com/rockclaver/claver-agent/internal/storage"
 	"github.com/rockclaver/claver-agent/internal/store"
 	"github.com/rockclaver/claver-agent/internal/systemd"
 	"github.com/rockclaver/claver-agent/internal/tooling"
@@ -181,6 +183,15 @@ func main() {
 	if err != nil {
 		log.Fatalf("claver-agent: init infra: %v", err)
 	}
+	storageMgr, err := storage.New(storage.Config{
+		HomeDir:      homeDirOr(*dataDir),
+		DataDir:      *dataDir,
+		ProjectsRoot: filepath.Join(*dataDir, "projects"),
+		Docker:       dockerMgr,
+	})
+	if err != nil {
+		log.Fatalf("claver-agent: init storage: %v", err)
+	}
 	systemdMgr, err := systemd.New(systemd.Config{Client: systemd.NewSystemctlClient()})
 	if err != nil {
 		log.Fatalf("claver-agent: init systemd: %v", err)
@@ -201,6 +212,13 @@ func main() {
 	})
 	if err != nil {
 		log.Fatalf("claver-agent: init firewall: %v", err)
+	}
+	securityMgr, err := security.New(security.Config{
+		Firewall:  firewallMgr,
+		Processes: processMgr,
+	})
+	if err != nil {
+		log.Fatalf("claver-agent: init security audit: %v", err)
 	}
 	notificationHub := notifications.NewHub()
 	alertMgr, err := alerts.New(alerts.Config{
@@ -226,6 +244,19 @@ func main() {
 			BinDir:  toolingMgr.BinDir(),
 			HomeDir: homeDirOr(*dataDir),
 			Secrets: authMgr.Secrets,
+		},
+		ProposerForAgent: func(agent string) runbook.Proposer {
+			switch agent {
+			case "claude", "codex":
+				return runbook.CLIProposer{
+					Agent:   agent,
+					BinDir:  toolingMgr.BinDir(),
+					HomeDir: homeDirOr(*dataDir),
+					Secrets: authMgr.Secrets,
+				}
+			default:
+				return nil
+			}
 		},
 		Snapshotter: runbook.SnapshotFunc(func(ctx context.Context) runbook.Grounding {
 			g := runbook.Grounding{Metrics: infraMgr.Sample(ctx)}
@@ -312,6 +343,8 @@ func main() {
 		Webservers:    webserverMgr,
 		Processes:     processMgr,
 		Firewall:      firewallMgr,
+		Storage:       storageMgr,
+		Security:      securityMgr,
 		Alerts:        alertMgr,
 		AIProposals:   aiProposalMgr,
 		Notifications: notificationHub,

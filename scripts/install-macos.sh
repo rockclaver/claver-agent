@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# Claver macOS agent installer.
+#
+# Installs the agent as a per-user launchd LaunchAgent. Do not run this script
+# with sudo: Claude, Codex, GitHub CLI auth, transcripts, and installed skills
+# should live under the same macOS account that DevDeck reaches over SSH.
+#
+# Usage:
+#   curl -fsSL https://raw.githubusercontent.com/rockclaver/claver-agent/main/scripts/install-macos.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/rockclaver/claver-agent/main/scripts/install-macos.sh | bash -s -- --version 0.1.2
+
+set -euo pipefail
+
+VERSION="${VERSION:-latest}"
+RELEASE_BASE="${RELEASE_BASE:-https://github.com/rockclaver/claver-agent/releases/download}"
+RELEASES_LATEST_URL="${RELEASES_LATEST_URL:-https://github.com/rockclaver/claver-agent/releases/latest}"
+LABEL="${LABEL:-com.rockclaver.claver-agent}"
+ADDR="${ADDR:-127.0.0.1:7676}"
+DATA_DIR="${DATA_DIR:-$HOME/Library/Application Support/ClaverAgent}"
+BIN_DIR="$DATA_DIR/bin"
+BIN_DST="$BIN_DIR/claver-agent"
+FRAGMENTS_DIR="$DATA_DIR/caddy-fragments"
+LOG_DIR="$HOME/Library/Logs/ClaverAgent"
+PLIST_DIR="$HOME/Library/LaunchAgents"
+PLIST_DST="$PLIST_DIR/$LABEL.plist"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --version) VERSION="$2"; shift 2 ;;
+    --release-base) RELEASE_BASE="$2"; shift 2 ;;
+    --addr) ADDR="$2"; shift 2 ;;
+    --data-dir) DATA_DIR="$2"; shift 2 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+BIN_DIR="$DATA_DIR/bin"
+BIN_DST="$BIN_DIR/claver-agent"
+FRAGMENTS_DIR="$DATA_DIR/caddy-fragments"
+
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "install-macos.sh only supports macOS. Use scripts/install.sh on Linux." >&2
+  exit 1
+fi
+
+if [[ "$(id -u)" -eq 0 ]]; then
+  echo "install-macos.sh must run as the target macOS user, not root." >&2
+  echo "Do not use sudo; this installer creates a per-user LaunchAgent." >&2
+  exit 1
+fi
+
+if [[ "$ADDR" != 127.0.0.1:* && "$ADDR" != localhost:* && "$ADDR" != "[::1]:"* && "$ADDR" != "::1:"* ]]; then
+  echo "refusing non-loopback --addr $ADDR" >&2
+  exit 1
+fi
+
+if [[ "$VERSION" == "latest" ]]; then
+  echo "resolving latest claver-agent release" >&2
+  resolved="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$RELEASES_LATEST_URL" || true)"
+  VERSION="${resolved##*/tag/v}"
+  if [[ -z "$VERSION" || "$VERSION" == "$resolved" ]]; then
+    echo "failed to resolve latest release from $RELEASES_LATEST_URL" >&2
+    echo "pass --version X.Y.Z to pin a specific release" >&2
+    exit 1
+  fi
+  echo "latest release: v${VERSION}" >&2
+fi
+
+arch="$(uname -m)"
+case "$arch" in
+  x86_64|amd64) arch=amd64 ;;
+  arm64|aarch64) arch=arm64 ;;
+  *) echo "unsupported macOS arch: $arch" >&2; exit 1 ;;
+esac
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+url="${RELEASE_BASE}/v${VERSION}/claver-agent-darwin-${arch}"
+echo "downloading $url" >&2
+if ! curl -fsSL "$url" -o "$tmp/claver-agent"; then
+  echo "failed to download claver-agent ${VERSION} for darwin-${arch}" >&2
+  echo "expected release asset: $url" >&2
+  exit 1
+fi
+chmod 0755 "$tmp/claver-agent"
+
+install -d -m 0700 "$DATA_DIR" "$BIN_DIR" "$FRAGMENTS_DIR" "$LOG_DIR" "$PLIST_DIR"
+install -m 0755 "$tmp/claver-agent" "$BIN_DST"
+
+xml_escape() {
+  local value="$1"
+  value="${value//&/&amp;}"
+  value="${value//</&lt;}"
+  value="${value//>/&gt;}"
+  printf '%s' "$value"
+}
+
+bin_xml="$(xml_escape "$BIN_DST")"
+addr_xml="$(xml_escape "$ADDR")"
+data_xml="$(xml_escape "$DATA_DIR")"
+fragments_xml="$(xml_escape "$FRAGMENTS_DIR")"
+home_xml="$(xml_escape "$HOME")"
+path_xml="$(xml_escape "$BIN_DIR:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")"
+stdout_xml="$(xml_escape "$LOG_DIR/agent.log")"
+stderr_xml="$(xml_escape "$LOG_DIR/agent.err.log")"
+
+cat > "$PLIST_DST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$bin_xml</string>
+    <string>--addr</string>
+    <string>$addr_xml</string>
+    <string>--data-dir</string>
+    <string>$data_xml</string>
+    <string>--caddy-fragments-dir</string>
+    <string>$fragments_xml</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>$home_xml</string>
+    <key>PATH</key>
+    <string>$path_xml</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>$data_xml</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>$stdout_xml</string>
+  <key>StandardErrorPath</key>
+  <string>$stderr_xml</string>
+</dict>
+</plist>
+EOF
+chmod 0644 "$PLIST_DST"
+if command -v plutil >/dev/null 2>&1; then
+  plutil -lint "$PLIST_DST" >/dev/null
+fi
+
+uid="$(id -u)"
+domain="gui/$uid"
+if ! launchctl print "$domain" >/dev/null 2>&1; then
+  domain="user/$uid"
+fi
+
+launchctl bootout "$domain" "$PLIST_DST" >/dev/null 2>&1 || true
+launchctl bootstrap "$domain" "$PLIST_DST"
+launchctl enable "$domain/$LABEL" >/dev/null 2>&1 || true
+launchctl kickstart -k "$domain/$LABEL" >/dev/null 2>&1 || true
+
+echo "installed claver-agent:"
+"$BIN_DST" --version
+echo "launchd service: $domain/$LABEL"
+echo "data dir: $DATA_DIR"
+echo "logs: $LOG_DIR"

@@ -49,6 +49,25 @@ func (w *warnRecorder) contains(sub string) bool {
 	return false
 }
 
+func TestStructuredSink_PublishesStderrAsErrorEvents(t *testing.T) {
+	coll := &eventCollector{}
+	sink := structuredSink{sessionID: "s1", emit: coll.emit}
+
+	sink.publishStderr(strings.NewReader("\nprotocol mismatch\n"), "codex stderr")
+
+	got := coll.waitForType(t, EvError, time.Second)
+	var ev ErrorEvent
+	if err := json.Unmarshal([]byte(got.ev.Data), &ev); err != nil {
+		t.Fatal(err)
+	}
+	if ev.Fatal {
+		t.Fatalf("stderr event should be non-fatal: %+v", ev)
+	}
+	if !strings.Contains(ev.Message, "codex stderr: protocol mismatch") {
+		t.Fatalf("stderr message = %q", ev.Message)
+	}
+}
+
 // AC: "Reconnect during a live turn loses no persisted events and duplicates no
 // deltas (automated)." AppendSessionEvent and fanout are not atomic, so an event
 // persisted just before a reconnect's replay snapshot and fanned out just after

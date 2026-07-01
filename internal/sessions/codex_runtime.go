@@ -21,7 +21,7 @@ import (
 // protocol (the structured transport), translating its server notifications into
 // normalized events and answering its exec/patch approval requests. Wire shapes
 // are source-verified from `codex app-server generate-json-schema` (codex-cli
-// 0.142.4); see plans/structured-agent-ui.md and codex_schema_test.go.
+// 0.142.5); see plans/structured-agent-ui.md and codex_schema_test.go.
 
 // codexControlTimeout bounds how long we wait for the app-server to answer a
 // parent-issued JSON-RPC request (initialize/thread.start/turn.start/interrupt).
@@ -497,7 +497,7 @@ func (r *CodexStructuredRuntime) Start(ctx context.Context, spec RuntimeSpec) er
 	r.procs[spec.SessionID] = proc
 	r.mu.Unlock()
 
-	go io.Copy(io.Discard, stderr) //nolint:errcheck // drain so the pipe never blocks the child
+	go sink.publishStderr(stderr, "codex stderr")
 	go conn.run(stdout)
 	go func() {
 		_ = cmd.Wait()

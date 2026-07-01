@@ -419,7 +419,7 @@ func (r *ClaudeStructuredRuntime) Start(ctx context.Context, spec RuntimeSpec) e
 		spec.OnAgentSession(claudeSessionID)
 	}
 
-	go io.Copy(io.Discard, stderr) //nolint:errcheck // drain so the pipe never blocks the child
+	go sink.publishStderr(stderr, "claude stderr")
 	go conn.run(stdout)
 	go func() {
 		_ = cmd.Wait()

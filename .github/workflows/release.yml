@@ -21,7 +21,7 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
-      - name: Build Linux binaries
+      - name: Build binaries
         env:
           VERSION: ${{ github.ref_name }}
         run: |
@@ -37,9 +37,19 @@ jobs:
               ./cmd/claver-agent
           done
 
+          for arch in amd64 arm64; do
+            GOOS=darwin GOARCH="$arch" CGO_ENABLED=0 go build \
+              -trimpath \
+              -ldflags "-s -w -X github.com/rockclaver/claver-agent/internal/version.Version=${version}" \
+              -o "dist/claver-agent-darwin-${arch}" \
+              ./cmd/claver-agent
+          done
+
           cp systemd/claver-agent.service dist/claver-agent.service
           cp systemd/claver-agent-firewall.sudoers dist/claver-agent-firewall.sudoers
-          (cd dist && sha256sum claver-agent-linux-* claver-agent.service claver-agent-firewall.sudoers > SHA256SUMS)
+          cp systemd/claver-agent-sudo.tmpfiles.conf dist/claver-agent-sudo.tmpfiles.conf
+          cp scripts/install-macos.sh dist/install-macos.sh
+          (cd dist && sha256sum claver-agent-* install-macos.sh > SHA256SUMS)
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
@@ -47,6 +57,10 @@ jobs:
           files: |
             dist/claver-agent-linux-amd64
             dist/claver-agent-linux-arm64
+            dist/claver-agent-darwin-amd64
+            dist/claver-agent-darwin-arm64
             dist/claver-agent.service
             dist/claver-agent-firewall.sudoers
+            dist/claver-agent-sudo.tmpfiles.conf
+            dist/install-macos.sh
             dist/SHA256SUMS

@@ -28,6 +28,7 @@ const (
 	KindProcessKill    Kind = "infra.process.kill"
 	KindFirewallAdd    Kind = "infra.firewall.rule_add"
 	KindFirewallRemove Kind = "infra.firewall.rule_remove"
+	KindSecurityFix    Kind = "security.fix"
 )
 
 // Status is the lifecycle state of a proposal.
@@ -103,7 +104,7 @@ func randomID() string {
 // and params (so the same binding the human flow uses is reused verbatim).
 func (m *Manager) Create(p Proposal) (Proposal, error) {
 	switch p.Kind {
-	case KindServiceAction, KindProcessKill, KindFirewallAdd, KindFirewallRemove:
+	case KindServiceAction, KindProcessKill, KindFirewallAdd, KindFirewallRemove, KindSecurityFix:
 	default:
 		return Proposal{}, ErrUnknownKind
 	}

@@ -11,7 +11,7 @@ import (
 // the Claude runtime emits, so the Flutter transcript renders Codex unchanged.
 // It is a pure function table-tested against recorded fixtures
 // (fixtures/codex/*.jsonl). Wire shapes are source-verified from
-// `codex app-server generate-json-schema` (codex-cli 0.142.4); the committed
+// `codex app-server generate-json-schema` (codex-cli 0.142.5); the committed
 // schema and a drift check live in codex_schema_test.go.
 
 // Server->client notification methods (no id) and approval request methods

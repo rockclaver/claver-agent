@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -43,6 +44,11 @@ type fakeClient struct {
 
 	actionCalls *[]string
 	actionErr   error
+
+	diskUsage    DiskUsage
+	diskUsageErr error
+	pruneResult  PruneResult
+	pruneErr     error
 }
 
 func (f fakeClient) Version(ctx context.Context) (VersionInfo, error) {
@@ -117,6 +123,26 @@ func (f fakeClient) ContainerAction(_ context.Context, id string, action Contain
 		return f.actionErr
 	}
 	return f.err
+}
+
+func (f fakeClient) DiskUsage(ctx context.Context) (DiskUsage, error) {
+	return f.diskUsage, f.diskUsageErr
+}
+
+func (f fakeClient) PruneContainers(ctx context.Context) (PruneResult, error) {
+	return f.pruneResult, f.pruneErr
+}
+
+func (f fakeClient) PruneImages(ctx context.Context) (PruneResult, error) {
+	return f.pruneResult, f.pruneErr
+}
+
+func (f fakeClient) PruneBuildCache(ctx context.Context) (PruneResult, error) {
+	return f.pruneResult, f.pruneErr
+}
+
+func (f fakeClient) PruneVolumes(ctx context.Context) (PruneResult, error) {
+	return f.pruneResult, f.pruneErr
 }
 
 func newManager(t *testing.T, c Client) *Manager {
@@ -783,6 +809,180 @@ func TestDropNoneTagsStripsPlaceholders(t *testing.T) {
 	}
 	if dropNoneTags([]string{"<none>:<none>"}) != nil {
 		t.Fatal("placeholder-only slice must collapse to nil")
+	}
+}
+
+// AC: DiskUsage aggregates reclaimable bytes the same way `docker system df
+// -v` does: stopped containers' writable layer, dangling (untagged, unused)
+// images, unused build cache, and volumes with no attached container.
+// Running/paused containers, tagged or in-use images, in-use build cache,
+// and attached volumes must never count toward reclaimable space.
+func TestSocketClientDiskUsage_AggregatesReclaimableBytes(t *testing.T) {
+	socket := startUnixDockerServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/system/df" || r.URL.Query().Get("verbose") != "1" {
+			t.Fatalf("unexpected request %s?%s", r.URL.Path, r.URL.RawQuery)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"Containers": [
+				{"SizeRw": 100, "State": "running"},
+				{"SizeRw": 200, "State": "exited"},
+				{"SizeRw": 50, "State": "dead"}
+			],
+			"Images": [
+				{"RepoTags": ["app:latest"], "Size": 1000, "Containers": 0},
+				{"RepoTags": ["<none>:<none>"], "Size": 300, "Containers": 0},
+				{"RepoTags": [], "Size": 400, "Containers": 1}
+			],
+			"BuildCache": [
+				{"Size": 500, "InUse": false},
+				{"Size": 600, "InUse": true}
+			],
+			"Volumes": [
+				{"UsageData": {"Size": 700, "RefCount": 0}},
+				{"UsageData": {"Size": 800, "RefCount": 2}},
+				{"UsageData": null}
+			]
+		}`))
+	})
+	c := NewSocketClient(socket)
+	got, err := c.DiskUsage(context.Background())
+	if err != nil {
+		t.Fatalf("DiskUsage: %v", err)
+	}
+	want := DiskUsage{
+		ContainersReclaimableBytes: 250, // exited(200) + dead(50), running excluded
+		ContainersReclaimableCount: 2,
+		ImagesReclaimableBytes:     300, // only the untagged, unused image
+		ImagesReclaimableCount:     1,
+		BuildCacheReclaimableBytes: 500, // only the not-in-use entry
+		VolumesReclaimableBytes:    700, // only RefCount==0
+		VolumesReclaimableCount:    1,
+	}
+	if got != want {
+		t.Fatalf("DiskUsage = %+v, want %+v", got, want)
+	}
+}
+
+// AC: each prune endpoint POSTs the expected path/filters and decodes
+// Docker's {Deleted:[...], SpaceReclaimed:N} response into a PruneResult.
+func TestSocketClientPrune_ParsesSpaceReclaimedAndDeletedCount(t *testing.T) {
+	cases := []struct {
+		name      string
+		call      func(*SocketClient) (PruneResult, error)
+		wantPath  string
+		wantQuery string
+		body      string
+	}{
+		{
+			name:     "containers",
+			call:     func(c *SocketClient) (PruneResult, error) { return c.PruneContainers(context.Background()) },
+			wantPath: "/containers/prune",
+			body:     `{"ContainersDeleted": ["a", "b"], "SpaceReclaimed": 1234}`,
+		},
+		{
+			name:     "images",
+			call:     func(c *SocketClient) (PruneResult, error) { return c.PruneImages(context.Background()) },
+			wantPath: "/images/prune",
+			body:     `{"ImagesDeleted": [{"Deleted": "sha256:x"}], "SpaceReclaimed": 42}`,
+		},
+		{
+			name:     "build cache",
+			call:     func(c *SocketClient) (PruneResult, error) { return c.PruneBuildCache(context.Background()) },
+			wantPath: "/build/prune",
+			body:     `{"CachesDeleted": ["id1"], "SpaceReclaimed": 7}`,
+		},
+		{
+			name:      "volumes",
+			call:      func(c *SocketClient) (PruneResult, error) { return c.PruneVolumes(context.Background()) },
+			wantPath:  "/volumes/prune",
+			wantQuery: `filters={"all":["true"]}`,
+			body:      `{"VolumesDeleted": ["v1", "v2", "v3"], "SpaceReclaimed": 99}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotPath, gotMethod string
+			var gotQuery url.Values
+			socket := startUnixDockerServer(t, func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				gotMethod = r.Method
+				gotQuery = r.URL.Query()
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(tc.body))
+			})
+			c := NewSocketClient(socket)
+			got, err := tc.call(c)
+			if err != nil {
+				t.Fatalf("%s: %v", tc.name, err)
+			}
+			if gotMethod != http.MethodPost || gotPath != tc.wantPath {
+				t.Fatalf("%s: method/path = %s %s, want POST %s", tc.name, gotMethod, gotPath, tc.wantPath)
+			}
+			if tc.wantQuery != "" {
+				decoded, _ := url.ParseQuery(tc.wantQuery)
+				if gotQuery.Get("filters") != decoded.Get("filters") {
+					t.Fatalf("%s: filters = %q, want %q", tc.name, gotQuery.Get("filters"), decoded.Get("filters"))
+				}
+			}
+			if got.FreedBytes == 0 {
+				t.Fatalf("%s: expected non-zero freed bytes", tc.name)
+			}
+		})
+	}
+}
+
+// AC: Manager.DiskUsage never propagates a client error — an unreachable
+// daemon collapses into Available:false so the Storage scan can omit the
+// Docker categories rather than erroring the whole scan.
+func TestManagerDiskUsage_CollapsesClientErrorToUnavailable(t *testing.T) {
+	m := newManager(t, fakeClient{diskUsageErr: ErrDaemonDown})
+	got, err := m.DiskUsage(context.Background())
+	if err != nil {
+		t.Fatalf("DiskUsage returned error, want nil: %v", err)
+	}
+	if got.Available {
+		t.Fatal("expected Available=false on client error")
+	}
+}
+
+// AC: Manager.DiskUsage marks a successful read Available and passes the
+// byte/count fields through unchanged.
+func TestManagerDiskUsage_AvailableOnSuccess(t *testing.T) {
+	want := DiskUsage{ContainersReclaimableBytes: 10, ImagesReclaimableCount: 1}
+	m := newManager(t, fakeClient{diskUsage: want})
+	got, err := m.DiskUsage(context.Background())
+	if err != nil {
+		t.Fatalf("DiskUsage: %v", err)
+	}
+	want.Available = true
+	if got != want {
+		t.Fatalf("DiskUsage = %+v, want %+v", got, want)
+	}
+}
+
+// AC: every Manager prune method delegates straight to the Client and
+// surfaces its error untouched (unlike DiskUsage, a failed mutation must be
+// visible to the caller).
+func TestManagerPrune_DelegatesToClientAndSurfacesErrors(t *testing.T) {
+	wantErr := errors.New("boom")
+	m := newManager(t, fakeClient{pruneResult: PruneResult{FreedBytes: 5, Count: 1}, pruneErr: wantErr})
+	if _, err := m.PruneContainers(context.Background()); !errors.Is(err, wantErr) {
+		t.Fatalf("PruneContainers err = %v, want %v", err, wantErr)
+	}
+	if _, err := m.PruneImages(context.Background()); !errors.Is(err, wantErr) {
+		t.Fatalf("PruneImages err = %v, want %v", err, wantErr)
+	}
+	if _, err := m.PruneBuildCache(context.Background()); !errors.Is(err, wantErr) {
+		t.Fatalf("PruneBuildCache err = %v, want %v", err, wantErr)
+	}
+	if _, err := m.PruneVolumes(context.Background()); !errors.Is(err, wantErr) {
+		t.Fatalf("PruneVolumes err = %v, want %v", err, wantErr)
+	}
+	m2 := newManager(t, fakeClient{pruneResult: PruneResult{FreedBytes: 5, Count: 1}})
+	got, err := m2.PruneImages(context.Background())
+	if err != nil || got.FreedBytes != 5 || got.Count != 1 {
+		t.Fatalf("PruneImages = %+v, %v", got, err)
 	}
 }
 

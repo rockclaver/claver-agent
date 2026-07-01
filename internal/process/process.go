@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 const (
@@ -29,6 +30,8 @@ var (
 	ErrProtectedPID      = errors.New("process: protected pid")
 	ErrUnsupportedSignal = errors.New("process: unsupported signal")
 	ErrIdentityMismatch  = errors.New("process: identity mismatch")
+	ErrTerminationFailed = errors.New("process: termination failed")
+	ErrKernelThread      = errors.New("process: pid is a kernel thread")
 )
 
 type ProtectedPIDError struct {
@@ -51,40 +54,57 @@ type Process struct {
 	StartTimeTicks uint64  `json:"start_time_ticks"`
 	Protected      bool    `json:"protected"`
 	ProtectReason  string  `json:"protect_reason,omitempty"`
+	ExePath        string  `json:"exe_path,omitempty"`
+	ExeDeleted     bool    `json:"exe_deleted,omitempty"`
+	// KernelThread is true for kernel-scheduled threads (kworker,
+	// kdevtmpfs, ksoftirqd, migration, rcu_gp, …): they have no argv
+	// (empty /proc/<pid>/cmdline) and no backing executable (no
+	// /proc/<pid>/exe symlink at all). They are never suspicious in the
+	// userspace sense and cannot be signalled to exit — kill() is a no-op
+	// against them, unlike a real process ignoring SIGTERM.
+	KernelThread bool `json:"kernel_thread,omitempty"`
 }
 
 type FileReader interface {
 	ReadFile(name string) ([]byte, error)
 	ReadDir(name string) ([]os.DirEntry, error)
+	Readlink(name string) (string, error)
 }
 
 type osReader struct{}
 
 func (osReader) ReadFile(name string) ([]byte, error)       { return os.ReadFile(name) }
 func (osReader) ReadDir(name string) ([]os.DirEntry, error) { return os.ReadDir(name) }
+func (osReader) Readlink(name string) (string, error)       { return os.Readlink(name) }
 
 type Config struct {
-	ProcRoot     string
-	Reader       FileReader
-	PageSize     uint64
-	ClockTicks   float64
-	NumCPU       int
-	AgentPID     int
-	TmuxPanePIDs func(context.Context) []int
-	LookupUser   func(uid string) string
-	Signal       func(pid int, signal syscall.Signal) error
+	ProcRoot         string
+	Reader           FileReader
+	PageSize         uint64
+	ClockTicks       float64
+	NumCPU           int
+	AgentPID         int
+	TmuxPanePIDs     func(context.Context) []int
+	LookupUser       func(uid string) string
+	Signal           func(ctx context.Context, pid int, signal syscall.Signal) error
+	Sleep            func(time.Duration)
+	KillGrace        time.Duration
+	KillPollInterval time.Duration
 }
 
 type Manager struct {
-	procRoot     string
-	reader       FileReader
-	pageSize     uint64
-	clockTicks   float64
-	numCPU       int
-	agentPID     int
-	tmuxPanePIDs func(context.Context) []int
-	lookupUser   func(string) string
-	signal       func(int, syscall.Signal) error
+	procRoot         string
+	reader           FileReader
+	pageSize         uint64
+	clockTicks       float64
+	numCPU           int
+	agentPID         int
+	tmuxPanePIDs     func(context.Context) []int
+	lookupUser       func(string) string
+	signal           func(context.Context, int, syscall.Signal) error
+	sleep            func(time.Duration)
+	killGrace        time.Duration
+	killPollInterval time.Duration
 }
 
 func New(cfg Config) (*Manager, error) {
@@ -113,20 +133,30 @@ func New(cfg Config) (*Manager, error) {
 		cfg.LookupUser = lookupUser
 	}
 	if cfg.Signal == nil {
-		cfg.Signal = func(pid int, sig syscall.Signal) error {
-			return syscall.Kill(pid, sig)
-		}
+		cfg.Signal = defaultSignal
+	}
+	if cfg.Sleep == nil {
+		cfg.Sleep = time.Sleep
+	}
+	if cfg.KillGrace <= 0 {
+		cfg.KillGrace = 2 * time.Second
+	}
+	if cfg.KillPollInterval <= 0 {
+		cfg.KillPollInterval = 100 * time.Millisecond
 	}
 	return &Manager{
-		procRoot:     cfg.ProcRoot,
-		reader:       cfg.Reader,
-		pageSize:     cfg.PageSize,
-		clockTicks:   cfg.ClockTicks,
-		numCPU:       cfg.NumCPU,
-		agentPID:     cfg.AgentPID,
-		tmuxPanePIDs: cfg.TmuxPanePIDs,
-		lookupUser:   cfg.LookupUser,
-		signal:       cfg.Signal,
+		procRoot:         cfg.ProcRoot,
+		reader:           cfg.Reader,
+		pageSize:         cfg.PageSize,
+		clockTicks:       cfg.ClockTicks,
+		numCPU:           cfg.NumCPU,
+		agentPID:         cfg.AgentPID,
+		tmuxPanePIDs:     cfg.TmuxPanePIDs,
+		lookupUser:       cfg.LookupUser,
+		signal:           cfg.Signal,
+		sleep:            cfg.Sleep,
+		killGrace:        cfg.KillGrace,
+		killPollInterval: cfg.KillPollInterval,
 	}, nil
 }
 
@@ -183,6 +213,16 @@ func (m *Manager) List(ctx context.Context, sortBy string, limit int) ([]Process
 	return out, nil
 }
 
+// Kill signals pid, then verifies it actually exited rather than trusting
+// the signal-delivery return value alone: syscall success (or a
+// successful sudo escalation) only means the kernel delivered the signal,
+// not that the process terminated. A process with a SIGTERM handler that
+// ignores or swallows it — common for both well-behaved daemons doing slow
+// cleanup and for malware evading exactly this kind of automated response —
+// would otherwise be reported as "fixed" while still running. Kill escalates
+// once from SIGTERM to SIGKILL if the process is still alive after the
+// grace period, and only reports success once the PID is confirmed gone (or
+// reused by an unrelated process).
 func (m *Manager) Kill(ctx context.Context, pid int, startTimeTicks uint64, signalName string) error {
 	if pid <= 0 {
 		return errors.New("process: pid required")
@@ -204,7 +244,44 @@ func (m *Manager) Kill(ctx context.Context, pid int, startTimeTicks uint64, sign
 	if p.StartTimeTicks != startTimeTicks {
 		return fmt.Errorf("%w: pid %d start_time_ticks changed from %d to %d", ErrIdentityMismatch, pid, startTimeTicks, p.StartTimeTicks)
 	}
-	return m.signal(pid, sig)
+	if p.KernelThread {
+		return fmt.Errorf("%w: pid %d (%s) has no argv and no backing executable; signalling it is a no-op", ErrKernelThread, pid, p.Command)
+	}
+	if err := m.signal(ctx, pid, sig); err != nil {
+		return err
+	}
+	if m.awaitExit(ctx, pid, startTimeTicks) {
+		return nil
+	}
+	if sig == syscall.SIGKILL {
+		return fmt.Errorf("%w: pid %d is still running after SIGKILL (it may be stuck in an uninterruptible kernel wait)", ErrTerminationFailed, pid)
+	}
+	if err := m.signal(ctx, pid, syscall.SIGKILL); err != nil {
+		return fmt.Errorf("process: escalation to SIGKILL failed for pid %d: %w", pid, err)
+	}
+	if m.awaitExit(ctx, pid, startTimeTicks) {
+		return nil
+	}
+	return fmt.Errorf("%w: pid %d ignored SIGTERM and is still running after SIGKILL", ErrTerminationFailed, pid)
+}
+
+// awaitExit polls until pid has exited (readProcess fails) or been reused by
+// an unrelated process (StartTimeTicks changed), or the grace period elapses.
+func (m *Manager) awaitExit(ctx context.Context, pid int, startTimeTicks uint64) bool {
+	interval := m.killPollInterval
+	if interval <= 0 || interval > m.killGrace {
+		interval = m.killGrace
+	}
+	for elapsed := time.Duration(0); ; elapsed += interval {
+		p, err := m.readProcess(pid, 0)
+		if err != nil || p.StartTimeTicks != startTimeTicks {
+			return true
+		}
+		if elapsed >= m.killGrace || ctx.Err() != nil {
+			return false
+		}
+		m.sleep(interval)
+	}
 }
 
 func (m *Manager) IsProtected(ctx context.Context, pid int) (string, bool) {
@@ -265,7 +342,8 @@ func (m *Manager) readProcess(pid int, uptime float64) (Process, error) {
 	if err != nil {
 		return Process{}, err
 	}
-	cmd := parseCmdline(mustString(m.reader.ReadFile(filepath.Join(dir, "cmdline"))))
+	rawCmd := parseCmdline(mustString(m.reader.ReadFile(filepath.Join(dir, "cmdline"))))
+	cmd := rawCmd
 	if cmd == "" {
 		cmd = stat.command
 	}
@@ -275,6 +353,12 @@ func (m *Manager) readProcess(pid int, uptime float64) (Process, error) {
 	} else if stat.rssPages > 0 {
 		rssBytes = uint64(stat.rssPages) * m.pageSize
 	}
+	exePath, exeDeleted := "", false
+	exeResolved := false
+	if target, err := m.reader.Readlink(filepath.Join(dir, "exe")); err == nil {
+		exeResolved = true
+		exePath, exeDeleted = strings.CutSuffix(target, " (deleted)")
+	}
 	return Process{
 		PID:            pid,
 		User:           m.lookupUser(uid),
@@ -282,6 +366,9 @@ func (m *Manager) readProcess(pid int, uptime float64) (Process, error) {
 		CPUPercent:     cpuPercent(stat, uptime, m.clockTicks, m.numCPU),
 		RSSBytes:       rssBytes,
 		StartTimeTicks: stat.startTicks,
+		ExePath:        exePath,
+		ExeDeleted:     exeDeleted,
+		KernelThread:   rawCmd == "" && !exeResolved,
 	}, nil
 }
 
@@ -414,6 +501,53 @@ func parseSignal(name string) (syscall.Signal, error) {
 		return syscall.SIGKILL, nil
 	default:
 		return 0, ErrUnsupportedSignal
+	}
+}
+
+// defaultSignal is the production Config.Signal. The agent runs as the
+// unprivileged `claver` system user (see claver-agent.service), so a bare
+// syscall.Kill only reaches processes owned by that same user — every
+// process owned by root or another service account fails with EPERM
+// ("operation not permitted"), which is exactly the case that matters for a
+// security-audit "terminate process" fix, since the flagged process is
+// almost always owned by root or a service account, not `claver`. Try the
+// direct signal first (works for same-user processes and when the agent
+// runs as root, with no sudo dependency at all) and escalate through the
+// same `sudo -n` + sudoers.d pattern the firewall backends use only on
+// EPERM. The sudoers fragment scopes this to `kill -TERM`/`kill -KILL`
+// only, and the PID/start-time identity check and protected-PID guard in
+// Kill above still run before this is ever invoked.
+func defaultSignal(ctx context.Context, pid int, sig syscall.Signal) error {
+	err := syscall.Kill(pid, sig)
+	if err == nil || !errors.Is(err, syscall.EPERM) {
+		return err
+	}
+	out, sudoErr := exec.CommandContext(ctx, "sudo", sudoKillArgs(pid, sig)...).CombinedOutput()
+	if sudoErr != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			msg = sudoErr.Error()
+		}
+		return fmt.Errorf("process: sudo kill failed: %s", msg)
+	}
+	return nil
+}
+
+// sudoKillArgs builds the `sudo -n kill …` argument list. Split out from
+// defaultSignal so the argument shape (signal flag, PID) is unit-testable
+// without shelling out to a real sudo binary.
+func sudoKillArgs(pid int, sig syscall.Signal) []string {
+	return []string{"-n", "kill", signalFlag(sig), strconv.Itoa(pid)}
+}
+
+func signalFlag(sig syscall.Signal) string {
+	switch sig {
+	case syscall.SIGTERM:
+		return "-TERM"
+	case syscall.SIGKILL:
+		return "-KILL"
+	default:
+		return "-" + strconv.Itoa(int(sig))
 	}
 }
 

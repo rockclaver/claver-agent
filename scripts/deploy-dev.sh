@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Build the agent from the current working tree and install it on a remote
 # VPS over SSH. Used during development to roll out unreleased changes
-# without waiting for a tagged release.
+# without waiting for a tagged release — the binary AND the systemd unit /
+# sudoers / tmpfiles fragments under systemd/, since a code change that
+# needs a matching config change (e.g. a new sudoers rule) is silently
+# incomplete if only the binary gets pushed.
 #
 # Usage:
 #   agent/scripts/deploy-dev.sh <ssh-target> [--arch amd64|arm64] [--sudo]
@@ -64,13 +67,31 @@ BIN="$OUT/claver-agent"
 echo "[deploy] building linux/$ARCH from $ROOT"
 (cd "$ROOT" && GOOS=linux GOARCH="$ARCH" CGO_ENABLED=0 go build -o "$BIN" ./cmd/claver-agent)
 
-echo "[deploy] copying binary to $TARGET:/tmp/claver-agent"
-scp -q "$BIN" "$TARGET:/tmp/claver-agent"
+SERVICE_SRC="$ROOT/systemd/claver-agent.service"
+SUDOERS_SRC="$ROOT/systemd/claver-agent-firewall.sudoers"
+TMPFILES_SRC="$ROOT/systemd/claver-agent-sudo.tmpfiles.conf"
 
-echo "[deploy] installing + restarting claver-agent on $TARGET"
-ssh "$TARGET" "$SUDO install -m 0755 /tmp/claver-agent /usr/local/bin/claver-agent \
-  && $SUDO systemctl restart claver-agent \
-  && rm -f /tmp/claver-agent"
+echo "[deploy] copying binary + systemd/sudoers/tmpfiles fragments to $TARGET:/tmp"
+scp -q "$BIN" "$SERVICE_SRC" "$SUDOERS_SRC" "$TMPFILES_SRC" "$TARGET:/tmp/"
+
+echo "[deploy] installing binary + config fragments on $TARGET"
+ssh "$TARGET" "
+  set -euo pipefail
+  $SUDO install -m 0755 /tmp/claver-agent /usr/local/bin/claver-agent
+  $SUDO install -m 0644 /tmp/claver-agent.service /etc/systemd/system/claver-agent.service
+  $SUDO install -m 0644 /tmp/claver-agent-sudo.tmpfiles.conf /etc/tmpfiles.d/claver-agent-sudo.conf
+  $SUDO systemd-tmpfiles --create /etc/tmpfiles.d/claver-agent-sudo.conf
+  $SUDO install -m 0440 /tmp/claver-agent-firewall.sudoers /etc/sudoers.d/claver-agent-firewall.new
+  if $SUDO visudo -c -f /etc/sudoers.d/claver-agent-firewall.new >/dev/null; then
+    $SUDO mv /etc/sudoers.d/claver-agent-firewall.new /etc/sudoers.d/claver-agent-firewall
+  else
+    echo 'warning: claver-agent-firewall sudoers fragment failed visudo check; leaving previous fragment in place' >&2
+    $SUDO rm -f /etc/sudoers.d/claver-agent-firewall.new
+  fi
+  $SUDO systemctl daemon-reload
+  $SUDO systemctl restart claver-agent
+  rm -f /tmp/claver-agent /tmp/claver-agent.service /tmp/claver-agent-firewall.sudoers /tmp/claver-agent-sudo.tmpfiles.conf
+"
 
 echo "[deploy] installed version on $TARGET:"
 ssh "$TARGET" "/usr/local/bin/claver-agent --version"

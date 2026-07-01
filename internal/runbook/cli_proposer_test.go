@@ -3,6 +3,8 @@ package runbook
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -51,6 +53,43 @@ func TestCLIProposer_ParsesDirectJSON(t *testing.T) {
 	}
 }
 
+func TestCLICommand_CodexSkipsGitRepoCheck(t *testing.T) {
+	name, args := cliCommand("codex")
+	if name != "codex" {
+		t.Fatalf("name=%q", name)
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "--skip-git-repo-check") {
+		t.Fatalf("codex args missing git check skip: %#v", args)
+	}
+	if !strings.Contains(joined, "--ephemeral") {
+		t.Fatalf("codex args missing ephemeral mode: %#v", args)
+	}
+}
+
+func TestCLIProposer_DefaultExecResolvesFromBinDirPATH(t *testing.T) {
+	binDir := t.TempDir()
+	stub := filepath.Join(binDir, "codex")
+	script := `#!/bin/sh
+cat >/dev/null
+printf '{"summary":"from managed bin","risk":"low","steps":[]}'
+`
+	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := CLIProposer{
+		Agent:  "codex",
+		BinDir: binDir,
+	}
+	got, err := p.Propose(context.Background(), sampleAlert(), Grounding{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Summary != "from managed bin" {
+		t.Fatalf("bad parse: %+v", got)
+	}
+}
+
 func TestCLIProposer_ParsesJSONInsideCodeFence(t *testing.T) {
 	body := "Here is the plan:\n```json\n{\"summary\":\"x\",\"risk\":\"low\",\"steps\":[]}\n```\nthat is all"
 	p := CLIProposer{
@@ -65,6 +104,31 @@ func TestCLIProposer_ParsesJSONInsideCodeFence(t *testing.T) {
 	}
 	if got.Summary != "x" {
 		t.Fatalf("bad parse: %+v", got)
+	}
+}
+
+func TestCLIProposer_ParsesCodexJSONLStream(t *testing.T) {
+	body := `{"summary":"deny exposed redis","risk":"high","steps":[{"kind":"infra.firewall.rule_add","params":{"action":"deny","protocol":"tcp","port":6379},"description":"block public redis"}]}`
+	stdout := strings.Join([]string{
+		`{"type":"session.started","session_id":"s1"}`,
+		`{"msg":{"type":"agent_message","message":"` + escapeJSON(body) + `"}}`,
+		`{"type":"session.completed","status":"ok"}`,
+	}, "\n")
+	p := CLIProposer{
+		Agent: "codex",
+		Exec: func(_ context.Context, _ string, _ []string, _ []string, _ string) ([]byte, error) {
+			return []byte(stdout), nil
+		},
+	}
+	got, err := p.Propose(context.Background(), sampleAlert(), Grounding{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Summary != "deny exposed redis" || got.Risk != RiskHigh || len(got.Steps) != 1 {
+		t.Fatalf("bad parse: %+v", got)
+	}
+	if got.Steps[0].Kind != aiproposal.KindFirewallAdd {
+		t.Fatalf("step kind=%q", got.Steps[0].Kind)
 	}
 }
 
@@ -130,6 +194,9 @@ func TestCLIProposer_PromptContainsAlertAndGrounding(t *testing.T) {
 	}
 	if !strings.Contains(capturedPrompt, "infra.service.action") {
 		t.Fatal("prompt missing kind whitelist")
+	}
+	if !strings.Contains(capturedPrompt, "security.fix") {
+		t.Fatal("prompt missing security fix whitelist")
 	}
 }
 
