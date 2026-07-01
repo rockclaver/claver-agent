@@ -212,7 +212,7 @@ func main() {
 	}
 	var socketReader firewall.SocketReader = firewall.NewSSCommandReader()
 	if runtime.GOOS == "darwin" {
-		socketReader = firewall.NewLsofSocketReader()
+		socketReader = firewall.NewNetstatSocketReader()
 	}
 	firewallMgr, err := firewall.New(firewall.Config{
 		Backends: []firewall.Backend{firewall.NewUFWBackend(), firewall.NewFirewalldBackend()},

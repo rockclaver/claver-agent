@@ -421,3 +421,22 @@ claver-ag   999 claver    7u  IPv4 0x123456789abcdef1      0t0  TCP 127.0.0.1:76
 		t.Fatalf("second socket: %+v", got[1])
 	}
 }
+
+func TestParseNetstatDarwinSockets(t *testing.T) {
+	raw := `Active Internet connections (including servers)
+Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)          rxbytes      txbytes  rhiwat  shiwat          process:pid    state  options
+tcp4       0      0  127.0.0.1.7676         *.*                    LISTEN                 0            0  131072  131072     claver-agent:99680  00100 00000006
+tcp4       0      0  *.22                   *.*                    LISTEN                 0            0  131072  131072          launchd:1      00180 00000006
+tcp4       0      0  127.0.0.1.64795        1.1.1.1.443            ESTABLISHED            0          171  132104  132104          Safari:100     00102 00000008
+`
+	got := parseNetstatDarwin(raw)
+	if len(got) != 2 {
+		t.Fatalf("len=%d got=%+v", len(got), got)
+	}
+	if got[0].Process != "claver-agent" || got[0].PID != 99680 || got[0].Address != "127.0.0.1" || got[0].Port != 7676 {
+		t.Fatalf("first socket: %+v", got[0])
+	}
+	if got[1].Process != "launchd" || got[1].PID != 1 || got[1].Address != "*" || got[1].Port != 22 {
+		t.Fatalf("second socket: %+v", got[1])
+	}
+}

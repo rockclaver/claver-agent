@@ -455,6 +455,89 @@ func dedupeSockets(in []Socket) []Socket {
 	return out
 }
 
+type NetstatSocketReader struct {
+	Run runner
+}
+
+func NewNetstatSocketReader() *NetstatSocketReader {
+	return &NetstatSocketReader{Run: defaultRunner}
+}
+
+func (n *NetstatSocketReader) Listening(ctx context.Context) ([]Socket, error) {
+	run := n.Run
+	if run == nil {
+		run = defaultRunner
+	}
+	out, err := run(ctx, "netstat", "-anv", "-p", "tcp")
+	if err != nil {
+		return nil, fmt.Errorf("netstat: %w", err)
+	}
+	return dedupeSockets(parseNetstatDarwin(string(out))), nil
+}
+
+func parseNetstatDarwin(raw string) []Socket {
+	var out []Socket
+	sc := bufio.NewScanner(strings.NewReader(raw))
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "Active ") || strings.HasPrefix(line, "Proto ") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 6 || !strings.HasPrefix(fields[0], "tcp") {
+			continue
+		}
+		listenIdx := -1
+		for i, f := range fields {
+			if f == "LISTEN" {
+				listenIdx = i
+				break
+			}
+		}
+		if listenIdx < 0 {
+			continue
+		}
+		addr, port, ok := splitDarwinNetstatAddr(fields[3])
+		if !ok {
+			continue
+		}
+		proc, pid := parseDarwinNetstatProcess(fields[listenIdx+1:])
+		out = append(out, Socket{Protocol: ProtoTCP, Address: addr, Port: port, Process: proc, PID: pid})
+	}
+	return out
+}
+
+func splitDarwinNetstatAddr(tok string) (string, int, bool) {
+	i := strings.LastIndex(tok, ".")
+	if i < 0 || i == len(tok)-1 {
+		return "", 0, false
+	}
+	port, err := strconv.Atoi(tok[i+1:])
+	if err != nil || port <= 0 {
+		return "", 0, false
+	}
+	addr := tok[:i]
+	if addr == "" {
+		addr = "*"
+	}
+	return addr, port, true
+}
+
+func parseDarwinNetstatProcess(fields []string) (string, int) {
+	for _, f := range fields {
+		i := strings.LastIndex(f, ":")
+		if i <= 0 || i == len(f)-1 {
+			continue
+		}
+		pid, err := strconv.Atoi(f[i+1:])
+		if err != nil || pid <= 0 {
+			continue
+		}
+		return f[:i], pid
+	}
+	return "", 0
+}
+
 // SSHFromSockets resolves SSH ports by inspecting listening sockets whose
 // owning process name is "sshd". Falls back to 22 only if the reader
 // returned no sockets at all.
