@@ -175,9 +175,9 @@ the persistent Claude/Codex skill roots under `/var/lib/claver`.
 
 ## Install on macOS
 
-Install Tailscale and enable Remote Login first if the Mac is not reachable on
-the same LAN. Then install the agent as the macOS user that DevDeck will SSH
-into:
+Enable Remote Login first, then install the agent as the macOS user that
+DevDeck will SSH into. Use the Mac's `.local` name or LAN IP when the phone is
+on the same network:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/rockclaver/claver-agent/main/scripts/install-macos.sh \
