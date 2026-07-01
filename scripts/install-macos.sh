@@ -164,3 +164,14 @@ echo "installed claver-agent:"
 echo "launchd service: $domain/$LABEL"
 echo "data dir: $DATA_DIR"
 echo "logs: $LOG_DIR"
+
+local_name="$(scutil --get LocalHostName 2>/dev/null || true)"
+if [[ -n "$local_name" ]]; then
+  echo "DevDeck local host: ${local_name}.local"
+fi
+for iface in en0 en1; do
+  if ip="$(ipconfig getifaddr "$iface" 2>/dev/null)"; then
+    echo "DevDeck LAN IP ($iface): $ip"
+  fi
+done
+echo "Use SSH port 22 and your macOS username. Remote Login must be enabled."

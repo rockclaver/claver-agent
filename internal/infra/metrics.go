@@ -1,5 +1,6 @@
 // Package infra collects read-only host infrastructure metrics from native
-// Linux procfs/sysfs/statfs sources.
+// Linux procfs/sysfs/statfs sources, with a smaller Darwin collector for local
+// MacBook agents.
 package infra
 
 import (
@@ -8,7 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -84,12 +88,15 @@ type osReader struct{}
 func (osReader) ReadFile(name string) ([]byte, error) { return os.ReadFile(name) }
 
 type StatFS func(path string) (syscall.Statfs_t, error)
+type CommandRunner func(ctx context.Context, name string, args ...string) ([]byte, error)
 
 type Config struct {
 	ProcRoot string
 	SysRoot  string
 	Reader   FileReader
 	StatFS   StatFS
+	Command  CommandRunner
+	Platform string
 	Now      func() time.Time
 	Cadence  time.Duration
 }
@@ -99,6 +106,8 @@ type Manager struct {
 	sysRoot  string
 	reader   FileReader
 	statFS   StatFS
+	command  CommandRunner
+	platform string
 	now      func() time.Time
 	cadence  time.Duration
 
@@ -125,6 +134,14 @@ func New(cfg Config) (*Manager, error) {
 			return st, err
 		}
 	}
+	if cfg.Command == nil {
+		cfg.Command = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			return exec.CommandContext(ctx, name, args...).Output()
+		}
+	}
+	if cfg.Platform == "" {
+		cfg.Platform = runtime.GOOS
+	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
@@ -136,6 +153,8 @@ func New(cfg Config) (*Manager, error) {
 		sysRoot:  cfg.SysRoot,
 		reader:   cfg.Reader,
 		statFS:   cfg.StatFS,
+		command:  cfg.Command,
+		platform: cfg.Platform,
 		now:      cfg.Now,
 		cadence:  cfg.Cadence,
 	}, nil
@@ -160,6 +179,9 @@ func (m *Manager) Subscribe(ctx context.Context, emit func(HostMetrics)) error {
 }
 
 func (m *Manager) collect(ctx context.Context, at time.Time) HostMetrics {
+	if m.platform == "darwin" {
+		return m.collectDarwin(ctx, at)
+	}
 	_ = ctx
 	snap := HostMetrics{Timestamp: at}
 
@@ -237,6 +259,93 @@ func (m *Manager) collect(ctx context.Context, at time.Time) HostMetrics {
 		snap.Disks = m.collectDisks(mounts)
 	}
 	return snap
+}
+
+func (m *Manager) collectDarwin(ctx context.Context, at time.Time) HostMetrics {
+	snap := HostMetrics{Timestamp: at}
+
+	if cpu, err := m.darwinCPU(ctx); err == nil {
+		snap.CPU = cpu
+	} else {
+		snap.CPU = unavailableCPU(err)
+	}
+	if load, err := parseDarwinLoad(m.command(ctx, "sysctl", "-n", "vm.loadavg")); err == nil {
+		snap.Load = load
+	} else {
+		snap.Load = LoadMetric{MetricReason: MetricReason{Available: false, Reason: ReasonUnavailable, Message: err.Error()}}
+	}
+	memSize, memSizeErr := m.command(ctx, "sysctl", "-n", "hw.memsize")
+	vmStat, vmStatErr := m.command(ctx, "vm_stat")
+	if mem, err := parseDarwinMemory(memSize, memSizeErr, vmStat, vmStatErr); err == nil {
+		snap.Memory = mem
+	} else {
+		snap.Memory = MemoryMetric{MetricReason: MetricReason{Available: false, Reason: ReasonUnavailable, Message: err.Error()}}
+	}
+	if swap, err := parseDarwinSwap(m.command(ctx, "sysctl", "-n", "vm.swapusage")); err == nil {
+		snap.Swap = swap
+	} else {
+		snap.Swap = MemoryMetric{MetricReason: MetricReason{Available: false, Reason: ReasonUnavailable, Message: err.Error()}}
+	}
+	snap.Disks = m.collectDisks([]mount{{fs: "apfs", path: "/"}})
+
+	net, netOK, netErr := parseDarwinNetstat(m.command(ctx, "netstat", "-ibn"))
+	m.mu.Lock()
+	if netErr != nil || !netOK {
+		snap.Network = unavailableNet(netErr)
+	} else if !m.lastTime.IsZero() && len(m.lastNet) > 0 {
+		dt := at.Sub(m.lastTime).Seconds()
+		snap.Network = NetworkMetric{MetricReason: MetricReason{Available: true}}
+		if dt > 0 {
+			var rx, tx uint64
+			for name, next := range net {
+				prev, ok := m.lastNet[name]
+				if !ok {
+					continue
+				}
+				if next.rx >= prev.rx {
+					rx += uint64(float64(next.rx-prev.rx) / dt)
+				}
+				if next.tx >= prev.tx {
+					tx += uint64(float64(next.tx-prev.tx) / dt)
+				}
+			}
+			snap.Network.RxBytesPerSec = rx
+			snap.Network.TxBytesPerSec = tx
+		}
+	} else {
+		snap.Network = unavailableNet(errors.New("network delta pending"))
+	}
+	if netOK {
+		m.lastNet = net
+	}
+	m.lastTime = at
+	m.mu.Unlock()
+
+	return snap
+}
+
+func (m *Manager) darwinCPU(ctx context.Context) (CPUMetric, error) {
+	out, err := m.command(ctx, "ps", "-A", "-o", "%cpu=")
+	if err != nil {
+		return CPUMetric{}, err
+	}
+	var total float64
+	sc := bufio.NewScanner(strings.NewReader(string(out)))
+	for sc.Scan() {
+		v, err := strconv.ParseFloat(strings.TrimSpace(sc.Text()), 64)
+		if err == nil {
+			total += v
+		}
+	}
+	cores := runtime.NumCPU()
+	if cores <= 0 {
+		cores = 1
+	}
+	percent := total / float64(cores)
+	if percent > 100 {
+		percent = 100
+	}
+	return CPUMetric{MetricReason: MetricReason{Available: true}, Percent: percent}, nil
 }
 
 func (m *Manager) read(rel string) ([]byte, error) {
@@ -483,6 +592,145 @@ func (m *Manager) collectDisks(mounts []mount) []DiskMetric {
 		out = append(out, DiskMetric{Mountpoint: row.path, Filesystem: row.fs, TotalBytes: total, AvailableBytes: avail, UsedBytes: used, Percent: percent, Available: true})
 	}
 	return out
+}
+
+func parseDarwinLoad(b []byte, err error) (LoadMetric, error) {
+	if err != nil {
+		return LoadMetric{}, err
+	}
+	fields := strings.Fields(strings.NewReplacer("{", "", "}", "").Replace(string(b)))
+	if len(fields) < 3 {
+		return LoadMetric{}, errors.New("darwin loadavg missing fields")
+	}
+	one, err := strconv.ParseFloat(fields[0], 64)
+	if err != nil {
+		return LoadMetric{}, err
+	}
+	five, err := strconv.ParseFloat(fields[1], 64)
+	if err != nil {
+		return LoadMetric{}, err
+	}
+	fifteen, err := strconv.ParseFloat(fields[2], 64)
+	if err != nil {
+		return LoadMetric{}, err
+	}
+	return LoadMetric{MetricReason: MetricReason{Available: true}, One: one, Five: five, Fifteen: fifteen}, nil
+}
+
+func parseDarwinMemory(memSize []byte, memSizeErr error, vmStat []byte, vmStatErr error) (MemoryMetric, error) {
+	if memSizeErr != nil {
+		return MemoryMetric{}, memSizeErr
+	}
+	if vmStatErr != nil {
+		return MemoryMetric{}, vmStatErr
+	}
+	total, err := strconv.ParseUint(strings.TrimSpace(string(memSize)), 10, 64)
+	if err != nil {
+		return MemoryMetric{}, err
+	}
+	pageSize := uint64(4096)
+	pageRE := regexp.MustCompile(`page size of ([0-9]+) bytes`)
+	if match := pageRE.FindStringSubmatch(string(vmStat)); len(match) == 2 {
+		if parsed, err := strconv.ParseUint(match[1], 10, 64); err == nil && parsed > 0 {
+			pageSize = parsed
+		}
+	}
+	values := map[string]uint64{}
+	sc := bufio.NewScanner(strings.NewReader(string(vmStat)))
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if !strings.Contains(line, ":") {
+			continue
+		}
+		parts := strings.SplitN(line, ":", 2)
+		key := strings.TrimSpace(parts[0])
+		raw := strings.Trim(strings.TrimSpace(parts[1]), ".")
+		raw = strings.ReplaceAll(raw, ".", "")
+		raw = strings.ReplaceAll(raw, ",", "")
+		v, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 64)
+		if err == nil {
+			values[key] = v
+		}
+	}
+	availablePages := values["Pages free"] + values["Pages inactive"] + values["Pages speculative"]
+	available := availablePages * pageSize
+	if available > total {
+		available = total
+	}
+	return memoryMetric(total, available), nil
+}
+
+func parseDarwinSwap(b []byte, err error) (MemoryMetric, error) {
+	if err != nil {
+		return MemoryMetric{}, err
+	}
+	total, okTotal := darwinSizeField(string(b), "total")
+	used, okUsed := darwinSizeField(string(b), "used")
+	if !okTotal || !okUsed {
+		return MemoryMetric{}, errors.New("darwin swapusage missing total or used")
+	}
+	available := uint64(0)
+	if total >= used {
+		available = total - used
+	}
+	return memoryMetric(total, available), nil
+}
+
+func darwinSizeField(s, name string) (uint64, bool) {
+	re := regexp.MustCompile(name + ` = ([0-9.]+)([KMGTP])`)
+	match := re.FindStringSubmatch(s)
+	if len(match) != 3 {
+		return 0, false
+	}
+	v, err := strconv.ParseFloat(match[1], 64)
+	if err != nil {
+		return 0, false
+	}
+	mult := float64(1)
+	switch match[2] {
+	case "K":
+		mult = 1024
+	case "M":
+		mult = 1024 * 1024
+	case "G":
+		mult = 1024 * 1024 * 1024
+	case "T":
+		mult = 1024 * 1024 * 1024 * 1024
+	case "P":
+		mult = 1024 * 1024 * 1024 * 1024 * 1024
+	}
+	return uint64(v * mult), true
+}
+
+func parseDarwinNetstat(b []byte, err error) (map[string]netCounters, bool, error) {
+	if err != nil {
+		return nil, false, err
+	}
+	out := map[string]netCounters{}
+	sc := bufio.NewScanner(strings.NewReader(string(b)))
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		if len(fields) < 10 || fields[0] == "Name" {
+			continue
+		}
+		name := fields[0]
+		if strings.HasPrefix(name, "lo") || strings.HasPrefix(name, "utun") || strings.HasPrefix(name, "awdl") || strings.HasPrefix(name, "llw") {
+			continue
+		}
+		ibytes, errIn := strconv.ParseUint(fields[6], 10, 64)
+		obytes, errOut := strconv.ParseUint(fields[9], 10, 64)
+		if errIn != nil || errOut != nil {
+			continue
+		}
+		cur := out[name]
+		cur.rx += ibytes
+		cur.tx += obytes
+		out[name] = cur
+	}
+	if len(out) == 0 {
+		return out, false, errors.New("no non-loopback interfaces")
+	}
+	return out, true, nil
 }
 
 func unavailableCPU(err error) CPUMetric {

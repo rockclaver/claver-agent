@@ -66,9 +66,25 @@ The agent control plane must stay private. It binds to loopback and the mobile
 app reaches it by opening an SSH tunnel to `127.0.0.1:7676` on the managed
 host. Do not expose port `7676` on a public interface.
 
-For a VPS with a public SSH address, add the server normally in DevDeck. For a
-MacBook or a private server, use Tailscale so the device has a stable private
-address without opening SSH to the internet:
+For a VPS with a public SSH address, add the server normally in DevDeck.
+
+For a MacBook on the same Wi-Fi/LAN as the phone, use direct SSH:
+
+1. Enable **System Settings → General → Sharing → Remote Login** on the Mac.
+2. Install and start `claver-agent` with the macOS installer below.
+3. Add the Mac in DevDeck using either:
+   - the Mac's Bonjour name, for example `Peters-MacBook-Pro.local`; or
+   - the Mac's LAN IP, for example `192.168.1.145`.
+4. Use SSH port `22`, the macOS username, and the public key DevDeck shows in
+   the app.
+
+The direct MacBook path does not require Tailscale on the phone. It does require
+the iOS Local Network permission because the app opens an SSH socket to a
+private LAN or `.local` address.
+
+If the phone is away from the Mac's local network, direct LAN SSH will not work.
+Do not make public router port-forwarded SSH the default. For remote access,
+prefer a private overlay network such as Tailscale:
 
 1. Install Tailscale on the host.
    - Linux: `curl -fsSL https://tailscale.com/install.sh | sh`, then run

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -22,6 +23,20 @@ func (f fakeReader) ReadFile(name string) ([]byte, error) {
 	return b, nil
 }
 
+type fakeCommand map[string][]byte
+
+func (f fakeCommand) run(_ context.Context, name string, args ...string) ([]byte, error) {
+	key := name
+	if len(args) > 0 {
+		key += " " + strings.Join(args, " ")
+	}
+	b, ok := f[key]
+	if !ok {
+		return nil, errors.New("missing command " + key)
+	}
+	return b, nil
+}
+
 func TestIssue41MetricsCollector_GoldenProcSysStatfsFixtures(t *testing.T) {
 	now := time.Unix(100, 0)
 	reader := fakeReader{files: map[string][]byte{
@@ -33,6 +48,7 @@ func TestIssue41MetricsCollector_GoldenProcSysStatfsFixtures(t *testing.T) {
 		"operstate": []byte("up\n"),
 	}}
 	mgr, err := New(Config{
+		Platform: "linux",
 		Reader:   reader,
 		Now:      func() time.Time { return now },
 		ProcRoot: "/proc",
@@ -88,8 +104,66 @@ func TestIssue41MetricsCollector_GoldenProcSysStatfsFixtures(t *testing.T) {
 	}
 }
 
+func TestMetricsCollector_DarwinOverviewUsesNativeCommands(t *testing.T) {
+	now := time.Unix(100, 0)
+	cmds := fakeCommand{
+		"ps -A -o %cpu=":         []byte("10.0\n20.0\n"),
+		"sysctl -n vm.loadavg":   []byte("{ 1.25 1.50 1.75 }\n"),
+		"sysctl -n hw.memsize":   []byte("17179869184\n"),
+		"vm_stat":                []byte("Mach Virtual Memory Statistics: (page size of 4096 bytes)\nPages free: 1000.\nPages inactive: 2000.\nPages speculative: 500.\n"),
+		"sysctl -n vm.swapusage": []byte("total = 2048.00M  used = 512.00M  free = 1536.00M  (encrypted)\n"),
+		"netstat -ibn":           []byte("Name  Mtu   Network     Address            Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n en0   1500  <Link#4>    aa:bb:cc           10    0     1000   20    0     2000   0\n"),
+	}
+	mgr, err := New(Config{
+		Platform: "darwin",
+		Command:  cmds.run,
+		Now:      func() time.Time { return now },
+		StatFS: func(path string) (syscall.Statfs_t, error) {
+			if path != "/" {
+				t.Fatalf("statfs path = %q", path)
+			}
+			return syscall.Statfs_t{Blocks: 100, Bavail: 25, Bsize: 4096}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first := mgr.Sample(context.Background())
+	if !first.CPU.Available {
+		t.Fatalf("darwin CPU unavailable: %+v", first.CPU)
+	}
+	wantCPU := 30.0 / float64(runtime.NumCPU())
+	if first.CPU.Percent != wantCPU {
+		t.Fatalf("darwin CPU = %.4f, want %.4f", first.CPU.Percent, wantCPU)
+	}
+	if first.Load.One != 1.25 || first.Load.Five != 1.50 || first.Load.Fifteen != 1.75 {
+		t.Fatalf("darwin load = %+v", first.Load)
+	}
+	if !first.Memory.Available || first.Memory.TotalBytes != 17179869184 {
+		t.Fatalf("darwin memory = %+v", first.Memory)
+	}
+	if !first.Swap.Available || first.Swap.UsedBytes != 512*1024*1024 {
+		t.Fatalf("darwin swap = %+v", first.Swap)
+	}
+	if len(first.Disks) != 1 || !first.Disks[0].Available || first.Disks[0].Mountpoint != "/" {
+		t.Fatalf("darwin disks = %+v", first.Disks)
+	}
+	if first.Network.Available {
+		t.Fatalf("first network sample should require delta: %+v", first.Network)
+	}
+
+	now = now.Add(2 * time.Second)
+	cmds["netstat -ibn"] = []byte("Name  Mtu   Network     Address            Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n en0   1500  <Link#4>    aa:bb:cc           10    0     3000   20    0     7000   0\n")
+	second := mgr.Sample(context.Background())
+	if !second.Network.Available || second.Network.RxBytesPerSec != 1000 || second.Network.TxBytesPerSec != 2500 {
+		t.Fatalf("darwin net = %+v", second.Network)
+	}
+}
+
 func TestIssue41MetricsCollector_UnavailableMetricHasTypedReason(t *testing.T) {
 	mgr, err := New(Config{
+		Platform: "linux",
 		Reader: fakeReader{files: map[string][]byte{
 			"stat":    []byte("cpu broken\n"),
 			"loadavg": []byte("0.1 0.2 0.3 1/1 1\n"),
@@ -131,7 +205,8 @@ func TestMetricsCollector_SkipsDockerAndPseudoMounts(t *testing.T) {
 		}, "\n")),
 	}}
 	mgr, err := New(Config{
-		Reader: reader,
+		Platform: "linux",
+		Reader:   reader,
 		StatFS: func(path string) (syscall.Statfs_t, error) {
 			if strings.HasPrefix(path, "/run/") {
 				return syscall.Statfs_t{}, errors.New("permission denied")
@@ -154,7 +229,8 @@ func TestMetricsCollector_SkipsDockerAndPseudoMounts(t *testing.T) {
 func TestIssue41MetricsSubscribe_EmitsAndStopsOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	mgr, err := New(Config{
-		Cadence: time.Millisecond,
+		Platform: "linux",
+		Cadence:  time.Millisecond,
 		Reader: fakeReader{files: map[string][]byte{
 			"stat":    []byte("cpu  1 0 1 8 0 0 0 0\n"),
 			"loadavg": []byte("0.1 0.2 0.3 1/1 1\n"),
