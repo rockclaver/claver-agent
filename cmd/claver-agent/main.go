@@ -43,12 +43,18 @@ import (
 	"github.com/rockclaver/claver-agent/internal/webserver"
 )
 
+// defaultNotifyRelayURL is the org-operated claver-notify deployment (see
+// github.com/rockclaver/claver-notify). Override with --notify-relay-url or
+// CLAVER_NOTIFY_RELAY_URL to point at a self-hosted relay instead, or set
+// to "" to disable server-side push entirely.
+const defaultNotifyRelayURL = "https://notify.orivo.app"
+
 func main() {
 	addr := flag.String("addr", "127.0.0.1:7676", "loopback bind address")
 	dataDir := flag.String("data-dir", defaultDataDir(), "directory for state.db and project workspaces")
 	caddyFragmentsDir := flag.String("caddy-fragments-dir", envOr("CLAVER_CADDY_FRAGMENTS_DIR", "/etc/caddy/claver"), "directory for per-preview Caddy site blocks")
 	previewExpectedIP := flag.String("preview-expected-ip", os.Getenv("CLAVER_PREVIEW_EXPECTED_IP"), "if set, DNS validation requires the wildcard to resolve to this IP")
-	notifyRelayURL := flag.String("notify-relay-url", envOr("CLAVER_NOTIFY_RELAY_URL", ""), "base URL of the central claver-notify relay; enables server-side push when set")
+	notifyRelayURL := flag.String("notify-relay-url", envOr("CLAVER_NOTIFY_RELAY_URL", defaultNotifyRelayURL), "base URL of the central claver-notify relay; set to empty to disable push")
 	notifyToken := flag.String("notify-token", envOr("CLAVER_NOTIFY_TOKEN", ""), "bearer token for the notify relay; auto-registered and persisted on first run when empty")
 	runbookAgent := flag.String("runbook-agent", envOr("CLAVER_RUNBOOK_AGENT", "claude"), "AI CLI to use for runbook generation (claude|codex)")
 	codexRuntimeKind := flag.String("codex-runtime", envOr("CLAVER_CODEX_RUNTIME", "app-server"), "codex structured runtime: app-server (default) or exec (fallback)")
