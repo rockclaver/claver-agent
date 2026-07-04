@@ -53,11 +53,13 @@ func defaultHTTPClient(c HTTPDoer) HTTPDoer {
 	return &http.Client{Timeout: 15 * time.Second}
 }
 
-// Register calls a claver-notify deployment's self-service enrollment
-// endpoint and returns a fresh bearer token for this installation. label is
-// an optional human-readable hint (e.g. hostname) the relay stores alongside
-// the token so an operator can identify it later; it need not be unique.
-func Register(ctx context.Context, baseURL, label string, httpClient HTTPDoer) (string, error) {
+// Register calls a claver-notify deployment's enrollment endpoint and returns
+// a fresh bearer token for this installation. label is an optional
+// human-readable hint (e.g. hostname) the relay stores alongside the token so
+// an operator can identify it later; it need not be unique. enrollSecret, when
+// non-empty, is sent as the Authorization bearer the relay requires for
+// enrollment (empty is accepted only by a relay running open registration).
+func Register(ctx context.Context, baseURL, label, enrollSecret string, httpClient HTTPDoer) (string, error) {
 	httpClient = defaultHTTPClient(httpClient)
 	body, err := json.Marshal(map[string]string{"label": label})
 	if err != nil {
@@ -69,6 +71,9 @@ func Register(ctx context.Context, baseURL, label string, httpClient HTTPDoer) (
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if enrollSecret != "" {
+		req.Header.Set("Authorization", "Bearer "+enrollSecret)
+	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("notify relay register: %w", err)
@@ -200,28 +205,49 @@ type Sender interface {
 }
 
 // Hub wires the agent's notifications.Hub to a Sender + the device registry
-// in store. On every selected notification it queries the registry once and
-// fans the message out to every device, pruning tokens the relay reports as
-// unregistered.
+// in store. On every notification it queries the registry and prefs once and
+// fans the message out to every eligible device, pruning tokens the relay
+// reports as unregistered.
 //
-// Selection is opt-in by notification Type: we only push high-signal events
-// (alerts, runbooks) and not chatty things like session lifecycle ticks.
+// Push eligibility is policy-driven (policy.go), not an opt-in type list:
+// each notification is classified into a Kind, and a Kind pushes unless an
+// operator override in the store says otherwise. This keeps "recovered"
+// alert clears, low-signal inbox items, etc. off the phone by default while
+// staying configurable per install.
 type Hub struct {
 	Sender Sender
 	Store  *store.Store
-	// Types lists the notification types to forward. Empty -> no forwarding.
-	Types map[string]bool
+	// Label identifies this install to the recipient when a device is
+	// registered against several agents at once (a phone managing a fleet
+	// of VPSes gets pushes from every one of them through the same relay).
+	// Every agent's alert body reads the same generic phrasing ("sshd.service
+	// recovered"), so without a label the banner gives no clue which server
+	// sent it. Set from --server-id / hostname at startup; empty disables
+	// prefixing. Stamped onto both the title (what the OS banner shows) and
+	// the data payload (so the client can render it structurally later).
+	Label string
 	// Logf, when non-nil, receives one-line operational messages (token
 	// pruned, send error). Defaults to a no-op so tests stay quiet.
 	Logf func(format string, args ...any)
 }
 
-// Forward pushes one notification to every registered device.
+// Forward pushes one notification to every registered device eligible for
+// its kind (see policy.go). Silent no-op when the notification's kind is not
+// push-eligible -- callers don't need to pre-filter by Type.
 func (h *Hub) Forward(ctx context.Context, n notifications.Notification) {
 	if h == nil || h.Sender == nil || h.Store == nil {
 		return
 	}
-	if !h.Types[n.Type] {
+	overrides, err := h.Store.ListNotificationPrefs()
+	if err != nil {
+		h.log("push: list prefs: %v", err)
+		return
+	}
+	ov := make(map[Kind]bool, len(overrides))
+	for _, p := range overrides {
+		ov[Kind(p.Type)] = p.PushEnabled
+	}
+	if !pushEligible(n, ov) {
 		return
 	}
 	devices, err := h.Store.ListPushDevices()
@@ -229,11 +255,30 @@ func (h *Hub) Forward(ctx context.Context, n notifications.Notification) {
 		h.log("push: list devices: %v", err)
 		return
 	}
-	data := flattenData(n)
+	title := n.Title
+	base := flattenData(n)
+	if h.Label != "" {
+		title = h.Label + ": " + n.Title
+		base["server_label"] = h.Label
+	}
 	for _, d := range devices {
+		// server_id in the payload must identify the server the way THIS
+		// device's app knows it (a client-minted id, unrelated to the
+		// agent's own "local" rule-bucket id) so deep-link taps and staged
+		// ack/silence actions resolve to the right ServerTransport. Stamped
+		// per device since two phones can add the same physical box under
+		// different client-side ids.
+		data := base
+		if d.ClientServerID != "" {
+			data = make(map[string]string, len(base))
+			for k, v := range base {
+				data[k] = v
+			}
+			data["server_id"] = d.ClientServerID
+		}
 		err := h.Sender.Send(ctx, Message{
 			Token: d.Token,
-			Title: n.Title,
+			Title: title,
 			Body:  n.Body,
 			Data:  data,
 		})

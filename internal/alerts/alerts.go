@@ -42,6 +42,12 @@ type Config struct {
 	DiskHysteresis      float64
 	LoadHysteresis      float64
 	LoadConsecutiveHits int
+	// UnitConsecutiveHits is the number of consecutive evaluation cycles a
+	// systemd unit must be observed failed (or observed healthy again)
+	// before its unit_failed alert fires or clears. Without this a unit
+	// that flaps faster than Cadence (e.g. a crash-looping service caught
+	// mid-restart on alternating polls) pages on every single cycle.
+	UnitConsecutiveHits int
 }
 
 type Manager struct {
@@ -55,6 +61,7 @@ type Manager struct {
 	diskHysteresis      float64
 	loadHysteresis      float64
 	loadConsecutiveHits int
+	unitConsecutiveHits int
 
 	mu     sync.Mutex
 	active map[string]alertState
@@ -161,6 +168,9 @@ func New(cfg Config) (*Manager, error) {
 	if cfg.LoadConsecutiveHits <= 0 {
 		cfg.LoadConsecutiveHits = 2
 	}
+	if cfg.UnitConsecutiveHits <= 0 {
+		cfg.UnitConsecutiveHits = 2
+	}
 	return &Manager{
 		store:               cfg.Store,
 		m:                   cfg.Metrics,
@@ -171,6 +181,7 @@ func New(cfg Config) (*Manager, error) {
 		diskHysteresis:      cfg.DiskHysteresis,
 		loadHysteresis:      cfg.LoadHysteresis,
 		loadConsecutiveHits: cfg.LoadConsecutiveHits,
+		unitConsecutiveHits: cfg.UnitConsecutiveHits,
 		active:              make(map[string]alertState),
 	}, nil
 }
@@ -286,8 +297,8 @@ func (m *Manager) evalUnits(ctx context.Context, rule store.InfraAlertRule) {
 		m.clearStatePrefix(RuleUnitFailed + ":")
 		return
 	}
-	st := m.sd.Status(ctx)
-	if !st.Available {
+	sdStatus := m.sd.Status(ctx)
+	if !sdStatus.Available {
 		return
 	}
 	units, err := m.sd.List(ctx)
@@ -298,19 +309,58 @@ func (m *Manager) evalUnits(ctx context.Context, rule store.InfraAlertRule) {
 	for _, u := range units {
 		if strings.EqualFold(u.ActiveState, "failed") || strings.EqualFold(u.SubState, "failed") {
 			failed[u.Name] = true
-			m.enter(ctx, RuleUnitFailed+":"+u.Name, rule, u.Name, nil, fmt.Sprintf("%s entered failed state", u.Name))
 		}
 	}
+	for name := range failed {
+		m.trackUnit(ctx, rule, RuleUnitFailed+":"+name, name, true)
+	}
+
+	// Sweep every unit_failed key with state to carry (either already firing,
+	// or mid-debounce toward firing) that this poll no longer reports failed,
+	// so a recovered/never-confirmed unit's counter moves toward clear.
 	m.mu.Lock()
-	keys := make([]string, 0)
+	tracked := make([]string, 0, len(m.active))
 	for key, st := range m.active {
-		if st.active && strings.HasPrefix(key, RuleUnitFailed+":") && !failed[strings.TrimPrefix(key, RuleUnitFailed+":")] {
-			keys = append(keys, key)
+		if strings.HasPrefix(key, RuleUnitFailed+":") && (st.active || st.hits > 0) {
+			tracked = append(tracked, key)
 		}
 	}
 	m.mu.Unlock()
-	for _, key := range keys {
+	for _, key := range tracked {
 		unit := strings.TrimPrefix(key, RuleUnitFailed+":")
+		if failed[unit] {
+			continue
+		}
+		m.trackUnit(ctx, rule, key, unit, false)
+	}
+}
+
+// trackUnit debounces a unit's failed/recovered transition: isFailed must
+// hold for unitConsecutiveHits consecutive polls before the alert fires or
+// clears. A unit that flaps faster than the poll cadence (e.g. a
+// crash-looping service caught mid-restart on alternating polls) resets the
+// counter instead of paging on every single cycle.
+func (m *Manager) trackUnit(ctx context.Context, rule store.InfraAlertRule, key, unit string, isFailed bool) {
+	st := m.state(key)
+	if st.active == isFailed {
+		// Already in the target state (still firing and still failed, or
+		// already clear and still healthy): cancel any opposing debounce.
+		if st.hits != 0 {
+			st.hits = 0
+			m.setState(key, st)
+		}
+		return
+	}
+	st.hits++
+	if st.hits < m.unitConsecutiveHits {
+		m.setState(key, st)
+		return
+	}
+	st.hits = 0
+	m.setState(key, st)
+	if isFailed {
+		m.enter(ctx, key, rule, unit, nil, fmt.Sprintf("%s entered failed state", unit))
+	} else {
 		m.clear(ctx, key, rule, unit, nil, fmt.Sprintf("%s recovered", unit))
 	}
 }
@@ -327,7 +377,7 @@ func (m *Manager) enter(ctx context.Context, key string, rule store.InfraAlertRu
 	st.body = body
 	st.severity = "warning"
 	m.setState(key, st)
-	m.publish(ctx, rule, target, value, false, body)
+	m.publish(ctx, rule, target, value, false, body, st.firedAt)
 }
 
 func (m *Manager) clear(ctx context.Context, key string, rule store.InfraAlertRule, target string, value *float64, body string) {
@@ -335,13 +385,14 @@ func (m *Manager) clear(ctx context.Context, key string, rule store.InfraAlertRu
 	if !st.active {
 		return
 	}
+	firedAt := st.firedAt
 	st.active = false
 	st.hits = 0
 	m.setState(key, st)
-	m.publish(ctx, rule, target, value, true, body)
+	m.publish(ctx, rule, target, value, true, body, firedAt)
 }
 
-func (m *Manager) publish(ctx context.Context, rule store.InfraAlertRule, target string, value *float64, clear bool, body string) {
+func (m *Manager) publish(ctx context.Context, rule store.InfraAlertRule, target string, value *float64, clear bool, body string, firedAt time.Time) {
 	if m.sink == nil {
 		return
 	}
@@ -366,6 +417,11 @@ func (m *Manager) publish(ctx context.Context, rule store.InfraAlertRule, target
 		"threshold":  rule.Threshold,
 		"clear":      clear,
 		"updated_at": rule.UpdatedAt.Unix(),
+		// fired_at is the firing episode's timestamp, echoed back by the
+		// client on infra.alerts.ack (Manager.Ack requires an exact match --
+		// see its doc comment) so an "Acknowledge" tap staged from the OS
+		// notification action button acks the right episode.
+		"fired_at": firedAt.Unix(),
 		// category drives the OS notification action buttons the app renders
 		// (acknowledge / silence / open); deep_link routes a tap into the
 		// matching inbox item. Recovery ("clear") notifications carry neither

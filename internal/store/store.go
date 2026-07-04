@@ -186,11 +186,16 @@ type GitHubToken struct {
 // device by FCMToken regardless of platform, so nothing currently sends to
 // APNsToken directly.
 type PushDevice struct {
-	Token        string
-	APNsToken    string
-	Platform     string // "ios" | "android"
-	RegisteredAt time.Time
-	LastSeenAt   time.Time
+	Token     string
+	APNsToken string
+	Platform  string // "ios" | "android"
+	// ClientServerID is the mobile app's own identifier for the server this
+	// device registered against (see the client_server_id migration note in
+	// migrate()). Empty for devices registered before this field existed, or
+	// by a client build that doesn't send it yet.
+	ClientServerID string
+	RegisteredAt   time.Time
+	LastSeenAt     time.Time
 }
 
 // CliToken stores the encrypted credential material for one CLI (claude or
@@ -516,6 +521,12 @@ CREATE TABLE IF NOT EXISTS action_job_events (
 	PRIMARY KEY(job_id, seq),
 	FOREIGN KEY(job_id) REFERENCES action_jobs(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS notification_prefs (
+	type         TEXT PRIMARY KEY,
+	push_enabled INTEGER NOT NULL,
+	updated_at   INTEGER NOT NULL
+);
 `)
 	if err != nil {
 		return err
@@ -533,8 +544,19 @@ CREATE TABLE IF NOT EXISTS action_job_events (
 	}
 	// Stores created before the direct-APNs-token capture (device registers
 	// now send both FCM and APNs tokens) need the column added idempotently.
-	return s.addColumns("push_devices",
+	if err := s.addColumns("push_devices",
 		columnDef{"apns_token", "TEXT NOT NULL DEFAULT ''"},
+	); err != nil {
+		return err
+	}
+	// client_server_id is the mobile app's own identifier for the server this
+	// device connected to when it registered (DevDeck mints a client-side id
+	// per configured server; the agent has no notion of it otherwise). Stored
+	// per-device so Hub.Forward can stamp the right value into deep_link
+	// payloads instead of the agent's internal "local" rule-bucket id, which
+	// the client can never match against its own server list.
+	return s.addColumns("push_devices",
+		columnDef{"client_server_id", "TEXT NOT NULL DEFAULT ''"},
 	)
 }
 
@@ -1628,7 +1650,9 @@ func (s *Store) PutAgentSetting(key, value string) error {
 // PutPushDevice upserts a device token. RegisteredAt is preserved on update;
 // LastSeenAt is always bumped to now (or to the value supplied by the caller
 // if non-zero), so the agent can later prune stale tokens that FCM has
-// rejected as unregistered.
+// rejected as unregistered. ClientServerID, when the caller supplies one, is
+// always overwritten -- the client re-sends it on every push.register call
+// and the app may have renamed/re-added the server since the last register.
 func (s *Store) PutPushDevice(d PushDevice) error {
 	if d.Token == "" {
 		return errors.New("push device token required")
@@ -1642,13 +1666,14 @@ func (s *Store) PutPushDevice(d PushDevice) error {
 		reg = now
 	}
 	_, err := s.db.Exec(
-		`INSERT INTO push_devices (token, apns_token, platform, registered_at, last_seen_at)
-		 VALUES (?, ?, ?, ?, ?)
+		`INSERT INTO push_devices (token, apns_token, platform, client_server_id, registered_at, last_seen_at)
+		 VALUES (?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(token) DO UPDATE SET
 		   apns_token = excluded.apns_token,
 		   platform = excluded.platform,
+		   client_server_id = excluded.client_server_id,
 		   last_seen_at = excluded.last_seen_at`,
-		d.Token, d.APNsToken, d.Platform, reg.Unix(), now.Unix(),
+		d.Token, d.APNsToken, d.Platform, d.ClientServerID, reg.Unix(), now.Unix(),
 	)
 	return err
 }
@@ -1663,7 +1688,7 @@ func (s *Store) DeletePushDevice(token string) error {
 
 // ListPushDevices returns every registered device.
 func (s *Store) ListPushDevices() ([]PushDevice, error) {
-	rows, err := s.db.Query(`SELECT token, apns_token, platform, registered_at, last_seen_at FROM push_devices ORDER BY registered_at`)
+	rows, err := s.db.Query(`SELECT token, apns_token, platform, client_server_id, registered_at, last_seen_at FROM push_devices ORDER BY registered_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -1672,12 +1697,76 @@ func (s *Store) ListPushDevices() ([]PushDevice, error) {
 	for rows.Next() {
 		var d PushDevice
 		var reg, seen int64
-		if err := rows.Scan(&d.Token, &d.APNsToken, &d.Platform, &reg, &seen); err != nil {
+		if err := rows.Scan(&d.Token, &d.APNsToken, &d.Platform, &d.ClientServerID, &reg, &seen); err != nil {
 			return nil, err
 		}
 		d.RegisteredAt = time.Unix(reg, 0)
 		d.LastSeenAt = time.Unix(seen, 0)
 		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// NotificationPref is a per-type override of whether a notification kind is
+// eligible for push delivery. Absence means "use the built-in default" (see
+// push.KnownKinds); a row here always wins.
+type NotificationPref struct {
+	Type        string
+	PushEnabled bool
+	UpdatedAt   time.Time
+}
+
+// PutNotificationPref upserts one override.
+func (s *Store) PutNotificationPref(p NotificationPref) error {
+	if p.Type == "" {
+		return errors.New("notification pref type required")
+	}
+	updated := p.UpdatedAt
+	if updated.IsZero() {
+		updated = time.Now()
+	}
+	enabled := 0
+	if p.PushEnabled {
+		enabled = 1
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO notification_prefs (type, push_enabled, updated_at)
+		 VALUES (?, ?, ?)
+		 ON CONFLICT(type) DO UPDATE SET
+		   push_enabled = excluded.push_enabled,
+		   updated_at = excluded.updated_at`,
+		p.Type, enabled, updated.Unix(),
+	)
+	return err
+}
+
+// DeleteNotificationPref removes an override, reverting the type to its
+// built-in default.
+func (s *Store) DeleteNotificationPref(typ string) error {
+	_, err := s.db.Exec(`DELETE FROM notification_prefs WHERE type = ?`, typ)
+	return err
+}
+
+// ListNotificationPrefs returns every persisted override (not the defaults --
+// callers overlay push.KnownKinds themselves, mirroring ListInfraAlertRules'
+// defaults-plus-overrides split).
+func (s *Store) ListNotificationPrefs() ([]NotificationPref, error) {
+	rows, err := s.db.Query(`SELECT type, push_enabled, updated_at FROM notification_prefs ORDER BY type`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []NotificationPref
+	for rows.Next() {
+		var p NotificationPref
+		var enabled int
+		var updated int64
+		if err := rows.Scan(&p.Type, &enabled, &updated); err != nil {
+			return nil, err
+		}
+		p.PushEnabled = enabled != 0
+		p.UpdatedAt = time.Unix(updated, 0)
+		out = append(out, p)
 	}
 	return out, rows.Err()
 }

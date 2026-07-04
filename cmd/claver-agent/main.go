@@ -2,30 +2,28 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"flag"
 	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/rockclaver/claver-agent/internal/actions"
 	"github.com/rockclaver/claver-agent/internal/aiproposal"
 	"github.com/rockclaver/claver-agent/internal/alerts"
-	"github.com/rockclaver/claver-agent/internal/billing"
 	"github.com/rockclaver/claver-agent/internal/cliauth"
-	"github.com/rockclaver/claver-agent/internal/cost"
 	"github.com/rockclaver/claver-agent/internal/docker"
 	"github.com/rockclaver/claver-agent/internal/firewall"
 	gh "github.com/rockclaver/claver-agent/internal/github"
-	"github.com/rockclaver/claver-agent/internal/inbox"
 	"github.com/rockclaver/claver-agent/internal/infra"
 	"github.com/rockclaver/claver-agent/internal/inventory"
-	"github.com/rockclaver/claver-agent/internal/memory"
 	"github.com/rockclaver/claver-agent/internal/notifications"
-	"github.com/rockclaver/claver-agent/internal/previews"
 	agentprocess "github.com/rockclaver/claver-agent/internal/process"
 	"github.com/rockclaver/claver-agent/internal/projects"
 	"github.com/rockclaver/claver-agent/internal/push"
@@ -50,12 +48,16 @@ import (
 const defaultNotifyRelayURL = "https://notify.orivo.app"
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "pairing-key" {
+		printPairingKey(os.Args[2:])
+		return
+	}
 	addr := flag.String("addr", "127.0.0.1:7676", "loopback bind address")
 	dataDir := flag.String("data-dir", defaultDataDir(), "directory for state.db and project workspaces")
-	caddyFragmentsDir := flag.String("caddy-fragments-dir", envOr("CLAVER_CADDY_FRAGMENTS_DIR", "/etc/caddy/claver"), "directory for per-preview Caddy site blocks")
-	previewExpectedIP := flag.String("preview-expected-ip", os.Getenv("CLAVER_PREVIEW_EXPECTED_IP"), "if set, DNS validation requires the wildcard to resolve to this IP")
+	requirePairing := flag.Bool("require-pairing", true, "require the mobile app to present the control-plane pairing key on the WebSocket; disable only for local development")
 	notifyRelayURL := flag.String("notify-relay-url", envOr("CLAVER_NOTIFY_RELAY_URL", defaultNotifyRelayURL), "base URL of the central claver-notify relay; set to empty to disable push")
 	notifyToken := flag.String("notify-token", envOr("CLAVER_NOTIFY_TOKEN", ""), "bearer token for the notify relay; auto-registered and persisted on first run when empty")
+	notifyEnrollSecret := flag.String("notify-enroll-secret", envOr("CLAVER_NOTIFY_ENROLL_SECRET", ""), "enrollment secret presented to the notify relay's /v1/register; required when the relay enforces enrollment auth")
 	runbookAgent := flag.String("runbook-agent", envOr("CLAVER_RUNBOOK_AGENT", "claude"), "AI CLI to use for runbook generation (claude|codex)")
 	codexRuntimeKind := flag.String("codex-runtime", envOr("CLAVER_CODEX_RUNTIME", "app-server"), "codex structured runtime: app-server (default) or exec (fallback)")
 	serverID := flag.String("server-id", envOr("CLAVER_SERVER_ID", "local"), "stable id labelling this server's cost/usage rows in the cross-fleet dashboard")
@@ -70,6 +72,10 @@ func main() {
 
 	if err := os.MkdirAll(*dataDir, 0o700); err != nil {
 		log.Fatalf("claver-agent: mkdir data-dir: %v", err)
+	}
+	controlPlaneKey, err := loadOrCreateControlPlaneKey(*dataDir)
+	if err != nil {
+		log.Fatalf("claver-agent: control-plane key: %v", err)
 	}
 	st, err := store.Open(filepath.Join(*dataDir, "state.db"))
 	if err != nil {
@@ -133,51 +139,6 @@ func main() {
 	sessionMgr.AuthOK = func(ctx context.Context, agent string) bool {
 		st, err := authMgr.Status(ctx, agent)
 		return err == nil && st.LoggedIn
-	}
-
-	// Per-project agent memory + project journal (Stickiness #5). Sessions load
-	// rendered memory as context on start, and a session-end summarizer shells
-	// out to the same authenticated CLI to write a journal entry and propose
-	// new memory entries (which require one-tap user confirmation).
-	memoryMgr := memory.New(st)
-	memoryMgr.Transcript = sessionMgr.Log
-	memoryMgr.Summarizer = memory.CLISummarizer{
-		Agent:   *runbookAgent,
-		BinDir:  toolingMgr.BinDir(),
-		HomeDir: homeDirOr(*dataDir),
-		Secrets: authMgr.Secrets,
-	}
-	sessionMgr.MemorySource = memoryMgr.Render
-	// Summarization shells out to a CLI (seconds), so run it off the Stop path
-	// with a fresh context that outlives the request connection.
-	sessionMgr.OnEnd = func(_ context.Context, sess store.Session) {
-		go func() {
-			if err := memoryMgr.OnSessionEnd(context.Background(), sess); err != nil {
-				log.Printf("claver-agent: session %s journal: %v", sess.ID, err)
-			}
-		}()
-	}
-
-	// Cross-fleet cost & usage dashboard (Stickiness #8). The cost calculator
-	// prices session token usage and folds in the per-server infra bills the
-	// billing manager pulls daily from VPS provider APIs. Provider credentials
-	// are sealed with their own AES key (separate namespace from the CLI/GitHub
-	// vault) and stored encrypted in SQLite.
-	costCalc := cost.New(st, *serverID)
-	billingVault := billing.NewVault(filepath.Join(*dataDir, "billing.key"))
-	billingMgr := billing.New(st, billingVault, *serverID)
-	billingMgr.Logf = log.Printf
-
-	previewMgr, err := previews.New(previews.Config{
-		FragmentsDir: *caddyFragmentsDir,
-		ExpectedIP:   *previewExpectedIP,
-	}, st, mgr)
-	if err != nil {
-		// A missing /etc/caddy/claver on a non-root install is expected
-		// during local development; log and continue with previews
-		// disabled rather than crashing the agent.
-		log.Printf("claver-agent: previews disabled: %v", err)
-		previewMgr = nil
 	}
 
 	dockerMgr, err := docker.New(docker.Config{
@@ -321,56 +282,37 @@ func main() {
 		Docker:         dockerMgr,
 		Systemd:        systemdMgr,
 		Processes:      processMgr,
-		Previews:       previewMgr,
 		PushDevices:    st,
 		PushConfigured: func() bool { return pushDeliveryConfigured },
 		Auth:           authMgr,
 	})
 
-	inboxMgr := inbox.New()
-	inboxMgr.SetStateStore(st)
-	inboxMgr.AddSource(&inbox.ProposalSource{Mgr: aiProposalMgr})
-	inboxMgr.AddSource(&inbox.AlertSource{Mgr: alertMgr})
-	inboxMgr.AddSource(&inbox.SessionSource{Store: st})
-	inboxMgr.AddSource(&inbox.RunbookSource{Mgr: runbookMgr})
-	githubSource := &inbox.GitHubSource{
-		GitHub:  githubMgr,
-		Store:   st,
-		Publish: inboxMgr.Publish,
-	}
-	inboxMgr.AddSource(githubSource)
-	inboxBridgeCleanup := inbox.BridgeAlertNotifications(notificationHub, inboxMgr)
-	defer inboxBridgeCleanup()
-
 	srv := server.New(server.Config{
-		Addr:          *addr,
-		Projects:      mgr,
-		Sessions:      sessionMgr,
-		Skills:        skills.New(homeDirOr(*dataDir)),
-		Review:        reviewMgr,
-		GitHub:        githubMgr,
-		Previews:      previewMgr,
-		Tooling:       toolingMgr,
-		Auth:          authMgr,
-		Docker:        dockerMgr,
-		Infra:         infraMgr,
-		Systemd:       systemdMgr,
-		Webservers:    webserverMgr,
-		Processes:     processMgr,
-		Firewall:      firewallMgr,
-		Storage:       storageMgr,
-		Security:      securityMgr,
-		Alerts:        alertMgr,
-		AIProposals:   aiProposalMgr,
-		Notifications: notificationHub,
-		Inbox:         inboxMgr,
-		Runbook:       runbookMgr,
-		Actions:       actionsMgr,
-		Inventory:     inventoryMgr,
-		PushDevices:   st,
-		Memory:        memoryMgr,
-		Cost:          costCalc,
-		Billing:       billingMgr,
+		Addr:            *addr,
+		Projects:        mgr,
+		Sessions:        sessionMgr,
+		Skills:          skills.New(homeDirOr(*dataDir)),
+		Review:          reviewMgr,
+		GitHub:          githubMgr,
+		Tooling:         toolingMgr,
+		Auth:            authMgr,
+		Docker:          dockerMgr,
+		Infra:           infraMgr,
+		Systemd:         systemdMgr,
+		Webservers:      webserverMgr,
+		Processes:       processMgr,
+		Firewall:        firewallMgr,
+		Storage:         storageMgr,
+		Security:        securityMgr,
+		Alerts:          alertMgr,
+		AIProposals:     aiProposalMgr,
+		Notifications:   notificationHub,
+		Runbook:         runbookMgr,
+		Actions:         actionsMgr,
+		Inventory:       inventoryMgr,
+		PushDevices:     st,
+		ControlPlaneKey: controlPlaneKey,
+		RequirePairing:  *requirePairing,
 	})
 	ln, err := srv.Listen()
 	if err != nil {
@@ -385,8 +327,6 @@ func main() {
 	}
 	sessionMgr.StartReaper(ctx, 0)
 	alertMgr.Start(ctx)
-	billingCleanup := billingMgr.StartDaily(ctx)
-	defer billingCleanup()
 	runbookCleanup := runbookMgr.Start(ctx)
 	defer runbookCleanup()
 
@@ -407,7 +347,7 @@ func main() {
 		}
 		if token == "" {
 			registerCtx, registerCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			registeredToken, regErr := push.Register(registerCtx, *notifyRelayURL, hostname, nil)
+			registeredToken, regErr := push.Register(registerCtx, *notifyRelayURL, hostname, *notifyEnrollSecret, nil)
 			registerCancel()
 			if regErr != nil {
 				log.Printf("claver-agent: notify relay register failed, push disabled: %v", regErr)
@@ -419,10 +359,21 @@ func main() {
 			}
 		}
 		if token != "" {
+			// Prefer the operator-set --server-id (the same label used for
+			// cross-fleet cost/usage rows) when it has actually been set;
+			// otherwise fall back to the host's own name. Either way this
+			// prefixes the push title so a phone receiving alerts from
+			// several agents through the shared relay can tell them apart --
+			// every agent's alert body otherwise reads identically (e.g.
+			// "sshd.service recovered").
+			label := *serverID
+			if label == "" || label == alerts.ServerLocal {
+				label = hostname
+			}
 			pushHub := &push.Hub{
 				Sender: push.NewRelayClient(*notifyRelayURL, token, nil),
 				Store:  st,
-				Types:  map[string]bool{"infra.alert": true, "infra.runbook": true},
+				Label:  label,
 				Logf:   log.Printf,
 			}
 			pushCleanup := pushHub.Subscribe(ctx, notificationHub)
@@ -432,24 +383,6 @@ func main() {
 		}
 	}
 
-	githubSource.Start(ctx)
-	// Reap resolved inbox-state rows so the table can't grow without bound as
-	// item ids churn. Resolved entries older than 30 days are well past any
-	// chance of their source item reappearing.
-	go func() {
-		t := time.NewTicker(12 * time.Hour)
-		defer t.Stop()
-		for {
-			if _, err := st.GCInboxState(time.Now().Add(-30 * 24 * time.Hour)); err != nil {
-				log.Printf("claver-agent: inbox-state GC: %v", err)
-			}
-			select {
-			case <-t.C:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
 	if err := srv.Serve(ctx, ln); err != nil {
 		log.Fatalf("claver-agent serve: %v", err)
 	}
@@ -477,4 +410,63 @@ func homeDirOr(dataDir string) string {
 		return h
 	}
 	return filepath.Dir(dataDir)
+}
+
+// controlPlaneKeyPath is the 0600 file holding the WebSocket pairing key the
+// mobile app must present. It lives beside state.db so it inherits the data
+// dir's ownership and permissions.
+func controlPlaneKeyPath(dataDir string) string {
+	return filepath.Join(dataDir, "control_plane.key")
+}
+
+// loadOrCreateControlPlaneKey returns the persisted pairing key, generating a
+// fresh 32-byte random one on first run. The file is 0600 so only the agent
+// user (and root) can read it; the app fetches it over the operator-
+// authenticated SSH channel.
+func loadOrCreateControlPlaneKey(dataDir string) (string, error) {
+	path := controlPlaneKeyPath(dataDir)
+	if b, err := os.ReadFile(path); err == nil {
+		if key := strings.TrimSpace(string(b)); key != "" {
+			// Enforce 0600 on every boot so an earlier version or a manual edit
+			// that left the secret group/other-readable can't quietly defeat the
+			// WebSocket pairing check.
+			if err := os.Chmod(path, 0o600); err != nil {
+				return "", err
+			}
+			return key, nil
+		}
+	}
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	key := hex.EncodeToString(raw)
+	if err := os.WriteFile(path, []byte(key+"\n"), 0o600); err != nil {
+		return "", err
+	}
+	return key, nil
+}
+
+// printPairingKey implements `claver-agent pairing-key`: it prints the
+// control-plane pairing key so the mobile app can read it over SSH. It scans
+// the standard install locations so an operator can run it (as root / via
+// sudo) without knowing the daemon's exact data dir.
+func printPairingKey(args []string) {
+	fs := flag.NewFlagSet("pairing-key", flag.ExitOnError)
+	dataDir := fs.String("data-dir", "", "agent data dir (defaults to the standard install locations)")
+	_ = fs.Parse(args)
+	var candidates []string
+	if *dataDir != "" {
+		candidates = append(candidates, *dataDir)
+	}
+	candidates = append(candidates, defaultDataDir(), "/var/lib/claver/claver")
+	for _, dir := range candidates {
+		if b, err := os.ReadFile(controlPlaneKeyPath(dir)); err == nil {
+			if key := strings.TrimSpace(string(b)); key != "" {
+				_, _ = os.Stdout.WriteString(key + "\n")
+				return
+			}
+		}
+	}
+	log.Fatal("claver-agent: pairing key not found; is the agent installed and started?")
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -243,5 +244,172 @@ func TestPush_UnavailableWhenNotWired(t *testing.T) {
 	}
 	if resp.Kind != "error.not_found" && resp.Kind != "error.unavailable" && resp.Kind != "error.bad_payload" {
 		t.Fatalf("expected error, got %s", resp.Kind)
+	}
+}
+
+// TestPush_RegisterCapturesServerID covers the deep-link routing fix: the
+// client's own server id, sent on push.register, must be persisted per
+// device so push.Hub can stamp it back into future notification payloads.
+func TestPush_RegisterCapturesServerID(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	wsURL, stop := startTestServerWith(t, Config{Addr: "127.0.0.1:0", PushDevices: st})
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close(websocket.StatusNormalClosure, "")
+
+	send := func(id, kind, payload string) Frame {
+		req, _ := json.Marshal(Frame{ID: id, Kind: kind, Payload: json.RawMessage(payload)})
+		if err := c.Write(ctx, websocket.MessageText, req); err != nil {
+			t.Fatal(err)
+		}
+		for {
+			_, data, err := c.Read(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var f Frame
+			_ = json.Unmarshal(data, &f)
+			if f.ID == id {
+				return f
+			}
+		}
+	}
+
+	if r := send("1", "push.register", `{"token":"fcm-1","platform":"ios","server_id":"client-xyz"}`); r.Kind == "error" {
+		t.Fatalf("register failed: %s", r.Payload)
+	}
+	devices, err := st.ListPushDevices()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(devices) != 1 || devices[0].ClientServerID != "client-xyz" {
+		t.Fatalf("client_server_id not persisted: %+v", devices)
+	}
+
+	// Re-registering without server_id clears it (the client always re-sends
+	// its current value; an empty field means the device build predates it).
+	if r := send("2", "push.register", `{"token":"fcm-1","platform":"ios"}`); r.Kind == "error" {
+		t.Fatalf("re-register failed: %s", r.Payload)
+	}
+	devices, _ = st.ListPushDevices()
+	if len(devices) != 1 || devices[0].ClientServerID != "" {
+		t.Fatalf("client_server_id not cleared on re-register: %+v", devices)
+	}
+}
+
+// TestNotificationPrefs_ListDefaultsAndSetOverride covers the settings
+// screen's RPC surface: list overlays defaults with any override, set
+// persists one, and set with reset:true reverts to the default.
+func TestNotificationPrefs_ListDefaultsAndSetOverride(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	wsURL, stop := startTestServerWith(t, Config{Addr: "127.0.0.1:0", PushDevices: st})
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close(websocket.StatusNormalClosure, "")
+
+	send := func(id, kind, payload string) Frame {
+		req, _ := json.Marshal(Frame{ID: id, Kind: kind, Payload: json.RawMessage(payload)})
+		if err := c.Write(ctx, websocket.MessageText, req); err != nil {
+			t.Fatal(err)
+		}
+		for {
+			_, data, err := c.Read(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var f Frame
+			_ = json.Unmarshal(data, &f)
+			if f.ID == id {
+				return f
+			}
+		}
+	}
+
+	type prefDTO struct {
+		Type        string `json:"type"`
+		DefaultPush bool   `json:"default_push"`
+		PushEnabled bool   `json:"push_enabled"`
+		Overridden  bool   `json:"overridden"`
+	}
+	list := func(reqID string) []prefDTO {
+		r := send(reqID, "notifications.prefs.list", `{}`)
+		if strings.HasPrefix(r.Kind, "error.") {
+			t.Fatalf("list failed: %s %s", r.Kind, r.Payload)
+		}
+		var out struct {
+			Prefs []prefDTO `json:"prefs"`
+		}
+		if err := json.Unmarshal(r.Payload, &out); err != nil {
+			t.Fatalf("list unmarshal: %v payload=%s", err, r.Payload)
+		}
+		return out.Prefs
+	}
+
+	before := list("list1")
+	if len(before) == 0 {
+		t.Fatal("expected known kinds")
+	}
+	for _, p := range before {
+		if p.Overridden {
+			t.Fatalf("fresh store should have no overrides: %+v", p)
+		}
+		if p.Type == "infra.alert.fired" && !p.PushEnabled {
+			t.Fatalf("infra.alert.fired should default to push: %+v", p)
+		}
+		if p.Type == "infra.alert.cleared" && p.PushEnabled {
+			t.Fatalf("infra.alert.cleared should default to no push: %+v", p)
+		}
+	}
+
+	// Flip the clear kind on.
+	if r := send("set", "notifications.prefs.set", `{"type":"infra.alert.cleared","push_enabled":true}`); strings.HasPrefix(r.Kind, "error.") {
+		t.Fatalf("set failed: %s %s", r.Kind, r.Payload)
+	}
+	after := list("list2")
+	found := false
+	for _, p := range after {
+		if p.Type != "infra.alert.cleared" {
+			continue
+		}
+		found = true
+		if !p.Overridden || !p.PushEnabled {
+			t.Fatalf("override did not apply: %+v", p)
+		}
+	}
+	if !found {
+		t.Fatalf("infra.alert.cleared missing from list: %+v", after)
+	}
+
+	// Reset reverts to the default.
+	if r := send("reset", "notifications.prefs.set", `{"type":"infra.alert.cleared","reset":true}`); strings.HasPrefix(r.Kind, "error.") {
+		t.Fatalf("reset failed: %s %s", r.Kind, r.Payload)
+	}
+	reset := list("list3")
+	for _, p := range reset {
+		if p.Type == "infra.alert.cleared" && (p.Overridden || p.PushEnabled) {
+			t.Fatalf("reset did not revert to default: %+v", p)
+		}
 	}
 }

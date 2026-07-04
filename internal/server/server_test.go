@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -2989,4 +2990,42 @@ func TestStorageDeepScan_ReturnsResultAndCaches(t *testing.T) {
 	if !out2.GeneratedAt.Equal(firstGeneratedAt) {
 		t.Fatalf("expected cached generated_at %v, got %v", firstGeneratedAt, out2.GeneratedAt)
 	}
+}
+
+func TestHandleWS_RequiresPairingKey(t *testing.T) {
+	const key = "test-pairing-key"
+	wsURL, stop := startTestServerWith(t, Config{Addr: "127.0.0.1:0", ControlPlaneKey: key, RequirePairing: true})
+	defer stop()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if _, resp, err := websocket.Dial(ctx, wsURL, nil); err == nil {
+		t.Fatal("dial without pairing key should be rejected")
+	} else if resp != nil && resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+
+	wrong := &websocket.DialOptions{HTTPHeader: http.Header{"Authorization": {"Bearer wrong"}}}
+	if _, _, err := websocket.Dial(ctx, wsURL, wrong); err == nil {
+		t.Fatal("dial with wrong pairing key should be rejected")
+	}
+
+	ok := &websocket.DialOptions{HTTPHeader: http.Header{"Authorization": {"Bearer " + key}}}
+	c, _, err := websocket.Dial(ctx, wsURL, ok)
+	if err != nil {
+		t.Fatalf("dial with valid pairing key: %v", err)
+	}
+	c.Close(websocket.StatusNormalClosure, "")
+}
+
+func TestHandleWS_PairingDisabledAllowsNoKey(t *testing.T) {
+	wsURL, stop := startTestServerWith(t, Config{Addr: "127.0.0.1:0", RequirePairing: false})
+	defer stop()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial with pairing disabled: %v", err)
+	}
+	c.Close(websocket.StatusNormalClosure, "")
 }

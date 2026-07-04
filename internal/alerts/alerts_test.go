@@ -71,6 +71,7 @@ func newTestManager(t *testing.T, samples []infra.HostMetrics, units [][]systemd
 		Sink:                sink,
 		Now:                 func() time.Time { return time.Unix(1700000000, 0) },
 		LoadConsecutiveHits: 2,
+		UnitConsecutiveHits: 2,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -210,23 +211,24 @@ func TestAlertEngine_LoadSamplesMustBeConsecutiveBeforeEntry(t *testing.T) {
 	}
 }
 
-func TestAlertEngine_UnitFailedFiresOnceAndClears(t *testing.T) {
+func TestAlertEngine_UnitFailedRequiresConsecutiveSamplesAndClears(t *testing.T) {
 	m, sink, st := newTestManager(
 		t,
-		[]infra.HostMetrics{sample(1, 1), sample(1, 1), sample(1, 1)},
+		[]infra.HostMetrics{sample(1, 1), sample(1, 1), sample(1, 1), sample(1, 1)},
 		[][]systemd.Unit{
 			{{Name: "api.service", ActiveState: "failed", SubState: "failed"}},
 			{{Name: "api.service", ActiveState: "failed", SubState: "failed"}},
+			{{Name: "api.service", ActiveState: "active", SubState: "running"}},
 			{{Name: "api.service", ActiveState: "active", SubState: "running"}},
 		},
 	)
 	defer st.Close()
 
-	for range 3 {
+	for range 4 {
 		m.Evaluate(context.Background())
 	}
 	if len(sink.got) != 2 {
-		t.Fatalf("notifications=%d want unit fire+clear", len(sink.got))
+		t.Fatalf("notifications=%d want unit fire+clear: %+v", len(sink.got), sink.got)
 	}
 	if sink.got[0].Data["target"] != "api.service" || sink.got[1].Severity != "resolved" {
 		t.Fatalf("unexpected unit notifications: %+v", sink.got)
@@ -239,6 +241,61 @@ func TestAlertEngine_UnitFailedFiresOnceAndClears(t *testing.T) {
 	}
 	if _, err := json.Marshal(sink.got[1]); err != nil {
 		t.Fatalf("unit clear must be JSON-safe: %v", err)
+	}
+}
+
+// TestAlertEngine_UnitFlapBelowThresholdFiresNothing reproduces the flood a
+// crash-looping unit used to cause: caught failed on one poll and healthy
+// again on the next, faster than it can satisfy the consecutive-sample
+// debounce. No enter/clear pair should ever reach the sink.
+func TestAlertEngine_UnitFlapBelowThresholdFiresNothing(t *testing.T) {
+	m, sink, st := newTestManager(
+		t,
+		[]infra.HostMetrics{sample(1, 1), sample(1, 1), sample(1, 1), sample(1, 1)},
+		[][]systemd.Unit{
+			{{Name: "api.service", ActiveState: "failed", SubState: "failed"}},
+			{{Name: "api.service", ActiveState: "active", SubState: "running"}},
+			{{Name: "api.service", ActiveState: "failed", SubState: "failed"}},
+			{{Name: "api.service", ActiveState: "active", SubState: "running"}},
+		},
+	)
+	defer st.Close()
+
+	for range 4 {
+		m.Evaluate(context.Background())
+	}
+	if len(sink.got) != 0 {
+		t.Fatalf("flapping unit below debounce threshold emitted: %+v", sink.got)
+	}
+}
+
+// TestAlertEngine_UnitFlapAfterFiringDoesNotClearPrematurely covers the
+// symmetric case: once an alert is firing, a single healthy poll must not
+// clear it outright -- that would immediately re-fire on the next failed
+// poll and double the notification count. The recovery counter must reset
+// when the unit dips back to failed before reaching the clear threshold.
+func TestAlertEngine_UnitFlapAfterFiringDoesNotClearPrematurely(t *testing.T) {
+	m, sink, st := newTestManager(
+		t,
+		[]infra.HostMetrics{sample(1, 1), sample(1, 1), sample(1, 1), sample(1, 1)},
+		[][]systemd.Unit{
+			{{Name: "api.service", ActiveState: "failed", SubState: "failed"}},
+			{{Name: "api.service", ActiveState: "failed", SubState: "failed"}},
+			{{Name: "api.service", ActiveState: "active", SubState: "running"}},
+			{{Name: "api.service", ActiveState: "failed", SubState: "failed"}},
+		},
+	)
+	defer st.Close()
+
+	for range 4 {
+		m.Evaluate(context.Background())
+	}
+	if len(sink.got) != 1 {
+		t.Fatalf("notifications=%d want exactly the initial fire: %+v", len(sink.got), sink.got)
+	}
+	active := m.ActiveAlerts()
+	if len(active) != 1 || active[0].Target != "api.service" {
+		t.Fatalf("alert should still be active after the single healthy blip: %+v", active)
 	}
 }
 

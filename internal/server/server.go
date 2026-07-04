@@ -7,6 +7,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,20 +22,16 @@ import (
 	"github.com/rockclaver/claver-agent/internal/actions"
 	"github.com/rockclaver/claver-agent/internal/aiproposal"
 	"github.com/rockclaver/claver-agent/internal/alerts"
-	"github.com/rockclaver/claver-agent/internal/billing"
 	"github.com/rockclaver/claver-agent/internal/cliauth"
-	"github.com/rockclaver/claver-agent/internal/cost"
 	"github.com/rockclaver/claver-agent/internal/docker"
 	"github.com/rockclaver/claver-agent/internal/firewall"
 	gh "github.com/rockclaver/claver-agent/internal/github"
-	"github.com/rockclaver/claver-agent/internal/inbox"
 	"github.com/rockclaver/claver-agent/internal/infra"
 	"github.com/rockclaver/claver-agent/internal/inventory"
-	"github.com/rockclaver/claver-agent/internal/memory"
 	"github.com/rockclaver/claver-agent/internal/notifications"
-	"github.com/rockclaver/claver-agent/internal/previews"
 	agentprocess "github.com/rockclaver/claver-agent/internal/process"
 	"github.com/rockclaver/claver-agent/internal/projects"
+	"github.com/rockclaver/claver-agent/internal/push"
 	"github.com/rockclaver/claver-agent/internal/review"
 	"github.com/rockclaver/claver-agent/internal/runbook"
 	"github.com/rockclaver/claver-agent/internal/security"
@@ -79,8 +76,6 @@ type Config struct {
 	Review *review.Manager
 	// GitHub, when non-nil, enables github.* kinds.
 	GitHub *gh.Manager
-	// Previews, when non-nil, enables preview.* kinds.
-	Previews *previews.Manager
 	// Tooling, when non-nil, enables tooling.* kinds.
 	Tooling *tooling.Manager
 	// Auth, when non-nil, enables auth.* kinds (CLI login flows).
@@ -110,8 +105,6 @@ type Config struct {
 	AIProposals *aiproposal.Manager
 	// Notifications fans background task.notification events to connected clients.
 	Notifications *notifications.Hub
-	// Inbox, when non-nil, enables inbox.* kinds (unified triage feed).
-	Inbox *inbox.Manager
 	// Runbook, when non-nil, enables infra.runbook.* kinds and surfaces
 	// the AI-proposed remediation queue (Stickiness #4).
 	Runbook *runbook.Manager
@@ -124,15 +117,14 @@ type Config struct {
 	// PushDevices, when non-nil, enables push.register / push.unregister
 	// for FCM device-token management.
 	PushDevices *store.Store
-	// Memory, when non-nil, enables memory.* and journal.* kinds (Stickiness
-	// #5: per-project agent memory + project journal).
-	Memory *memory.Manager
-	// Cost, when non-nil, enables cost.* kinds (Stickiness #8: cross-fleet
-	// cost & usage rollup).
-	Cost *cost.Calculator
-	// Billing, when non-nil, enables provider.* kinds (encrypted VPS billing
-	// credentials + on-demand refresh of the daily cost fetch).
-	Billing *billing.Manager
+	// ControlPlaneKey is the pairing secret the mobile app must present as an
+	// Authorization: Bearer header on the WebSocket upgrade. Generated and
+	// persisted by the agent; fetched by the app over the operator-
+	// authenticated SSH channel. Empty authorizes nothing when RequirePairing.
+	ControlPlaneKey string
+	// RequirePairing enforces the ControlPlaneKey check on every WebSocket
+	// upgrade. Defaults on for production; disable only for local development.
+	RequirePairing bool
 }
 
 // Server is the agent's control-plane server.
@@ -237,6 +229,15 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 }
 
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
+	// The control plane binds to loopback, but loopback is shared by every
+	// local process on the host. Require the pairing key (fetched by the app
+	// over the operator-authenticated SSH channel) before upgrading, so a
+	// co-tenant, compromised co-hosted app, or AI session running as another
+	// user cannot drive the agent just by opening a socket.
+	if s.cfg.RequirePairing && !s.pairingAuthorized(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		// Loopback only; no browser will reach this. Skip origin checks.
 		InsecureSkipVerify: true,
@@ -277,6 +278,22 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		}
 		s.dispatch(ctx, c, writeMu, f)
 	}
+}
+
+// pairingAuthorized reports whether the request carries the control-plane
+// pairing key as a bearer token. The comparison is constant-time; an empty
+// configured key never authorizes.
+func (s *Server) pairingAuthorized(r *http.Request) bool {
+	if s.cfg.ControlPlaneKey == "" {
+		return false
+	}
+	const prefix = "Bearer "
+	h := r.Header.Get("Authorization")
+	if !strings.HasPrefix(h, prefix) {
+		return false
+	}
+	got := strings.TrimSpace(strings.TrimPrefix(h, prefix))
+	return subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.ControlPlaneKey)) == 1
 }
 
 // connWriter serializes every outbound frame for one connection onto a single
@@ -436,16 +453,6 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 		"auth.confirm",
 		"audit.list":
 		s.dispatchReview(ctx, c, writeMu, f)
-	case "preview.setup_domain",
-		"preview.get_domain",
-		"preview.dns_validate",
-		"preview.start",
-		"preview.stop",
-		"preview.restart",
-		"preview.list",
-		"preview.get",
-		"preview.active":
-		s.dispatchPreview(ctx, c, writeMu, f)
 	case "tooling.check",
 		"tooling.install":
 		s.dispatchTooling(ctx, c, writeMu, f)
@@ -526,8 +533,6 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 		"github.pr_list",
 		"github.revoke":
 		s.dispatchGitHub(ctx, c, writeMu, f)
-	case "inbox.list", "inbox.stream", "inbox.mark_read", "inbox.resolve":
-		s.dispatchInbox(ctx, c, writeMu, f)
 	case "infra.runbook.list",
 		"infra.runbook.get":
 		s.dispatchRunbook(ctx, c, writeMu, f)
@@ -538,25 +543,9 @@ func (s *Server) dispatch(ctx context.Context, c *websocket.Conn, writeMu *connW
 		s.dispatchAction(ctx, c, writeMu, f)
 	case "inventory.capabilities":
 		s.dispatchInventory(ctx, c, writeMu, f)
-	case "push.register", "push.unregister", "push.list":
+	case "push.register", "push.unregister", "push.list",
+		"notifications.prefs.list", "notifications.prefs.set":
 		s.dispatchPush(ctx, c, writeMu, f)
-	case "memory.list",
-		"memory.create",
-		"memory.update",
-		"memory.delete",
-		"memory.proposals",
-		"memory.confirm",
-		"memory.reject",
-		"journal.list",
-		"journal.export":
-		s.dispatchMemory(ctx, c, writeMu, f)
-	case "cost.rollup",
-		"cost.export",
-		"provider.list",
-		"provider.set",
-		"provider.delete",
-		"provider.refresh":
-		s.dispatchCost(ctx, c, writeMu, f)
 	default:
 		s.writeError(ctx, c, writeMu, f.ID, "unknown_kind", f.Kind)
 	}
@@ -1333,15 +1322,6 @@ func (s *Server) dispatchGitHub(ctx context.Context, c *websocket.Conn, writeMu 
 			s.writeGitHubErr(ctx, c, writeMu, f.ID, err)
 			return
 		}
-		if s.cfg.Memory != nil && in.ProjectID != "" {
-			_, _ = s.cfg.Memory.AppendJournal(
-				in.ProjectID,
-				memory.JournalPR,
-				fmt.Sprintf("Opened PR #%d: %s", pr.Number, pr.Title),
-				pr.URL,
-				s.cfg.Now(),
-			)
-		}
 		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, pr)
 	case "github.pr_list":
 		var in struct {
@@ -1423,203 +1403,6 @@ func (s *Server) writeProjectErr(ctx context.Context, c *websocket.Conn, writeMu
 	default:
 		s.writeError(ctx, c, writeMu, id, "internal", err.Error())
 	}
-}
-
-// PreviewDTO is the wire shape of one preview row.
-type PreviewDTO struct {
-	ID         string `json:"id"`
-	ProjectID  string `json:"project_id"`
-	Subdomain  string `json:"subdomain"`
-	BaseDomain string `json:"base_domain"`
-	URL        string `json:"url"`
-	Command    string `json:"command"`
-	Port       int    `json:"port"`
-	Status     string `json:"status"`
-	LastError  string `json:"last_error,omitempty"`
-	StartedAt  int64  `json:"started_at"`
-	EndedAt    *int64 `json:"ended_at,omitempty"`
-}
-
-func toPreviewDTO(p store.Preview) PreviewDTO {
-	var ended *int64
-	if p.EndedAt != nil {
-		v := p.EndedAt.Unix()
-		ended = &v
-	}
-	return PreviewDTO{
-		ID: p.ID, ProjectID: p.ProjectID,
-		Subdomain: p.Subdomain, BaseDomain: p.BaseDomain,
-		URL: p.URL, Command: p.Command, Port: p.Port,
-		Status: p.Status, LastError: p.LastError,
-		StartedAt: p.StartedAt.Unix(), EndedAt: ended,
-	}
-}
-
-func (s *Server) dispatchPreview(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
-	if s.cfg.Previews == nil {
-		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "previews subsystem not configured")
-		return
-	}
-	mgr := s.cfg.Previews
-	switch f.Kind {
-	case "preview.get_domain":
-		base, err := mgr.BaseDomain()
-		if err != nil {
-			s.writePreviewErr(ctx, c, writeMu, f.ID, err)
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, map[string]any{
-			"base_domain":  base,
-			"cert_warmup":  int64(mgr.CertWarmup().Seconds()),
-			"is_setup":     base != "",
-			"sample_host":  sampleHost(base),
-			"wildcard_dns": wildcardDNSHint(base),
-		})
-	case "preview.setup_domain":
-		var in struct {
-			BaseDomain string `json:"base_domain"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.BaseDomain == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "base_domain required")
-			return
-		}
-		base, err := mgr.SetupDomain(in.BaseDomain)
-		if err != nil {
-			s.writePreviewErr(ctx, c, writeMu, f.ID, err)
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, map[string]any{
-			"base_domain":  base,
-			"wildcard_dns": wildcardDNSHint(base),
-		})
-	case "preview.dns_validate":
-		res, err := mgr.ValidateDNS(ctx)
-		if err != nil {
-			s.writePreviewErr(ctx, c, writeMu, f.ID, err)
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, res)
-	case "preview.start":
-		var in struct {
-			ProjectID string `json:"project_id"`
-			Command   string `json:"command"`
-			Port      int    `json:"port"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ProjectID == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "project_id required")
-			return
-		}
-		row, err := mgr.Start(ctx, previews.StartRequest{
-			ProjectID: in.ProjectID, Command: in.Command, Port: in.Port,
-		})
-		if err != nil {
-			s.writePreviewErr(ctx, c, writeMu, f.ID, err)
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, toPreviewDTO(row))
-	case "preview.stop":
-		var in struct {
-			ID string `json:"id"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
-			return
-		}
-		if err := mgr.Stop(ctx, in.ID); err != nil {
-			s.writePreviewErr(ctx, c, writeMu, f.ID, err)
-			return
-		}
-		row, _ := mgr.Get(in.ID)
-		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, toPreviewDTO(row))
-	case "preview.restart":
-		var in struct {
-			ID string `json:"id"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
-			return
-		}
-		row, err := mgr.Restart(ctx, in.ID)
-		if err != nil {
-			s.writePreviewErr(ctx, c, writeMu, f.ID, err)
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, toPreviewDTO(row))
-	case "preview.list":
-		var in struct {
-			ProjectID string `json:"project_id"`
-		}
-		_ = json.Unmarshal(f.Payload, &in)
-		rows, err := mgr.List(in.ProjectID)
-		if err != nil {
-			s.writePreviewErr(ctx, c, writeMu, f.ID, err)
-			return
-		}
-		out := make([]PreviewDTO, 0, len(rows))
-		for _, r := range rows {
-			out = append(out, toPreviewDTO(r))
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, map[string]any{"previews": out})
-	case "preview.get":
-		var in struct {
-			ID string `json:"id"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
-			return
-		}
-		row, err := mgr.Get(in.ID)
-		if err != nil {
-			s.writePreviewErr(ctx, c, writeMu, f.ID, err)
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, toPreviewDTO(row))
-	case "preview.active":
-		var in struct {
-			ProjectID string `json:"project_id"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ProjectID == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "project_id required")
-			return
-		}
-		row, err := mgr.Active(in.ProjectID)
-		if err != nil {
-			s.writePreviewErr(ctx, c, writeMu, f.ID, err)
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, f.Kind, toPreviewDTO(row))
-	}
-}
-
-func (s *Server) writePreviewErr(ctx context.Context, c *websocket.Conn, writeMu *connWriter, id string, err error) {
-	switch {
-	case errors.Is(err, previews.ErrBaseDomainUnset):
-		s.writeError(ctx, c, writeMu, id, "preview_no_domain", err.Error())
-	case errors.Is(err, previews.ErrDNSValidationFailed):
-		s.writeError(ctx, c, writeMu, id, "preview_dns_failed", err.Error())
-	case errors.Is(err, previews.ErrAlreadyRunning):
-		s.writeError(ctx, c, writeMu, id, "preview_already_running", err.Error())
-	case errors.Is(err, previews.ErrPortUnknown):
-		s.writeError(ctx, c, writeMu, id, "preview_port_unknown", err.Error())
-	case errors.Is(err, projects.ErrNotFound), errors.Is(err, store.ErrNotFound):
-		s.writeError(ctx, c, writeMu, id, "not_found", err.Error())
-	default:
-		s.writeError(ctx, c, writeMu, id, "internal", err.Error())
-	}
-}
-
-func sampleHost(base string) string {
-	if base == "" {
-		return ""
-	}
-	return "preview-abc123." + base
-}
-
-func wildcardDNSHint(base string) string {
-	if base == "" {
-		return ""
-	}
-	return "*." + base
 }
 
 // DockerStatusDTO mirrors docker.Status on the wire.
@@ -4053,13 +3836,22 @@ func (s *Server) dispatchPush(ctx context.Context, c *websocket.Conn, writeMu *c
 			Token     string `json:"token"`
 			APNsToken string `json:"apns_token"`
 			Platform  string `json:"platform"`
+			// ServerID is DevDeck's own client-side identifier for the
+			// server this device is registering against (minted when the
+			// user added the server; the agent has no other way to learn
+			// it). Persisted per-device so push.Hub can stamp the right
+			// value into deep_link/staged-action payloads instead of the
+			// agent's internal rule-bucket id, which the client can never
+			// match against its own server list.
+			ServerID string `json:"server_id"`
 		}
 		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Token == "" {
 			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "token required")
 			return
 		}
 		err := s.cfg.PushDevices.PutPushDevice(store.PushDevice{
-			Token: in.Token, APNsToken: in.APNsToken, Platform: in.Platform, LastSeenAt: s.cfg.Now(),
+			Token: in.Token, APNsToken: in.APNsToken, Platform: in.Platform,
+			ClientServerID: in.ServerID, LastSeenAt: s.cfg.Now(),
 		})
 		if err != nil {
 			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
@@ -4086,438 +3878,63 @@ func (s *Server) dispatchPush(ctx context.Context, c *websocket.Conn, writeMu *c
 			return
 		}
 		s.writeOK(ctx, c, writeMu, f.ID, "push.list", map[string]any{"devices": devices})
-	}
-}
-
-// MemoryDTO is the wire shape of a project_memory row.
-type MemoryDTO struct {
-	ID              string `json:"id"`
-	ProjectID       string `json:"project_id"`
-	Kind            string `json:"kind"`
-	Title           string `json:"title"`
-	Body            string `json:"body"`
-	CreatedAt       int64  `json:"created_at"`
-	UpdatedAt       int64  `json:"updated_at"`
-	SourceSessionID string `json:"source_session_id,omitempty"`
-}
-
-func toMemoryDTO(m store.ProjectMemory) MemoryDTO {
-	return MemoryDTO{
-		ID: m.ID, ProjectID: m.ProjectID, Kind: m.Kind, Title: m.Title, Body: m.Body,
-		CreatedAt: m.CreatedAt.Unix(), UpdatedAt: m.UpdatedAt.Unix(), SourceSessionID: m.SourceSessionID,
-	}
-}
-
-// MemoryProposalDTO is the wire shape of a pending AI-proposed memory entry.
-type MemoryProposalDTO struct {
-	ID        string `json:"id"`
-	ProjectID string `json:"project_id"`
-	SessionID string `json:"session_id,omitempty"`
-	Kind      string `json:"kind"`
-	Title     string `json:"title"`
-	Body      string `json:"body"`
-	CreatedAt int64  `json:"created_at"`
-}
-
-func toProposalDTO(p memory.Proposal) MemoryProposalDTO {
-	return MemoryProposalDTO{
-		ID: p.ID, ProjectID: p.ProjectID, SessionID: p.SessionID,
-		Kind: p.Kind, Title: p.Title, Body: p.Body, CreatedAt: p.CreatedAt.Unix(),
-	}
-}
-
-// JournalEntryDTO is the wire shape of a project_journal_entry row.
-type JournalEntryDTO struct {
-	ID         int64  `json:"id"`
-	ProjectID  string `json:"project_id"`
-	Kind       string `json:"kind"`
-	Summary    string `json:"summary"`
-	OccurredAt int64  `json:"occurred_at"`
-	RefID      string `json:"ref_id,omitempty"`
-}
-
-func toJournalDTO(e store.JournalEntry) JournalEntryDTO {
-	return JournalEntryDTO{
-		ID: e.ID, ProjectID: e.ProjectID, Kind: e.Kind, Summary: e.Summary,
-		OccurredAt: e.OccurredAt.Unix(), RefID: e.RefID,
-	}
-}
-
-func (s *Server) dispatchMemory(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
-	if s.cfg.Memory == nil {
-		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "memory subsystem not configured")
-		return
-	}
-	mgr := s.cfg.Memory
-	switch f.Kind {
-	case "memory.list":
-		var in struct {
-			ProjectID string `json:"project_id"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ProjectID == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "project_id required")
-			return
-		}
-		rows, err := mgr.ListMemory(in.ProjectID)
+	case "notifications.prefs.list":
+		overrides, err := s.cfg.PushDevices.ListNotificationPrefs()
 		if err != nil {
 			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
 			return
 		}
-		out := make([]MemoryDTO, 0, len(rows))
-		for _, r := range rows {
-			out = append(out, toMemoryDTO(r))
+		ov := make(map[string]bool, len(overrides))
+		for _, p := range overrides {
+			ov[p.Type] = p.PushEnabled
 		}
-		s.writeOK(ctx, c, writeMu, f.ID, "memory.list", map[string]any{"memories": out})
-	case "memory.create":
-		var in struct {
-			ProjectID string `json:"project_id"`
-			Kind      string `json:"kind"`
-			Title     string `json:"title"`
-			Body      string `json:"body"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
-			return
-		}
-		row, err := mgr.CreateMemory(in.ProjectID, in.Kind, in.Title, in.Body, "")
-		if err != nil {
-			s.writeMemoryErr(ctx, c, writeMu, f.ID, err)
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "memory.create", toMemoryDTO(row))
-	case "memory.update":
-		var in struct {
-			ID    string `json:"id"`
-			Kind  string `json:"kind"`
-			Title string `json:"title"`
-			Body  string `json:"body"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
-			return
-		}
-		row, err := mgr.UpdateMemory(in.ID, in.Kind, in.Title, in.Body)
-		if err != nil {
-			s.writeMemoryErr(ctx, c, writeMu, f.ID, err)
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "memory.update", toMemoryDTO(row))
-	case "memory.delete":
-		var in struct {
-			ID string `json:"id"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
-			return
-		}
-		if err := mgr.DeleteMemory(in.ID); err != nil {
-			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "memory.delete", map[string]any{"id": in.ID})
-	case "memory.proposals":
-		var in struct {
-			ProjectID string `json:"project_id"`
-		}
-		_ = json.Unmarshal(f.Payload, &in)
-		props := mgr.ListProposals(in.ProjectID)
-		out := make([]MemoryProposalDTO, 0, len(props))
-		for _, p := range props {
-			out = append(out, toProposalDTO(p))
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "memory.proposals", map[string]any{"proposals": out})
-	case "memory.confirm":
-		var in struct {
-			ID string `json:"id"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
-			return
-		}
-		row, err := mgr.ConfirmProposal(in.ID)
-		if err != nil {
-			s.writeMemoryErr(ctx, c, writeMu, f.ID, err)
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "memory.confirm", toMemoryDTO(row))
-	case "memory.reject":
-		var in struct {
-			ID string `json:"id"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ID == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id required")
-			return
-		}
-		if err := mgr.RejectProposal(in.ID); err != nil {
-			s.writeMemoryErr(ctx, c, writeMu, f.ID, err)
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "memory.reject", map[string]any{"id": in.ID})
-	case "journal.list":
-		var in struct {
-			ProjectID string `json:"project_id"`
-			Kind      string `json:"kind"`
-			Cursor    string `json:"cursor"`
-			Limit     int    `json:"limit"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ProjectID == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "project_id required")
-			return
-		}
-		entries, next, err := mgr.ListJournal(in.ProjectID, in.Kind, in.Cursor, in.Limit)
-		if err != nil {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
-			return
-		}
-		out := make([]JournalEntryDTO, 0, len(entries))
-		for _, e := range entries {
-			out = append(out, toJournalDTO(e))
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "journal.list", map[string]any{"entries": out, "next_cursor": next})
-	case "journal.export":
-		var in struct {
-			ProjectID string `json:"project_id"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.ProjectID == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "project_id required")
-			return
-		}
-		name := ""
-		if s.cfg.Projects != nil {
-			if p, err := s.cfg.Projects.Get(in.ProjectID); err == nil {
-				name = p.Name
+		kinds := push.KnownKinds()
+		out := make([]NotificationPrefDTO, 0, len(kinds))
+		for _, k := range kinds {
+			enabled, overridden := k.DefaultPush, false
+			if v, ok := ov[k.Key]; ok {
+				enabled, overridden = v, true
 			}
+			out = append(out, NotificationPrefDTO{
+				Type: k.Key, Label: k.Label, DefaultPush: k.DefaultPush,
+				PushEnabled: enabled, Overridden: overridden,
+			})
 		}
-		md, err := mgr.ExportJournalMarkdown(in.ProjectID, name)
-		if err != nil {
-			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "journal.export", map[string]any{"markdown": md})
-	}
-}
-
-func (s *Server) writeMemoryErr(ctx context.Context, c *websocket.Conn, writeMu *connWriter, id string, err error) {
-	switch {
-	case errors.Is(err, memory.ErrNotFound), errors.Is(err, memory.ErrNoProposal):
-		s.writeError(ctx, c, writeMu, id, "not_found", err.Error())
-	case errors.Is(err, memory.ErrBadKind), errors.Is(err, memory.ErrEmptyTitle),
-		errors.Is(err, memory.ErrNoProject), errors.Is(err, memory.ErrBadJournal):
-		s.writeError(ctx, c, writeMu, id, "bad_payload", err.Error())
-	default:
-		s.writeError(ctx, c, writeMu, id, "internal", err.Error())
-	}
-}
-
-// ProviderCredentialDTO is the non-secret wire shape of a stored billing
-// credential. The sealed API key is never serialized.
-type ProviderCredentialDTO struct {
-	Provider  string `json:"provider"`
-	UpdatedAt int64  `json:"updated_at"`
-}
-
-// dispatchCost serves the cross-fleet cost rollup (cost.*) and the encrypted
-// VPS billing credential surface (provider.*). cost.* needs only the Cost
-// calculator; provider.* additionally needs the Billing manager.
-func (s *Server) dispatchCost(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
-	switch f.Kind {
-	case "cost.rollup":
-		if s.cfg.Cost == nil {
-			s.writeError(ctx, c, writeMu, f.ID, "unavailable", "cost subsystem not configured")
-			return
-		}
+		s.writeOK(ctx, c, writeMu, f.ID, "notifications.prefs.list", map[string]any{"prefs": out})
+	case "notifications.prefs.set":
 		var in struct {
-			Month string `json:"month"`
+			Type        string `json:"type"`
+			PushEnabled bool   `json:"push_enabled"`
+			// Reset, when true, deletes any override and reverts Type to
+			// its built-in default; PushEnabled is ignored.
+			Reset bool `json:"reset"`
 		}
-		_ = json.Unmarshal(f.Payload, &in)
-		r, err := s.cfg.Cost.Rollup(in.Month)
-		if err != nil {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
+		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Type == "" {
+			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "type required")
 			return
 		}
-		s.writeOK(ctx, c, writeMu, f.ID, "cost.rollup", r)
-	case "cost.export":
-		if s.cfg.Cost == nil {
-			s.writeError(ctx, c, writeMu, f.ID, "unavailable", "cost subsystem not configured")
-			return
-		}
-		var in struct {
-			Month string `json:"month"`
-		}
-		_ = json.Unmarshal(f.Payload, &in)
-		csv, err := s.cfg.Cost.ExportCSV(in.Month)
-		if err != nil {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "cost.export", map[string]any{"csv": csv, "month": in.Month})
-	case "provider.list", "provider.set", "provider.delete", "provider.refresh":
-		s.dispatchProvider(ctx, c, writeMu, f)
-	}
-}
-
-func (s *Server) dispatchProvider(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
-	if s.cfg.Billing == nil {
-		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "billing subsystem not configured")
-		return
-	}
-	mgr := s.cfg.Billing
-	switch f.Kind {
-	case "provider.list":
-		infos, err := mgr.ListCredentials()
-		if err != nil {
-			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
-			return
-		}
-		out := make([]ProviderCredentialDTO, 0, len(infos))
-		for _, ci := range infos {
-			out = append(out, ProviderCredentialDTO{Provider: ci.Provider, UpdatedAt: ci.UpdatedAt.Unix()})
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "provider.list", map[string]any{
-			"credentials": out,
-			"supported":   billing.ProviderNames(),
-		})
-	case "provider.set":
-		var in struct {
-			Provider string `json:"provider"`
-			APIKey   string `json:"api_key"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
-			return
-		}
-		if err := mgr.SetCredential(in.Provider, in.APIKey); err != nil {
-			s.writeBillingErr(ctx, c, writeMu, f.ID, err)
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "provider.set", map[string]any{"provider": in.Provider})
-	case "provider.delete":
-		var in struct {
-			Provider string `json:"provider"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil || in.Provider == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "provider required")
-			return
-		}
-		if err := mgr.DeleteCredential(in.Provider); err != nil {
-			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "provider.delete", map[string]any{"provider": in.Provider})
-	case "provider.refresh":
-		rows, err := mgr.FetchAll(ctx)
-		if err != nil {
-			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
-			return
-		}
-		out := make([]ProviderCostDTO, 0, len(rows))
-		for _, r := range rows {
-			out = append(out, toProviderCostDTO(r))
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "provider.refresh", map[string]any{"infra": out})
-	}
-}
-
-// ProviderCostDTO mirrors one normalized infra-cost row for the refresh reply.
-type ProviderCostDTO struct {
-	Provider    string `json:"provider"`
-	Month       string `json:"month"`
-	AmountCents int64  `json:"amount_cents"`
-	Currency    string `json:"currency"`
-	Status      string `json:"status"`
-	Detail      string `json:"detail,omitempty"`
-	FetchedAt   int64  `json:"fetched_at"`
-}
-
-func toProviderCostDTO(r store.InfraCost) ProviderCostDTO {
-	return ProviderCostDTO{
-		Provider: r.Provider, Month: r.Month, AmountCents: r.AmountCents,
-		Currency: r.Currency, Status: r.Status, Detail: r.Detail, FetchedAt: r.FetchedAt.Unix(),
-	}
-}
-
-func (s *Server) writeBillingErr(ctx context.Context, c *websocket.Conn, writeMu *connWriter, id string, err error) {
-	switch {
-	case errors.Is(err, billing.ErrBadProvider), errors.Is(err, billing.ErrNoKey):
-		s.writeError(ctx, c, writeMu, id, "bad_payload", err.Error())
-	default:
-		s.writeError(ctx, c, writeMu, id, "internal", err.Error())
-	}
-}
-
-func (s *Server) dispatchInbox(ctx context.Context, c *websocket.Conn, writeMu *connWriter, f Frame) {
-	if s.cfg.Inbox == nil {
-		s.writeError(ctx, c, writeMu, f.ID, "unavailable", "inbox subsystem not configured")
-		return
-	}
-	mgr := s.cfg.Inbox
-	switch f.Kind {
-	case "inbox.list":
-		var in struct {
-			Cursor string `json:"cursor"`
-			Limit  int    `json:"limit"`
-		}
-		if len(f.Payload) > 0 {
-			if err := json.Unmarshal(f.Payload, &in); err != nil {
-				s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
+		if in.Reset {
+			if err := s.cfg.PushDevices.DeleteNotificationPref(in.Type); err != nil {
+				s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
 				return
 			}
-		}
-		res, err := mgr.List(ctx, in.Cursor, in.Limit)
-		if err != nil {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "inbox.list", res)
-	case "inbox.mark_read":
-		var in struct {
-			IDs []string `json:"ids"`
-		}
-		if len(f.Payload) > 0 {
-			if err := json.Unmarshal(f.Payload, &in); err != nil {
-				s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
-				return
-			}
-		}
-		if err := mgr.MarkRead(in.IDs); err != nil {
+		} else if err := s.cfg.PushDevices.PutNotificationPref(store.NotificationPref{
+			Type: in.Type, PushEnabled: in.PushEnabled, UpdatedAt: s.cfg.Now(),
+		}); err != nil {
 			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
 			return
 		}
-		s.writeOK(ctx, c, writeMu, f.ID, "inbox.mark_read", map[string]any{"ok": true})
-	case "inbox.resolve":
-		var in struct {
-			ID     string `json:"id"`
-			Action string `json:"action"`
-		}
-		if err := json.Unmarshal(f.Payload, &in); err != nil {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", err.Error())
-			return
-		}
-		if in.ID == "" {
-			s.writeError(ctx, c, writeMu, f.ID, "bad_payload", "id is required")
-			return
-		}
-		if err := mgr.Resolve(in.ID, in.Action); err != nil {
-			s.writeError(ctx, c, writeMu, f.ID, "internal", err.Error())
-			return
-		}
-		s.writeOK(ctx, c, writeMu, f.ID, "inbox.resolve", map[string]any{"ok": true})
-	case "inbox.stream":
-		ch, cleanup := mgr.Subscribe(ctx)
-		s.writeOK(ctx, c, writeMu, f.ID, "inbox.stream", map[string]any{"subscribed": true})
-		go func() {
-			defer cleanup()
-			for {
-				select {
-				case item, ok := <-ch:
-					if !ok {
-						return
-					}
-					s.writeOK(ctx, c, writeMu, "", "inbox.event", item)
-				case <-ctx.Done():
-					return
-				}
-			}
-		}()
+		s.writeOK(ctx, c, writeMu, f.ID, "notifications.prefs.set", map[string]any{"ok": true})
 	}
+}
+
+// NotificationPrefDTO is one row of the push notification settings list: a
+// known kind, its built-in default, and the effective push_enabled after
+// applying any persisted override.
+type NotificationPrefDTO struct {
+	Type        string `json:"type"`
+	Label       string `json:"label"`
+	DefaultPush bool   `json:"default_push"`
+	PushEnabled bool   `json:"push_enabled"`
+	Overridden  bool   `json:"overridden"`
 }
