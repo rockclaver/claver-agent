@@ -237,6 +237,24 @@ systemctl enable rootmote-agent.service
 # overwritten the binary, so restart unconditionally to pick it up.
 systemctl restart rootmote-agent.service
 
+# A just-killed listener can leave sockets lingering briefly; the unit's
+# Restart= policy retries the bind. Wait until the agent is actually up and
+# listening so the installer's verdict is definitive.
+agent_up=""
+for _ in $(seq 1 20); do
+  if [[ "$(systemctl is-active rootmote-agent.service 2>/dev/null)" == "active" ]] && \
+     [[ -n "$(list_port_pids "$AGENT_PORT")" ]]; then
+    agent_up=1
+    break
+  fi
+  sleep 1
+done
+if [[ -z "$agent_up" ]]; then
+  echo "error: rootmote-agent did not reach active+listening within 20s" >&2
+  journalctl -u rootmote-agent -n 10 --no-pager >&2 || true
+  exit 1
+fi
+
 # --- Phase 7: Caddy for live previews -------------------------------------
 # Install Caddy if absent. The agent writes per-preview fragments into
 # /etc/caddy/rootmote/*.caddy; the main Caddyfile must `import` that glob.
